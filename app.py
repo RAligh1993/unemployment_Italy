@@ -1046,7 +1046,39 @@ if run_button:
                     "text/csv",
                     use_container_width=True
                 )
+# ============= CHATBOT =============
 
+if st.session_state.api_key and uploaded_file is not None:
+    st.markdown("---")
+    st.header("💬 Ask AI Assistant")
+    
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+    
+    if prompt := st.chat_input("Ask about Italian unemployment trends..."):
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        
+        with st.chat_message("user"):
+            st.markdown(prompt)
+        
+        with st.chat_message("assistant"):
+            with st.spinner("🤔"):
+                context = "\n".join([f"{m['role']}: {m['content']}" 
+                                    for m in st.session_state.messages[-5:]])
+                
+                chat_prompt = f"""You are an AI assistant for Italian unemployment analysis.
+
+Previous context:
+{context}
+
+Provide a helpful, concise response (2-3 sentences)."""
+                
+                response = call_claude_api(chat_prompt, st.session_state.api_key)
+            
+            st.markdown(response)
+        
+        st.session_state.messages.append({"role": "assistant", "content": response})
 # ============= FOOTER =============
 
 st.markdown("---")
