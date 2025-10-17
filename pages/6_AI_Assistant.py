@@ -503,7 +503,7 @@ with st.sidebar:
         'OpenAI': ('gpt-4o-mini', HAS_OPENAI),
         'Claude': ('claude-3-5-sonnet-latest', HAS_ANTHROPIC),
         'Gemini': ('gemini-1.5-flash', HAS_GEMINI),
-        'Local': ('llama2', HAS_REQUESTS)
+        'Local/Ollama': ('llama2', HAS_REQUESTS)
     }
     
     provider = st.selectbox(
@@ -516,9 +516,23 @@ with st.sidebar:
     if not is_available:
         st.warning(f"⚠️ {provider} not available. Install required package.")
     
-    model = st.text_input("Model name:", value=default_model)
+    model = st.text_input("Model name:", value=default_model, key='model_name')
+    
+    # Provider-specific settings
+    if provider == 'Local/Ollama':
+        st.markdown("##### 🔗 Local Endpoint")
+        local_endpoint = st.text_input(
+            "API Endpoint:",
+            value=os.getenv('OLLAMA_ENDPOINT', 'http://localhost:11434/api/chat'),
+            help="Default Ollama endpoint or custom local API",
+            key='local_endpoint'
+        )
+        st.caption("💡 Start Ollama: `ollama serve`")
+    else:
+        local_endpoint = None
     
     # Settings
+    st.markdown("---")
     st.subheader("🎛️ Settings")
     
     temperature = st.slider(
@@ -549,15 +563,36 @@ with st.sidebar:
     
     st.markdown("---")
     
-    # API Status
-    st.subheader("🔑 API Status")
+    # API Keys Management
+    st.subheader("🔑 API Keys")
     
-    api_keys = {
-        'OpenAI': 'OPENAI_API_KEY',
-        'Anthropic': 'ANTHROPIC_API_KEY',
-        'Google': 'GOOGLE_API_KEY'
-    }
+    with st.expander("Configure API Keys", expanded=False):
+        st.markdown("**Current Status:**")
+        
+        api_keys = {
+            'OpenAI': 'OPENAI_API_KEY',
+            'Anthropic': 'ANTHROPIC_API_KEY',
+            'Google': 'GOOGLE_API_KEY'
+        }
+        
+        for name, key in api_keys.items():
+            has_key = bool(os.getenv(key))
+            status = "✅" if has_key else "❌"
+            st.markdown(f"{status} **{name}**")
+        
+        st.markdown("---")
+        st.markdown("**Set via environment variables:**")
+        st.code("""
+export OPENAI_API_KEY="sk-..."
+export ANTHROPIC_API_KEY="sk-ant-..."
+export GOOGLE_API_KEY="..."
+export OLLAMA_ENDPOINT="http://localhost:11434/api/chat"
+        """, language='bash')
+        
+        st.caption("⚠️ Restart app after setting keys")
     
+    # Quick status
+    st.markdown("**Quick Status:**")
     for name, key in api_keys.items():
         status = "✅" if os.getenv(key) else "❌"
         st.markdown(f"{status} {name}")
