@@ -1,518 +1,261 @@
-"""
-Dashboard Page - Real-time Overview and KPIs
-"""
+# pages/1_Dashboard.py — Professional Overview Dashboard (EN)
+# ============================================================================
+# Role
+#   • Executive overview for the Nowcasting Lab
+#   • KPIs for data readiness and (when available) model performance
+#   • Interactive target chart with overlays (moving averages & predictions)
+#   • Top feature correlations snapshot
+#   • Data quality panel (missing/duplicates/outliers)
+#
+# Notes
+#   • This page does NOT set page_config (centralized in app.py)
+#   • Works even if utils/state.py is not present (safe fallback)
+# ============================================================================
 
-import streamlit as st
-import pandas as pd
+from __future__ import annotations
+
+import typing as t
+from dataclasses import dataclass
+from datetime import datetime
+
 import numpy as np
-import plotly.express as px
+import pandas as pd
 import plotly.graph_objs as go
-from datetime import datetime, timedelta
-import time
+import plotly.express as px
+import streamlit as st
 
-st.set_page_config(page_title="Dashboard", page_icon="📊", layout="wide")
+# ----------------------------------------------------------------------------
+# State (robust import with fallback)
+# ----------------------------------------------------------------------------
+try:
+    from utils.state import AppState  # type: ignore
+except Exception:
+    class _State:
+        def __init__(self) -> None:
+            self.y_monthly: pd.Series | None = None
+            self.panel_monthly: pd.DataFrame | None = None
+            self.bt_results: dict[str, pd.Series] = {}
+            self.bt_metrics: pd.DataFrame | None = None
+            self.google_trends: pd.DataFrame | None = None
+            self.raw_daily: list[pd.DataFrame] = []
 
-# Apply consistent theme
-st.markdown("""
-<style>
-    .dashboard-kpi {
-        background: linear-gradient(135deg, rgba(99, 102, 241, 0.1), rgba(16, 185, 129, 0.1));
-        border: 1px solid rgba(99, 102, 241, 0.3);
-        border-radius: 20px;
-        padding: 25px;
-        text-align: center;
-        transition: all 0.3s ease;
-    }
-    
-    .dashboard-kpi:hover {
-        transform: translateY(-5px);
-        box-shadow: 0 10px 30px rgba(99, 102, 241, 0.3);
-    }
-    
-    .kpi-value {
-        font-size: 36px;
-        font-weight: 700;
-        background: linear-gradient(135deg, #6366F1, #10B981);
-        -webkit-background-clip: text;
-        -webkit-text-fill-color: transparent;
-    }
-    
-    .kpi-label {
-        font-size: 14px;
-        color: #9CA3AF;
-        margin-top: 10px;
-        text-transform: uppercase;
-        letter-spacing: 1px;
-    }
-    
-    .real-time-badge {
-        display: inline-block;
-        padding: 5px 15px;
-        background: linear-gradient(135deg, #10B981, #059669);
-        color: white;
-        border-radius: 20px;
-        font-size: 12px;
-        font-weight: 600;
-        animation: pulse 2s infinite;
-    }
-    
-    @keyframes pulse {
-        0%, 100% { opacity: 1; }
-        50% { opacity: 0.7; }
-    }
-</style>
-""", unsafe_allow_html=True)
+    class AppState:  # type: ignore
+        @staticmethod
+        def init() -> _State:
+            if "_app" not in st.session_state:
+                st.session_state["_app"] = _State()
+            return st.session_state["_app"]  # type: ignore
 
-# Header with real-time indicator
-col1, col2, col3 = st.columns([2, 1, 1])
+        @staticmethod
+        def get() -> _State:
+            return AppState.init()
 
-with col1:
-    st.markdown("""
-    <h1 style="margin: 0;">📊 Executive Dashboard</h1>
-    <p style="color: #9CA3AF; margin-top: 10px;">
-        Real-time monitoring of Italy's unemployment indicators
-    </p>
-    """, unsafe_allow_html=True)
+state = AppState.init()
 
-with col2:
-    st.markdown("""
-    <div style="text-align: right; padding-top: 20px;">
-        <span class="real-time-badge">● REAL-TIME</span>
-    </div>
-    """, unsafe_allow_html=True)
+# ----------------------------------------------------------------------------
+# Helpers & metrics
+# ----------------------------------------------------------------------------
 
-with col3:
-    current_time = datetime.now().strftime("%H:%M:%S")
-    st.markdown(f"""
-    <div style="text-align: right; padding-top: 25px; color: #9CA3AF;">
-        Last Update: {current_time}
-    </div>
-    """, unsafe_allow_html=True)
+@st.cache_data(show_spinner=False)
+def pct_change(s: pd.Series, m: int) -> float:
+    if s is None or s.empty or len(s) <= m:
+        return float("nan")
+    s = s.dropna()
+    if len(s) <= m:
+        return float("nan")
+    try:
+        return float(100.0 * (s.iloc[-1] - s.iloc[-1 - m]) / (abs(s.iloc[-1 - m]) + 1e-12))
+    except Exception:
+        return float("nan")
+
+
+@st.cache_data(show_spinner=False)
+def moving_avg(s: pd.Series, k: int) -> pd.Series:
+    if s is None or s.empty:
+        return pd.Series(dtype=float)
+    return s.sort_index().rolling(k, min_periods=max(1, k // 2)).mean().rename(f"MA{k}")
+
+
+def _metrics_against(y: pd.Series, yhat: pd.Series) -> dict[str, float]:
+    ya, pa = y.align(yhat, join="inner")
+    e = ya - pa
+    mae = float(e.abs().mean())
+    rmse = float(np.sqrt((e ** 2).mean()))
+    smape = float((200.0 * (e.abs() / (ya.abs() + pa.abs() + 1e-12))).mean())
+    denom = float((ya.diff().abs()).mean())
+    mase = float(mae / (denom + 1e-12)) if np.isfinite(denom) else float("nan")
+    return {"MAE": mae, "RMSE": rmse, "SMAPE": smape, "MASE": mase}
+
+
+def _continuous_month_index(s: pd.Series) -> pd.DatetimeIndex:
+    idx = s.sort_index().index
+    if len(idx) == 0:
+        return idx
+    full = pd.date_range(idx.min(), idx.max(), freq="M")
+    return full
+
+
+@st.cache_data(show_spinner=False)
+def data_quality(y: pd.Series) -> dict[str, t.Any]:
+    if y is None or y.empty:
+        return {"missing": 0, "duplicate": 0, "missing_dates": [], "outliers": pd.DataFrame()}
+    s = y.dropna()
+    # missing by calendar
+    full = _continuous_month_index(s)
+    miss_idx = full.difference(s.index)
+    # duplicates
+    duplicate = int(s.index.duplicated().sum())
+    # outliers via z-score (robust)
+    v = s.values.astype(float)
+    med = np.nanmedian(v)
+    mad = np.nanmedian(np.abs(v - med)) + 1e-9
+    z = 0.6745 * (v - med) / mad
+    out_mask = np.abs(z) > 3.5
+    out_df = pd.DataFrame({"date": s.index[out_mask], "value": s.values[out_mask], "|z|": np.abs(z[out_mask])})
+    return {"missing": int(len(miss_idx)), "duplicate": duplicate, "missing_dates": list(miss_idx), "outliers": out_df}
+
+
+# ----------------------------------------------------------------------------
+# Header
+# ----------------------------------------------------------------------------
+
+st.title("📊 Dashboard")
+st.caption("High‑level overview: data readiness, quick trends, feature snapshot, and quality checks.")
+
+# Guard: no target
+if state.y_monthly is None or state.y_monthly.empty:
+    st.warning("No monthly target loaded yet. Go to **Data & Aggregation** or use Quick Start on Home.")
+    st.stop()
+
+# ----------------------------------------------------------------------------
+# KPI strip
+# ----------------------------------------------------------------------------
+
+y = state.y_monthly.dropna().sort_index()
+latest = y.iloc[-1]
+range_txt = f"{y.index.min().date()} → {y.index.max().date()}"
+
+m1 = pct_change(y, 1)
+m12 = pct_change(y, 12)
+qoq = pct_change(y, 3)
+
+c1, c2, c3, c4 = st.columns(4)
+with c1:
+    st.metric("Latest value", f"{latest:,.3f}", help=f"Sample: {range_txt}")
+with c2:
+    st.metric("m/m %", f"{m1:,.2f}%")
+with c3:
+    st.metric("q/q %", f"{qoq:,.2f}%")
+with c4:
+    st.metric("y/y %", f"{m12:,.2f}%")
+
+# ----------------------------------------------------------------------------
+# Interactive chart (target + overlays)
+# ----------------------------------------------------------------------------
 
 st.markdown("---")
+st.subheader("Target timeline & overlays")
 
-# KPI Section
-st.markdown("### 🎯 Key Performance Indicators")
+colA, colB, colC = st.columns([1.1, 1, 1])
+with colA:
+    win_years = st.slider("Window (years)", 1, max(1, min(10, max(1, len(y) // 12))), 3)
+with colB:
+    ma_short = st.number_input("Short MA (months)", 2, 24, 3)
+with colC:
+    ma_long = st.number_input("Long MA (months)", 3, 48, 12)
 
-kpi_cols = st.columns(5)
+start_cut = y.index.max() - pd.DateOffset(years=win_years)
+plot_y = y[y.index >= start_cut]
 
-kpis = [
-    {"label": "Current Rate", "value": "7.8%", "delta": "-0.2%", "icon": "📉"},
-    {"label": "Youth (15-24)", "value": "22.3%", "delta": "-1.1%", "icon": "👥"},
-    {"label": "North Italy", "value": "5.2%", "delta": "-0.3%", "icon": "🗺️"},
-    {"label": "South Italy", "value": "15.8%", "delta": "-0.5%", "icon": "📍"},
-    {"label": "Forecast Accuracy", "value": "94.2%", "delta": "+1.3%", "icon": "🎯"}
-]
+fig = go.Figure()
+fig.add_trace(go.Scatter(x=plot_y.index, y=plot_y.values, mode="lines", name="Target", line=dict(width=3)))
 
-for idx, (col, kpi) in enumerate(zip(kpi_cols, kpis)):
-    with col:
-        # Determine color based on delta
-        delta_color = "#10B981" if kpi["delta"].startswith("-") or kpi["delta"].startswith("+1") else "#EF4444"
-        
-        st.markdown(f"""
-        <div class="dashboard-kpi">
-            <div style="font-size: 32px; margin-bottom: 10px;">{kpi["icon"]}</div>
-            <div class="kpi-value">{kpi["value"]}</div>
-            <div style="color: {delta_color}; font-size: 18px; font-weight: 600; margin-top: 5px;">
-                {kpi["delta"]}
-            </div>
-            <div class="kpi-label">{kpi["label"]}</div>
-        </div>
-        """, unsafe_allow_html=True)
+ma_s = moving_avg(y, int(ma_short))
+ma_l = moving_avg(y, int(ma_long))
+if not ma_s.empty:
+    ms = ma_s[ma_s.index >= start_cut]
+    fig.add_trace(go.Scatter(x=ms.index, y=ms.values, mode="lines", name=f"MA{ma_short}"))
+if not ma_l.empty:
+    ml = ma_l[ma_l.index >= start_cut]
+    fig.add_trace(go.Scatter(x=ml.index, y=ml.values, mode="lines", name=f"MA{ma_long}"))
 
-# Main Charts Section
+# Overlay model predictions if present
+if state.bt_results:
+    st.caption("Overlay backtest predictions (if any):")
+    names = sorted(list(state.bt_results.keys()))
+    chosen = st.multiselect("Models to overlay", names, default=names[: min(3, len(names))])
+    for name in chosen:
+        s = state.bt_results[name]
+        s = s[s.index >= start_cut]
+        fig.add_trace(go.Scatter(x=s.index, y=s.values, mode="lines", name=name))
+
+fig.update_layout(template="plotly_white", height=420, margin=dict(l=20, r=20, t=40, b=20))
+st.plotly_chart(fig, use_container_width=True)
+
+# Quick metrics for overlays
+if state.bt_results and len(state.bt_results) > 0:
+    rows = []
+    for name, s in state.bt_results.items():
+        m = _metrics_against(y, s)
+        m.update({"model": name})
+        rows.append(m)
+    dfm = pd.DataFrame(rows).sort_values("MAE")[["model", "MAE", "RMSE", "SMAPE", "MASE"]]
+    st.dataframe(dfm.style.format({"MAE": "{:.3f}", "RMSE": "{:.3f}", "SMAPE": "{:.2f}", "MASE": "{:.3f}"}), use_container_width=True)
+
+# ----------------------------------------------------------------------------
+# Feature snapshot (correlations)
+# ----------------------------------------------------------------------------
+
 st.markdown("---")
-st.markdown("### 📈 Trend Analysis & Forecasting")
+st.subheader("Top feature correlations (last N months)")
 
-tab1, tab2, tab3, tab4 = st.tabs(["📊 Historical Trend", "🔮 Predictions", "🌍 Regional Analysis", "📰 Market Signals"])
+if state.panel_monthly is None or state.panel_monthly.empty:
+    st.info("Monthly panel is empty. Build it in **Data & Aggregation**.")
+else:
+    lookback = st.slider("Lookback (months)", 12, min(120, max(12, len(state.panel_monthly))), 36, step=12)
+    # align & slice
+    y_al, X_al = y.align(state.panel_monthly.select_dtypes(include=[np.number]), join="inner")
+    y_al = y_al.tail(lookback)
+    X_al = X_al.loc[y_al.index]
+    if X_al.shape[1] == 0:
+        st.info("Panel has no numeric columns.")
+    else:
+        corr = X_al.corrwith(y_al).sort_values(ascending=False)
+        top = corr.head(15).dropna()
+        st.dataframe(top.to_frame("corr_with_target").style.format({"corr_with_target": "{:.3f}"}), use_container_width=True)
+        # Horizontal bar chart
+        figc = px.bar(top[::-1], x=top[::-1].values, y=top[::-1].index, orientation="h", title="Top correlations")
+        figc.update_layout(template="plotly_white", height=520, margin=dict(l=20, r=20, t=40, b=20))
+        st.plotly_chart(figc, use_container_width=True)
 
-with tab1:
-    # Historical trend with multiple series
-    col1, col2 = st.columns([3, 1])
-    
-    with col1:
-        # Generate sample data
-        dates = pd.date_range('2018-01-01', '2025-01-01', freq='M')
-        unemployment = 10 + np.sin(np.arange(len(dates)) * 0.05) * 2 + np.random.normal(0, 0.3, len(dates))
-        youth = unemployment * 2.8 + np.random.normal(0, 0.5, len(dates))
-        
-        fig = go.Figure()
-        
-        # Main unemployment rate
-        fig.add_trace(go.Scatter(
-            x=dates,
-            y=unemployment,
-            mode='lines',
-            name='Total Unemployment',
-            line=dict(color='#6366F1', width=3),
-            fill='tozeroy',
-            fillcolor='rgba(99, 102, 241, 0.1)'
-        ))
-        
-        # Youth unemployment
-        fig.add_trace(go.Scatter(
-            x=dates,
-            y=youth,
-            mode='lines',
-            name='Youth (15-24)',
-            line=dict(color='#F59E0B', width=2)
-        ))
-        
-        # Add events/annotations
-        events = [
-            {'date': '2020-03-01', 'text': 'COVID-19 Lockdown', 'y': 12},
-            {'date': '2021-07-01', 'text': 'Recovery Plan', 'y': 11},
-            {'date': '2024-01-01', 'text': 'New Policies', 'y': 8}
-        ]
-        
-        for event in events:
-            fig.add_vline(
-                x=pd.Timestamp(event['date']),
-                line_width=1,
-                line_dash="dash",
-                line_color="rgba(255, 255, 255, 0.3)"
-            )
-            fig.add_annotation(
-                x=event['date'],
-                y=event['y'],
-                text=event['text'],
-                showarrow=True,
-                arrowhead=2,
-                arrowsize=1,
-                arrowwidth=2,
-                arrowcolor="rgba(255, 255, 255, 0.5)",
-                font=dict(size=12, color="white"),
-                bgcolor="rgba(99, 102, 241, 0.8)",
-                bordercolor="rgba(99, 102, 241, 1)",
-                borderwidth=1
-            )
-        
-        fig.update_layout(
-            template="plotly_dark",
-            paper_bgcolor='rgba(0,0,0,0)',
-            plot_bgcolor='rgba(0,0,0,0)',
-            height=450,
-            hovermode='x unified',
-            title="Historical Unemployment Trends (2018-2025)",
-            legend=dict(
-                orientation="h",
-                yanchor="bottom",
-                y=1.02,
-                xanchor="right",
-                x=1
-            )
-        )
-        
-        st.plotly_chart(fig, use_container_width=True)
-    
-    with col2:
-        st.markdown("#### 📊 Quick Stats")
-        
-        stats = [
-            ("Avg 2024", "7.9%"),
-            ("Min 2024", "7.2%"),
-            ("Max 2024", "8.4%"),
-            ("Std Dev", "0.31%"),
-            ("Trend", "↓ Declining")
-        ]
-        
-        for label, value in stats:
-            st.markdown(f"""
-            <div style="
-                background: rgba(30, 41, 59, 0.5);
-                border-left: 3px solid #6366F1;
-                padding: 12px;
-                margin: 10px 0;
-                border-radius: 8px;
-            ">
-                <div style="color: #9CA3AF; font-size: 12px;">{label}</div>
-                <div style="color: white; font-size: 18px; font-weight: 600; margin-top: 5px;">
-                    {value}
-                </div>
-            </div>
-            """, unsafe_allow_html=True)
+# ----------------------------------------------------------------------------
+# Data Quality panel
+# ----------------------------------------------------------------------------
 
-with tab2:
-    # Model predictions comparison
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        # Prediction fan chart
-        dates_future = pd.date_range('2025-01-01', '2026-01-01', freq='M')
-        base_forecast = 7.5 + np.sin(np.arange(len(dates_future)) * 0.1) * 0.5
-        
-        fig = go.Figure()
-        
-        # Add multiple confidence bands
-        for pct, color, alpha in [(95, '#6366F1', 0.1), (80, '#8B5CF6', 0.2), (50, '#10B981', 0.3)]:
-            margin = (100 - pct) / 20
-            upper = base_forecast + margin
-            lower = base_forecast - margin
-            
-            fig.add_trace(go.Scatter(
-                x=dates_future,
-                y=upper,
-                mode='lines',
-                line=dict(width=0),
-                showlegend=False,
-                hoverinfo='skip'
-            ))
-            
-            fig.add_trace(go.Scatter(
-                x=dates_future,
-                y=lower,
-                mode='lines',
-                line=dict(width=0),
-                name=f'{pct}% CI',
-                fill='tonexty',
-                fillcolor=f'rgba({int(color[1:3], 16)}, {int(color[3:5], 16)}, {int(color[5:7], 16)}, {alpha})'
-            ))
-        
-        # Central forecast
-        fig.add_trace(go.Scatter(
-            x=dates_future,
-            y=base_forecast,
-            mode='lines+markers',
-            name='Central Forecast',
-            line=dict(color='white', width=3),
-            marker=dict(size=8, color='#10B981')
-        ))
-        
-        fig.update_layout(
-            template="plotly_dark",
-            paper_bgcolor='rgba(0,0,0,0)',
-            plot_bgcolor='rgba(0,0,0,0)',
-            height=400,
-            title="2025 Unemployment Forecast with Confidence Bands",
-            yaxis_title="Unemployment Rate (%)",
-            xaxis_title=""
-        )
-        
-        st.plotly_chart(fig, use_container_width=True)
-    
-    with col2:
-        # Model performance comparison
-        models_performance = pd.DataFrame({
-            'Model': ['XGBoost', 'LSTM', 'Ridge ARX', 'Ensemble', 'Prophet'],
-            'MAE': [0.18, 0.21, 0.23, 0.16, 0.24],
-            'MAPE': [2.3, 2.7, 2.9, 2.1, 3.1]
-        })
-        
-        fig = px.scatter(
-            models_performance,
-            x='MAE',
-            y='MAPE',
-            size=[100, 80, 70, 120, 60],
-            color='Model',
-            title='Model Performance Comparison',
-            labels={'MAE': 'Mean Absolute Error', 'MAPE': 'MAPE (%)'},
-            color_discrete_sequence=['#6366F1', '#10B981', '#F59E0B', '#EF4444', '#8B5CF6']
-        )
-        
-        fig.update_layout(
-            template="plotly_dark",
-            paper_bgcolor='rgba(0,0,0,0)',
-            plot_bgcolor='rgba(0,0,0,0)',
-            height=400,
-            showlegend=True
-        )
-        
-        st.plotly_chart(fig, use_container_width=True)
-
-with tab3:
-    # Regional analysis
-    col1, col2 = st.columns([2, 1])
-    
-    with col1:
-        # Map placeholder (would use folium or similar in production)
-        regions_data = pd.DataFrame({
-            'Region': ['Lombardia', 'Lazio', 'Campania', 'Sicilia', 'Veneto', 'Piemonte', 'Emilia-Romagna', 'Toscana'],
-            'Rate': [5.1, 7.8, 16.4, 18.2, 4.8, 6.9, 4.5, 6.2],
-            'Change': [-0.3, -0.2, -0.8, -1.1, -0.2, -0.4, -0.1, -0.3]
-        })
-        
-        fig = px.bar(
-            regions_data.sort_values('Rate'),
-            x='Rate',
-            y='Region',
-            orientation='h',
-            color='Rate',
-            color_continuous_scale='RdYlGn_r',
-            title='Unemployment Rate by Region',
-            text='Rate'
-        )
-        
-        fig.update_traces(texttemplate='%{text:.1f}%', textposition='outside')
-        
-        fig.update_layout(
-            template="plotly_dark",
-            paper_bgcolor='rgba(0,0,0,0)',
-            plot_bgcolor='rgba(0,0,0,0)',
-            height=450,
-            xaxis_title="Unemployment Rate (%)",
-            yaxis_title="",
-            showlegend=False
-        )
-        
-        st.plotly_chart(fig, use_container_width=True)
-    
-    with col2:
-        st.markdown("#### 🗺️ Regional Insights")
-        
-        # Regional summary cards
-        for _, row in regions_data.nlargest(3, 'Rate').iterrows():
-            color = "#EF4444" if row['Rate'] > 10 else "#F59E0B"
-            st.markdown(f"""
-            <div style="
-                background: rgba(30, 41, 59, 0.5);
-                border-left: 3px solid {color};
-                padding: 15px;
-                margin: 15px 0;
-                border-radius: 10px;
-            ">
-                <div style="font-weight: 600; color: white; font-size: 16px;">
-                    {row['Region']}
-                </div>
-                <div style="display: flex; justify-content: space-between; margin-top: 8px;">
-                    <span style="color: {color}; font-size: 20px; font-weight: 700;">
-                        {row['Rate']}%
-                    </span>
-                    <span style="color: #10B981; font-size: 14px;">
-                        {row['Change']}%
-                    </span>
-                </div>
-            </div>
-            """, unsafe_allow_html=True)
-
-with tab4:
-    # Market signals and indicators
-    st.markdown("#### 📰 Real-time Market Signals")
-    
-    col1, col2, col3 = st.columns(3)
-    
-    with col1:
-        # Google Trends indicator
-        st.markdown("""
-        <div style="
-            background: linear-gradient(135deg, rgba(99, 102, 241, 0.1), rgba(139, 92, 246, 0.1));
-            border: 1px solid rgba(99, 102, 241, 0.3);
-            border-radius: 15px;
-            padding: 20px;
-        ">
-            <div style="display: flex; align-items: center; margin-bottom: 15px;">
-                <span style="font-size: 24px; margin-right: 10px;">🔍</span>
-                <span style="font-weight: 600; color: white;">Google Trends</span>
-            </div>
-            <div style="font-size: 28px; font-weight: 700; color: #6366F1;">
-                +12%
-            </div>
-            <div style="color: #9CA3AF; font-size: 12px; margin-top: 5px;">
-                "Unemployment benefits" searches
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
-    
-    with col2:
-        # News sentiment
-        st.markdown("""
-        <div style="
-            background: linear-gradient(135deg, rgba(16, 185, 129, 0.1), rgba(5, 150, 105, 0.1));
-            border: 1px solid rgba(16, 185, 129, 0.3);
-            border-radius: 15px;
-            padding: 20px;
-        ">
-            <div style="display: flex; align-items: center; margin-bottom: 15px;">
-                <span style="font-size: 24px; margin-right: 10px;">📰</span>
-                <span style="font-weight: 600; color: white;">News Sentiment</span>
-            </div>
-            <div style="font-size: 28px; font-weight: 700; color: #10B981;">
-                Positive
-            </div>
-            <div style="color: #9CA3AF; font-size: 12px; margin-top: 5px;">
-                68% positive coverage
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
-    
-    with col3:
-        # Job postings
-        st.markdown("""
-        <div style="
-            background: linear-gradient(135deg, rgba(245, 158, 11, 0.1), rgba(217, 119, 6, 0.1));
-            border: 1px solid rgba(245, 158, 11, 0.3);
-            border-radius: 15px;
-            padding: 20px;
-        ">
-            <div style="display: flex; align-items: center; margin-bottom: 15px;">
-                <span style="font-size: 24px; margin-right: 10px;">💼</span>
-                <span style="font-weight: 600; color: white;">Job Postings</span>
-            </div>
-            <div style="font-size: 28px; font-weight: 700; color: #F59E0B;">
-                -5%
-            </div>
-            <div style="color: #9CA3AF; font-size: 12px; margin-top: 5px;">
-                Monthly change
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
-    
-    # Leading indicators chart
-    st.markdown("#### 📊 Leading Indicators Timeline")
-    
-    dates = pd.date_range('2024-01-01', '2025-01-01', freq='W')
-    
-    # Create multiple indicator series
-    indicators = pd.DataFrame({
-        'date': dates,
-        'Google Trends': np.cumsum(np.random.randn(len(dates))) + 100,
-        'Job Postings': np.cumsum(np.random.randn(len(dates)) * 0.8) + 95,
-        'News Sentiment': np.cumsum(np.random.randn(len(dates)) * 0.6) + 102,
-        'Consumer Confidence': np.cumsum(np.random.randn(len(dates)) * 0.7) + 98
-    })
-    
-    fig = go.Figure()
-    
-    colors = ['#6366F1', '#10B981', '#F59E0B', '#EF4444']
-    
-    for idx, col in enumerate(indicators.columns[1:]):
-        fig.add_trace(go.Scatter(
-            x=indicators['date'],
-            y=indicators[col],
-            mode='lines',
-            name=col,
-            line=dict(color=colors[idx], width=2)
-        ))
-    
-    fig.update_layout(
-        template="plotly_dark",
-        paper_bgcolor='rgba(0,0,0,0)',
-        plot_bgcolor='rgba(0,0,0,0)',
-        height=300,
-        hovermode='x unified',
-        yaxis_title="Index (Base=100)",
-        xaxis_title="",
-        legend=dict(
-            orientation="h",
-            yanchor="bottom",
-            y=1.02,
-            xanchor="right",
-            x=1
-        )
-    )
-    
-    st.plotly_chart(fig, use_container_width=True)
-
-# Auto-refresh indicator
 st.markdown("---")
-st.markdown("""
-<div style="text-align: center; padding: 20px; color: #9CA3AF;">
-    <p style="font-size: 12px;">
-        Dashboard auto-refreshes every 60 seconds | Next update in <span id="countdown">60</span>s
-    </p>
-</div>
-""", unsafe_allow_html=True)
+st.subheader("Data quality")
 
-# Add refresh functionality
-if st.checkbox("Enable auto-refresh", value=False):
-    time.sleep(60)
-    st.rerun()
+q = data_quality(y)
+colq1, colq2, colq3 = st.columns(3)
+with colq1:
+    st.metric("Missing months", f"{q['missing']}")
+with colq2:
+    st.metric("Duplicate index", f"{q['duplicate']}")
+with colq3:
+    st.metric("Outliers (>|z|>3.5)", f"{0 if q['outliers'] is None else len(q['outliers'])}")
+
+with st.expander("Details", expanded=False):
+    if q["missing_dates"]:
+        miss_df = pd.DataFrame({"missing_month": pd.to_datetime(q["missing_dates"]).date})
+        st.dataframe(miss_df, use_container_width=True)
+    else:
+        st.write("No missing months in the current sample range.")
+    if q["outliers"] is not None and not q["outliers"].empty:
+        st.write("Potential outliers (robust z-score):")
+        st.dataframe(q["outliers"], use_container_width=True)
+
+# ----------------------------------------------------------------------------
+# Footer
+# ----------------------------------------------------------------------------
+
+st.caption("Dashboard provides an at-a-glance view. For modeling, proceed to **Backtesting** and **Results** pages.")
