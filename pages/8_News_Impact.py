@@ -1,26 +1,17 @@
-# pages/8_News_Impact.py — Multi‑source News (Italy/EU/International) + LLM Impact Scoring
-# ============================================================================
-# What this page does (v2, pro):
-#   • Curated outlets grouped by Region: ITALY / EUROPE / INTERNATIONAL
-#   • User chooses outlets; for each outlet we pull via NewsAPI (if key & toggle)
-#     otherwise we fall back to RSS (or user‑provided custom RSS). CSV upload too.
-#   • Two‑stage scoring per article: keyword_index (fast) + optional LLM scoring
-#     (econ_impact, unemployment_impact in [-1, +1] with rationale). Providers:
-#     OpenAI / Claude / Gemini / Local HTTP (e.g., Ollama). Fully optional-safe.
-#   • Daily → Monthly signals per REGION (counts, kw_score, llm_econ, llm_unemp)
-#     with smoothing and lead/lag; append to panel_monthly with region prefix.
-#   • Impact analysis vs target: overlays, cross‑corr, rolling corr per region.
-#   • Export CSVs; persistent state: news_daily, news_monthly.
-# ============================================================================
-
+# pages/8_News_Impact.py — Pro v3
+# =============================================================================
+# Multi‑region news ingestion (RSS/NewsAPI/GDELT/CSV) → scoring (lexicon+VADER+LLM)
+# → daily metrics → monthly signals per REGION (ITALY/EUROPE/INTERNATIONAL)
+# → impact analysis vs. unemployment target. Fully optional APIs. RSS can run
+# automatically without user clicks (cache/TTL guarded).
+# =============================================================================
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 from dataclasses import dataclass
-from datetime import datetime
-from typing import Dict, List, Optional
+from datetime import datetime, timedelta, timezone
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -28,16 +19,25 @@ import plotly.express as px
 import plotly.graph_objs as go
 import streamlit as st
 
-# Optional deps
+# Optional deps (all gracefully degraded)
 try:
     import feedparser  # RSS
 except Exception:  # pragma: no cover
     feedparser = None  # type: ignore
 
 try:
-    import requests  # NewsAPI / Local HTTP LLM
+    import requests  # HTTP for NewsAPI/GDELT/local LLM
 except Exception:  # pragma: no cover
     requests = None  # type: ignore
+
+# Sentiment (optional)
+try:
+    import nltk  # for VADER
+    from nltk.sentiment import SentimentIntensityAnalyzer
+    _HAVE_VADER = True
+except Exception:  # pragma: no cover
+    SentimentIntensityAnalyzer = None  # type: ignore
+    _HAVE_VADER = False
 
 # LLM providers (all optional)
 try:
@@ -55,9 +55,9 @@ try:
 except Exception:  # pragma: no cover
     genai = None  # type: ignore
 
-# ----------------------------------------------------------------------------
-# State (robust import with fallback)
-# ----------------------------------------------------------------------------
+# =============================================================================
+# App state (robust import with fallback)
+# =============================================================================
 try:
     from utils.state import AppState  # type: ignore
 except Exception:
@@ -65,8 +65,6 @@ except Exception:
         def __init__(self) -> None:
             self.y_monthly: Optional[pd.Series] = None
             self.panel_monthly: Optional[pd.DataFrame] = None
-            self.bt_results: Dict[str, pd.Series] = {}
-            self.bt_metrics: Optional[pd.DataFrame] = None
             self.news_daily: Optional[pd.DataFrame] = None
             self.news_monthly: Optional[pd.DataFrame] = None
     class AppState:  # type: ignore
@@ -76,15 +74,15 @@ except Exception:
                 st.session_state["_app"] = _State()
             return st.session_state["_app"]  # type: ignore
         @staticmethod
-        def get() -> _State:  # noqa
+        def get() -> _State:
             return AppState.init()
 
 state = AppState.init()
 
-# ----------------------------------------------------------------------------
-# Curated outlets by region (editable). Each item: name, rss (list), newsapi_domains (list)
-# ----------------------------------------------------------------------------
-OUTLETS = {
+# =============================================================================
+# Curated outlets (editable). Each item: name, rss (list), domains (NewsAPI)
+# =============================================================================
+OUTLETS: Dict[str, List[Dict[str, List[str]]]] = {
     "ITALY": [
         {"name": "ANSA Economy", "rss": ["https://www.ansa.it/sito/notizie/economia/economia_rss.xml"], "domains": ["ansa.it"]},
         {"name": "Il Sole 24 Ore", "rss": ["https://www.ilsole24ore.com/rss/economia.xml"], "domains": ["ilsole24ore.com"]},
@@ -94,7 +92,7 @@ OUTLETS = {
     "EUROPE": [
         {"name": "Euronews Economy", "rss": ["https://www.euronews.com/rss?level=theme&name=news&theme=economy"], "domains": ["euronews.com"]},
         {"name": "ECB Press", "rss": ["https://www.ecb.europa.eu/press/html/press.en.html"], "domains": ["ecb.europa.eu"]},
-        {"name": "EU Commission Economy", "rss": ["https://ec.europa.eu/commission/presscorner/home/en/rss"], "domains": ["ec.europa.eu"]},
+        {"name": "EU Commission Press", "rss": ["https://ec.europa.eu/commission/presscorner/home/en/rss"], "domains": ["ec.europa.eu"]},
     ],
     "INTERNATIONAL": [
         {"name": "BBC Business", "rss": ["https://feeds.bbci.co.uk/news/business/rss.xml"], "domains": ["bbc.co.uk","bbc.com"]},
@@ -102,53 +100,74 @@ OUTLETS = {
         {"name": "AP Business", "rss": ["https://apnews.com/hub/apf-business?utm_source=apnews.com&utm_medium=referral&utm_campaign=rss"], "domains": ["apnews.com"]},
     ],
 }
-
 REGIONS = list(OUTLETS.keys())
 
-# ----------------------------------------------------------------------------
-# Simple lexicon for keyword_index (IT/EN)
-# ----------------------------------------------------------------------------
-ITALIAN_NEG = {"disoccupazione": -1.0, "licenziamenti": -1.0, "cassa integrazione": -0.8, "crisi": -0.6, "recessione": -0.8}
-ITALIAN_POS = {"assunzioni": +0.9, "occupazione": +0.8, "nuovi posti di lavoro": +1.0, "ripresa": +0.6}
-EN_NEG = {"unemployment": -0.8, "layoffs": -1.0, "jobless": -0.7, "recession": -0.8, "strike": -0.4}
-EN_POS = {"hiring": +0.9, "jobs added": +0.8, "job growth": +0.8, "recovery": +0.6}
+# =============================================================================
+# Keyword lexicon (IT/EN) — transparent deterministic score
+# =============================================================================
+ITALIAN_NEG = {
+    "disoccupazione": -1.0, "licenziamenti": -1.0, "cassa integrazione": -0.8,
+    "crisi": -0.6, "recessione": -0.8, "sciopero": -0.4
+}
+ITALIAN_POS = {
+    "assunzioni": +0.9, "occupazione": +0.7, "nuovi posti di lavoro": +1.0, "ripresa": +0.6
+}
+EN_NEG = {
+    "unemployment": -0.8, "layoffs": -1.0, "jobless": -0.7, "recession": -0.8, "strike": -0.4
+}
+EN_POS = {
+    "hiring": +0.9, "jobs added": +0.8, "job growth": +0.8, "recovery": +0.6
+}
 
-# ----------------------------------------------------------------------------
-# Utilities
-# ----------------------------------------------------------------------------
+# =============================================================================
+# Small helpers
+# =============================================================================
 
-def _to_dt(s):
-    return pd.to_datetime(s, errors="coerce").tz_localize(None)
-
-def _normalize_date(s):
-    return _to_dt(s).dt.normalize()
+def _to_dt(s) -> pd.Series:
+    return pd.to_datetime(s, errors="coerce").dt.tz_localize(None)
 
 @st.cache_data(show_spinner=False)
-def _hash_id(*parts) -> str:
-    m = hashlib.sha1()
-    for p in parts:
-        m.update(str(p).encode("utf-8"))
-    return m.hexdigest()[:16]
+def _parse_rss_cached(url: str) -> dict:
+    return feedparser.parse(url) if feedparser is not None else {}
 
-# ----------------------------------------------------------------------------
-# Sidebar controls
-# ----------------------------------------------------------------------------
+def _extract_dt(entry) -> Optional[datetime]:
+    # Try struct_time
+    for k in ("published_parsed", "updated_parsed", "created_parsed"):
+        val = getattr(entry, k, None)
+        if val is not None:
+            try:
+                return datetime(*val[:6])
+            except Exception:
+                pass
+    # Try text fields
+    for k in ("published", "updated", "created", "pubDate", "dc_date"):
+        val = getattr(entry, k, None)
+        if val:
+            try:
+                return pd.to_datetime(val).to_pydatetime()
+            except Exception:
+                pass
+    return None
 
-st.title("📰 News → Impact on Unemployment (by Region)")
-st.caption("Select outlets by region, collect news via RSS/NewsAPI, score with keywords and optional LLM, build monthly signals, and analyze impact vs target.")
+# =============================================================================
+# UI — controls
+# =============================================================================
+
+st.title("📰 News → Impact on Unemployment (By Region)")
+st.caption("Collect from user‑selected outlets (RSS/NewsAPI), score with lexicon/VADER/LLM, build regional monthly signals, and analyze impact vs the target.")
 
 with st.sidebar:
     st.header("Providers & Regions")
-    use_rss = st.checkbox("Use RSS", value=True)
+    use_rss = st.checkbox("Use RSS (no API)", value=True)
     use_newsapi = st.checkbox("Use NewsAPI (needs key)", value=False)
-    st.markdown("— You can also upload a CSV (date,title,source,content,url) in the page.")
+    use_gdelt = st.checkbox("Use GDELT (experimental)", value=False)
 
     st.markdown("---")
-    st.header("Outlets by region")
-    region = st.selectbox("Region", REGIONS, index=0)
-    names = [o["name"] for o in OUTLETS[region]]
-    selected_outlets = st.multiselect("Choose outlets", options=names, default=names[: min(3, len(names))])
-    add_custom_rss = st.text_area("Custom RSS (one per line)", value="", height=80)
+    st.header("Regions & Outlets")
+    region = st.selectbox("Region", options=REGIONS, index=0)
+    available = [o["name"] for o in OUTLETS[region]]
+    choose = st.multiselect("Outlets", options=available, default=available[: min(3, len(available))])
+    custom_rss = st.text_area("Custom RSS (one per line)", "", height=80)
 
     st.markdown("---")
     st.header("Date window")
@@ -156,61 +175,47 @@ with st.sidebar:
         ymin, ymax = state.y_monthly.index.min().date(), state.y_monthly.index.max().date()
     else:
         ymin, ymax = datetime(2019, 1, 1).date(), datetime.today().date()
-    dr = st.date_input("From / To", value=(ymin, ymax))
+    dr = st.date_input("From / To", (ymin, ymax))
 
     st.markdown("---")
-    st.header("LLM Scoring (optional)")
-    llm_enable = st.checkbox("LLM economic/unemployment impact scoring", value=False)
-    llm_provider = st.selectbox("Provider", ["openai","anthropic","gemini","local"], index=0, disabled=not llm_enable)
+    st.header("Auto RSS")
+    auto_collect = st.checkbox("Auto‑collect on load (RSS only)", value=True)
+    rss_ttl = st.number_input("RSS cache TTL (minutes)", 5, 180, 30)
+
+    st.markdown("---")
+    st.header("Scoring")
+    use_vader = st.checkbox("Add VADER sentiment (if available)", value=_HAVE_VADER)
+    llm_enable = st.checkbox("LLM impact (econ & unemployment)", value=False)
+    llm_provider = st.selectbox("Provider", ["openai","anthropic","gemini","local"], disabled=not llm_enable)
     llm_model = st.text_input("Model", value="gpt-4o-mini", disabled=not llm_enable)
-    llm_temperature = st.slider("Creativity", 0.0, 1.0, 0.2, 0.05, disabled=not llm_enable)
-    llm_max = st.slider("Max articles to LLM‑score per run", 10, 300, 60, 10, disabled=not llm_enable)
+    llm_temp = st.slider("Creativity", 0.0, 1.0, 0.2, 0.05, disabled=not llm_enable)
+    llm_max = st.slider("Max articles to LLM‑score", 10, 300, 60, 10, disabled=not llm_enable)
 
     st.markdown("---")
     st.header("Aggregation")
     smooth_ma = st.slider("Monthly smoothing MA", 1, 12, 3)
-    lead_lag = st.slider("Lead/Lag months (signal shift)", -6, 6, 0)
-    append_panel = st.checkbox("Append monthly signals to panel_monthly", value=True)
+    lead_lag = st.slider("Lead/Lag months", -6, 6, 0)
+    append_panel = st.checkbox("Append to panel_monthly", value=True)
 
-# ----------------------------------------------------------------------------
-# Ingest controls (center)
-# ----------------------------------------------------------------------------
+# Build region inputs
+sel = [o for o in OUTLETS[region] if o["name"] in choose]
+region_rss = [u for o in sel for u in o.get("rss", [])]
+if custom_rss.strip():
+    region_rss += [u.strip() for u in custom_rss.splitlines() if u.strip()]
+region_domains = [d for o in sel for d in o.get("domains", [])]
 
-st.subheader("1) Ingest news")
-
-col1, col2, col3 = st.columns([1.2, 1.2, 1.0])
-
-with col1:
-    st.markdown("**Selected outlets (current region)**")
-    st.write(", ".join(selected_outlets) if selected_outlets else "—")
-with col2:
-    st.markdown("**Providers enabled**")
-    st.write(("RSS" if use_rss else "") + (" + NewsAPI" if use_newsapi else ""))
-with col3:
-    up = st.file_uploader("Upload CSV (date,title,source,content,url)", type=["csv"])
-
-# ----------------------------------------------------------------------------
-# Build outlet list / domains / rss for selected region
-# ----------------------------------------------------------------------------
-
-sel_objs = [o for o in OUTLETS[region] if o["name"] in selected_outlets]
-region_rss = [u for o in sel_objs for u in o.get("rss", [])]
-region_domains = [d for o in sel_objs for d in o.get("domains", [])]
-if add_custom_rss.strip():
-    region_rss.extend([u.strip() for u in add_custom_rss.splitlines() if u.strip()])
-
-# CSV upload parse
-csv_df = pd.read_csv(up) if up is not None else pd.DataFrame(columns=["date","title","source","content","url"]) 
-if not csv_df.empty:
+# Upload CSV (fallback / augmentation)
+up = st.file_uploader("Upload CSV (date,title,source,content,url; UTF‑8)", type=["csv"])
+upload_df = pd.read_csv(up) if up is not None else pd.DataFrame(columns=["date","title","source","content","url"]) 
+if not upload_df.empty:
     for c in ["date","title","source","content","url"]:
-        if c not in csv_df.columns:
-            csv_df[c] = ""
-    csv_df["date"] = _normalize_date(csv_df["date"])  # normalize tz
-    csv_df["provider"] = "upload"; csv_df["region"] = region
+        if c not in upload_df.columns: upload_df[c] = ""
+    upload_df["date"] = _to_dt(upload_df["date"]).dt.normalize()
+    upload_df["provider"] = "upload"; upload_df["region"] = region
 
-# ----------------------------------------------------------------------------
-# Provider helpers
-# ----------------------------------------------------------------------------
+# =============================================================================
+# Providers
+# =============================================================================
 
 def _rss_fetch(urls: List[str], d_from: datetime, d_to: datetime, region_tag: str) -> pd.DataFrame:
     if not use_rss or feedparser is None or not urls:
@@ -218,28 +223,18 @@ def _rss_fetch(urls: List[str], d_from: datetime, d_to: datetime, region_tag: st
     rows = []
     for u in urls:
         try:
-            d = feedparser.parse(u)
-            feed_name = d.feed.get("title", "RSS") if hasattr(d, "feed") else "RSS"
-            for e in d.entries:
-                dt = None
-                for k in ("published_parsed","updated_parsed"):
-                    if hasattr(e, k) and getattr(e, k) is not None:
-                        try:
-                            dt = datetime(*getattr(e, k)[:6])
-                            break
-                        except Exception:
-                            pass
-                if dt is None:
-                    continue
-                dt = pd.to_datetime(dt).tz_localize(None)
+            d = _parse_rss_cached(u) or {}
+            feed_name = (d.get("feed") or {}).get("title", "RSS")
+            for e in d.get("entries", []):
+                dt = _extract_dt(e) or datetime.now(tz=timezone.utc).replace(tzinfo=None)
                 if not (d_from <= dt.date() <= d_to):
                     continue
                 rows.append({
-                    "date": dt.normalize(),
-                    "title": getattr(e, "title", "").strip(),
+                    "date": pd.to_datetime(dt).tz_localize(None).normalize(),
+                    "title": getattr(e, "title", "") or "",
                     "source": feed_name,
-                    "content": getattr(e, "summary", ""),
-                    "url": getattr(e, "link", ""),
+                    "content": getattr(e, "summary", "") or "",
+                    "url": getattr(e, "link", "") or "",
                     "provider": "rss",
                     "region": region_tag,
                 })
@@ -253,11 +248,9 @@ def _newsapi_fetch(domains: List[str], query: str, d_from: datetime, d_to: datet
         return pd.DataFrame(columns=["date","title","source","content","url","provider","region"]) 
     key = os.getenv("NEWSAPI_KEY") or (st.secrets.get("NEWSAPI_KEY") if hasattr(st, "secrets") else None)
     if not key:
-        st.info("NEWSAPI_KEY not set; skipping NewsAPI calls.")
-        return pd.DataFrame(columns=["date","title","source","content","url","provider","region"]) 
+        st.info("NEWSAPI_KEY not set; skipping NewsAPI.")
+        return pd.DataFrame()
     base = "https://newsapi.org/v2/everything"
-    rows = []
-    # NewsAPI limits: pass domains (comma‑sep) and restrict languages
     params = {
         "q": query,
         "domains": ",".join(domains),
@@ -269,16 +262,16 @@ def _newsapi_fetch(domains: List[str], query: str, d_from: datetime, d_to: datet
         "page": 1,
         "apiKey": key,
     }
+    rows = []
     try:
         r = requests.get(base, params=params, timeout=30)
         if r.status_code != 200:
             st.warning(f"NewsAPI error {r.status_code}: {r.text[:120]}")
             return pd.DataFrame()
-        data = r.json()
-        for a in data.get("articles", []):
-            dt = pd.to_datetime(a.get("publishedAt")).tz_localize(None)
+        for a in r.json().get("articles", []):
+            dt = pd.to_datetime(a.get("publishedAt")).tz_localize(None).normalize()
             rows.append({
-                "date": dt.normalize(),
+                "date": dt,
                 "title": a.get("title", "") or "",
                 "source": (a.get("source") or {}).get("name", "NewsAPI"),
                 "content": a.get("description", "") or "",
@@ -290,56 +283,102 @@ def _newsapi_fetch(domains: List[str], query: str, d_from: datetime, d_to: datet
         st.warning(f"NewsAPI request failed: {e}")
     return pd.DataFrame(rows)
 
-# ----------------------------------------------------------------------------
-# Run ingestion
-# ----------------------------------------------------------------------------
 
+def _gdelt_fetch(keywords: List[str], d_from: datetime, d_to: datetime, region_tag: str) -> pd.DataFrame:
+    # Minimal, may return empty due to API volatility; keep optional.
+    if not use_gdelt or requests is None or not keywords:
+        return pd.DataFrame(columns=["date","title","source","content","url","provider","region"]) 
+    try:
+        q = " OR ".join(keywords)
+        url = "https://api.gdeltproject.org/api/v2/doc/doc"
+        params = {"query": q, "mode": "ArtList", "format": "JSON", "maxrecords": 250}
+        r = requests.get(url, params=params, timeout=30)
+        rows = []
+        if r.status_code == 200:
+            for a in r.json().get("articles", []):
+                dt = pd.to_datetime(a.get("seendate")).tz_localize(None).normalize()
+                if d_from <= dt.date() <= d_to:
+                    rows.append({
+                        "date": dt,
+                        "title": a.get("title", ""),
+                        "source": a.get("sourceCommonName", "GDELT"),
+                        "content": a.get("snippet", ""),
+                        "url": a.get("url", ""),
+                        "provider": "gdelt",
+                        "region": region_tag,
+                    })
+        else:
+            st.info("GDELT unreachable/limited; skipping.")
+        return pd.DataFrame(rows)
+    except Exception:
+        return pd.DataFrame()
+
+# =============================================================================
+# Auto RSS collection on load (no API)
+# =============================================================================
+
+d_from, d_to = pd.to_datetime(dr[0]), pd.to_datetime(dr[1])
+
+if auto_collect and use_rss and region_rss:
+    ttl_bucket = pd.Timestamp.utcnow().floor(f"{int(rss_ttl)}min")
+    auto_key = f"auto::{region}::{hash(tuple(region_rss))}::{d_from.date()}::{d_to.date()}::{ttl_bucket}"
+    if st.session_state.get("_news_auto_key") != auto_key:
+        auto_df = _rss_fetch(region_rss, d_from, d_to, region)
+        if not auto_df.empty:
+            if state.news_daily is None or state.news_daily.empty:
+                state.news_daily = auto_df
+            else:
+                state.news_daily = pd.concat([state.news_daily, auto_df], ignore_index=True)
+                state.news_daily = state.news_daily.drop_duplicates(subset=["date","title","region"], keep="first")
+            st.success(f"[Auto‑RSS] Collected {len(auto_df):,} items for {region}.")
+        else:
+            st.info("[Auto‑RSS] No items in current window.")
+        st.session_state["_news_auto_key"] = auto_key
+
+# Manual collection button (merges with existing)
 if st.button("Collect news", type="primary"):
-    d_from, d_to = pd.to_datetime(dr[0]), pd.to_datetime(dr[1])
     frames = []
-    # Selected region only in this run; user can switch region and press again
     frames.append(_rss_fetch(region_rss, d_from, d_to, region))
     query = "(unemployment OR layoffs OR jobs OR lavoro OR disoccupazione)"
     frames.append(_newsapi_fetch(region_domains, query, d_from, d_to, region))
-    if not csv_df.empty:
-        frames.append(csv_df)
-
-    all_news = (
-        pd.concat([f for f in frames if f is not None and not f.empty], ignore_index=True)
-        if frames else pd.DataFrame(columns=["date","title","source","content","url","provider","region"]) 
-    )
+    if use_gdelt:
+        frames.append(_gdelt_fetch(["disoccupazione","lavoro","unemployment","layoffs"], d_from, d_to, region))
+    if not upload_df.empty:
+        frames.append(upload_df)
+    all_news = pd.concat([f for f in frames if f is not None and not f.empty], ignore_index=True) if frames else pd.DataFrame()
     if all_news.empty:
-        st.warning("No news collected for this run. Check providers/keys or widen date range.")
+        st.warning("No news collected. Check providers/keys or widen the date range.")
     else:
-        # de‑dup by (date,title) within region
         all_news = all_news.dropna(subset=["date"]).copy()
         all_news["title"] = all_news["title"].fillna("").astype(str).str.strip()
-        all_news["region"] = all_news["region"].fillna(region)
         all_news = all_news.sort_values("date").drop_duplicates(subset=["date","title","region"], keep="first")
-        # merge to existing state (append)
         if state.news_daily is None or state.news_daily.empty:
             state.news_daily = all_news
         else:
-            state.news_daily = pd.concat([state.news_daily, all_news], ignore_index=True).drop_duplicates(subset=["date","title","region"], keep="first")
-        st.success(f"Collected {len(all_news):,} articles (region={region}). Total in session: {len(state.news_daily):,}")
+            state.news_daily = pd.concat([state.news_daily, all_news], ignore_index=True)
+            state.news_daily = state.news_daily.drop_duplicates(subset=["date","title","region"], keep="first")
+        st.success(f"Added {len(all_news):,} items. Total in session: {len(state.news_daily):,}.")
 
 # Preview
 if state.news_daily is not None and not state.news_daily.empty:
-    st.markdown("### Preview (latest 30 across regions)")
+    st.markdown("### Latest 30 articles (all regions)")
     st.dataframe(state.news_daily.sort_values("date").tail(30), use_container_width=True)
+else:
+    st.info("No news in session yet. Enable Auto‑RSS or click Collect news.")
 
-# ----------------------------------------------------------------------------
-# 2) Scoring — keyword index and (optional) LLM impact
-# ----------------------------------------------------------------------------
+# =============================================================================
+# Scoring: lexicon + optional VADER + optional LLM
+# =============================================================================
 
 st.markdown("---")
 st.subheader("2) Score articles → daily metrics by region")
 
 if state.news_daily is None or state.news_daily.empty:
-    st.info("Collect some news first.")
     st.stop()
 
-# Keyword score
+news = state.news_daily.copy()
+
+# Lexicon score
 
 def _kw_score(text: str) -> float:
     t = (text or "").lower()
@@ -354,214 +393,185 @@ def _kw_score(text: str) -> float:
         if w in t: s += v
     return float(s)
 
-news = state.news_daily.copy()
 news["kw_score"] = [
     _kw_score(f"{t}\n{c}") for t, c in zip(news.get("title",""), news.get("content",""))
 ]
 
-# Optional LLM scoring (econ_impact, unemp_impact in [-1,1])
+# VADER (optional)
+if use_vader and _HAVE_VADER:
+    try:
+        # download lexicon lazily once
+        try:
+            nltk.data.find("sentiment/vader_lexicon.zip")
+        except Exception:
+            nltk.download("vader_lexicon")
+        sia = SentimentIntensityAnalyzer()
+        news["vader_compound"] = [sia.polarity_scores((f"{t}. {c}"))['compound'] for t, c in zip(news.get("title",""), news.get("content",""))]
+    except Exception:
+        st.info("VADER not available; skipping.")
+        news["vader_compound"] = np.nan
+else:
+    if "vader_compound" not in news.columns:
+        news["vader_compound"] = np.nan
 
-def _llm_clients():
-    cl = {
-        "openai": None,
-        "anthropic": None,
-        "gemini": None,
-    }
-    if llm_enable:
-        if llm_provider == "openai" and OpenAI is not None:
-            key = os.getenv("OPENAI_API_KEY") or (st.secrets.get("OPENAI_API_KEY") if hasattr(st, "secrets") else None)
-            if key:
-                cl["openai"] = OpenAI(api_key=key)
-        if llm_provider == "anthropic" and anthropic is not None:
-            key = os.getenv("ANTHROPIC_API_KEY") or (st.secrets.get("ANTHROPIC_API_KEY") if hasattr(st, "secrets") else None)
-            if key:
-                cl["anthropic"] = anthropic.Anthropic(api_key=key)
-        if llm_provider == "gemini" and genai is not None:
-            key = os.getenv("GOOGLE_API_KEY") or (st.secrets.get("GOOGLE_API_KEY") if hasattr(st, "secrets") else None)
-            if key:
-                genai.configure(api_key=key)
-                cl["gemini"] = genai.GenerativeModel(llm_model)
-    return cl
-
+# LLM scoring (econ_impact & unemp_impact in [-1,1])
 LLM_PROMPT = (
-    "You are an economic analyst. Read the headline and short summary. "
-    "Return a strict JSON with fields: econ_impact [-1..1], unemp_impact [-1..1], rationale (<=60 words). "
-    "econ_impact captures overall macro/financial impact; unemp_impact captures likely direction on unemployment (higher=more unemployment). "
-    "Be conservative; if unsure, output 0.0. Example: {\"econ_impact\": -0.2, \"unemp_impact\": 0.1, \"rationale\": \"mild slowdown\"}."
+    "You are an economic analyst. Read headline and summary and return a strict JSON: "
+    "{\\"econ_impact\\": [-1..1], \\"unemp_impact\\": [-1..1], \\"rationale\\": string<=60}. "
+    "econ_impact = macro/financial direction. unemp_impact = direction on unemployment (higher→more unemployment). "
+    "Be conservative; 0 if unclear."
 )
 
-@st.cache_data(show_spinner=False)
-def _llm_cache_key(txt: str, prov: str, model: str) -> str:
-    return _hash_id("llm", prov, model, txt[:500])
+
+def _llm_client(provider: str, model: str):
+    if not llm_enable: return None
+    if provider == "openai" and OpenAI is not None:
+        key = os.getenv("OPENAI_API_KEY") or (st.secrets.get("OPENAI_API_KEY") if hasattr(st, "secrets") else None)
+        return OpenAI(api_key=key) if key else None
+    if provider == "anthropic" and anthropic is not None:
+        key = os.getenv("ANTHROPIC_API_KEY") or (st.secrets.get("ANTHROPIC_API_KEY") if hasattr(st, "secrets") else None)
+        return anthropic.Anthropic(api_key=key) if key else None
+    if provider == "gemini" and genai is not None:
+        key = os.getenv("GOOGLE_API_KEY") or (st.secrets.get("GOOGLE_API_KEY") if hasattr(st, "secrets") else None)
+        if key:
+            genai.configure(api_key=key)
+            return genai.GenerativeModel(model)
+    if provider == "local" and requests is not None:
+        # generic chat endpoint like Ollama
+        return os.getenv("OLLAMA_ENDPOINT") or (st.secrets.get("OLLAMA_ENDPOINT") if hasattr(st, "secrets") else None)
+    return None
 
 
-def _llm_score_rows(df_in: pd.DataFrame) -> pd.DataFrame:
-    if not llm_enable:
+def _llm_score_subset(df: pd.DataFrame) -> pd.DataFrame:
+    if not llm_enable or df.empty:
         return pd.DataFrame(columns=["econ_impact","unemp_impact","rationale"]) 
-    clients = _llm_clients()
-    prov = llm_provider
-    if prov == "local":
-        endpoint = os.getenv("OLLAMA_ENDPOINT") or (st.secrets.get("OLLAMA_ENDPOINT") if hasattr(st, "secrets") else None)
-    n = min(llm_max, len(df_in))
-    out_rows = []
-    bar = st.progress(0.0, text=f"LLM scoring ({prov})…")
-    for i, (_, r) in enumerate(df_in.head(n).iterrows(), 1):
+    client = _llm_client(llm_provider, llm_model)
+    if client is None:
+        st.info("LLM provider not configured; skipping.")
+        return pd.DataFrame(columns=["econ_impact","unemp_impact","rationale"]) 
+    n = min(llm_max, len(df))
+    out = []
+    prog = st.progress(0.0, text=f"LLM scoring ({llm_provider})…")
+    for i, (_, r) in enumerate(df.head(n).iterrows(), 1):
         txt = f"Title: {r['title']}\nSource: {r['source']}\nRegion: {r['region']}\nSummary: {r['content']}"
-        ck = _llm_cache_key(txt, prov, llm_model)
-        cached = st.session_state.get(ck)
-        if cached:
-            out_rows.append(cached)
-            bar.progress(i / n)
-            continue
-        res = {"econ_impact": 0.0, "unemp_impact": 0.0, "rationale": "n/a"}
         try:
-            if prov == "openai" and clients["openai"] is not None:
-                c = clients["openai"]
-                resp = c.chat.completions.create(
+            if llm_provider == "openai":
+                resp = client.chat.completions.create(
                     model=llm_model,
-                    temperature=float(llm_temperature),
-                    messages=[
-                        {"role":"system","content": LLM_PROMPT},
-                        {"role":"user","content": txt},
-                    ],
+                    temperature=float(llm_temp),
+                    messages=[{"role":"system","content": LLM_PROMPT},{"role":"user","content": txt}],
                     response_format={"type":"json_object"},
                 )
-                res = json.loads(resp.choices[0].message.content)
-            elif prov == "anthropic" and clients["anthropic"] is not None:
-                c = clients["anthropic"]
-                m = c.messages.create(
-                    model=llm_model,
-                    temperature=float(llm_temperature),
-                    max_tokens=256,
-                    system=LLM_PROMPT,
-                    messages=[{"role":"user","content": txt}],
+                js = json.loads(resp.choices[0].message.content)
+            elif llm_provider == "anthropic":
+                m = client.messages.create(
+                    model=llm_model, temperature=float(llm_temp), max_tokens=256,
+                    system=LLM_PROMPT, messages=[{"role":"user","content": txt}],
                 )
-                res = json.loads(m.content[0].text)
-            elif prov == "gemini" and clients["gemini"] is not None:
-                model = clients["gemini"]
-                rp = model.generate_content([
-                    {"role":"user","parts":[LLM_PROMPT + "\n\n" + txt]}  # simple prompt
-                ])
-                res = json.loads(rp.text)
-            elif prov == "local" and requests is not None and (endpoint := (os.getenv("OLLAMA_ENDPOINT") or (st.secrets.get("OLLAMA_ENDPOINT") if hasattr(st,"secrets") else None))):
-                payload = {"model": llm_model, "messages": [
-                    {"role":"system","content": LLM_PROMPT},
-                    {"role":"user","content": txt},
-                ]}
-                rr = requests.post(endpoint, json=payload, timeout=60)
-                try:
-                    data = rr.json()
-                    content = data.get("message",{}).get("content") or data.get("choices", [{}])[0].get("message",{}).get("content")
-                    res = json.loads(content)
-                except Exception:
-                    pass
+                js = json.loads(m.content[0].text)
+            elif llm_provider == "gemini":
+                rp = client.generate_content([{"role":"user","parts":[LLM_PROMPT + "\n\n" + txt]}])
+                js = json.loads(rp.text)
+            else:  # local http
+                endpoint = client  # type: ignore
+                rr = requests.post(endpoint, json={"model": llm_model, "messages":[{"role":"system","content": LLM_PROMPT},{"role":"user","content": txt}]}, timeout=60)
+                data = rr.json()
+                content = data.get("message",{}).get("content") or data.get("choices", [{}])[0].get("message",{}).get("content")
+                js = json.loads(content)
+            out.append({
+                "econ_impact": float(js.get("econ_impact", 0.0)),
+                "unemp_impact": float(js.get("unemp_impact", 0.0)),
+                "rationale": str(js.get("rationale", ""))[:240],
+            })
         except Exception:
-            pass
-        # sanitize
-        try:
-            res = {
-                "econ_impact": float(res.get("econ_impact", 0.0)),
-                "unemp_impact": float(res.get("unemp_impact", 0.0)),
-                "rationale": str(res.get("rationale", ""))[:240],
-            }
-        except Exception:
-            res = {"econ_impact": 0.0, "unemp_impact": 0.0, "rationale": "n/a"}
-        st.session_state[ck] = res
-        out_rows.append(res)
-        bar.progress(i / n)
-    bar.empty()
-    return pd.DataFrame(out_rows)
+            out.append({"econ_impact": 0.0, "unemp_impact": 0.0, "rationale": "n/a"})
+        prog.progress(i/n)
+    prog.empty()
+    return pd.DataFrame(out)
 
-# Run LLM scoring on *new* rows without econ/unemp columns
-need_llm = llm_enable and ("econ_impact" not in news.columns or news["econ_impact"].isna().all())
-if need_llm:
-    scored = _llm_score_rows(news)
+# add LLM columns if missing
+for c in ["econ_impact","unemp_impact","rationale"]:
+    if c not in news.columns: news[c] = np.nan if c != "rationale" else ""
+
+if llm_enable:
+    scored = _llm_score_subset(news[news["econ_impact"].isna()])
     if not scored.empty:
-        # pad if we scored subset only
-        for col in ["econ_impact","unemp_impact","rationale"]:
-            news[col] = news.get(col)
-        news.loc[news.index[:len(scored)], ["econ_impact","unemp_impact","rationale"]] = scored.values
-else:
-    # ensure columns exist
-    for col in ["econ_impact","unemp_impact","rationale"]:
-        if col not in news.columns:
-            news[col] = np.nan if col != "rationale" else ""
+        idx = news[news["econ_impact"].isna()].index[: len(scored)]
+        news.loc[idx, ["econ_impact","unemp_impact","rationale"]] = scored.values
 
+# Persist back
 state.news_daily = news
 
-# Daily metrics by region
-metrics_daily = (
+# Daily metrics
+daily = (
     news.groupby([news["date"].dt.normalize(), "region"]).agg(
         n=("title","count"),
         kw_mean=("kw_score","mean"),
-        econ_llm=("econ_impact","mean"),
-        unemp_llm=("unemp_impact","mean"),
+        vader=("vader_compound","mean"),
+        llm_econ=("econ_impact","mean"),
+        llm_unemp=("unemp_impact","mean"),
     ).reset_index().rename(columns={"date":"day"})
 )
 
-st.markdown("**Daily metrics (tail, all regions)**")
-st.dataframe(metrics_daily.tail(30), use_container_width=True)
+st.markdown("**Daily metrics (tail)**")
+st.dataframe(daily.tail(30), use_container_width=True)
 
-# Plot daily counts (stacked by region)
-figd = px.bar(metrics_daily, x="day", y="n", color="region", title="#articles per day (stacked)")
-figd.update_layout(template="plotly_white", height=380)
+figd = px.bar(daily, x="day", y="n", color="region", title="#articles per day (stacked)")
+figd.update_layout(template="plotly_white", height=360)
 st.plotly_chart(figd, use_container_width=True)
 
-# ----------------------------------------------------------------------------
-# 3) Monthly signals by region
-# ----------------------------------------------------------------------------
+# =============================================================================
+# Monthly signals (per region) + append to panel
+# =============================================================================
 
 st.markdown("---")
-st.subheader("3) Build monthly signals (by region)")
+st.subheader("3) Build monthly signals by region")
 
-m = metrics_daily.set_index("day")
-M_list = []
+monthly_parts = []
 for reg in REGIONS:
-    g = m[m["region"] == reg]
-    if g.empty:
-        continue
+    g = daily[daily["region"] == reg].set_index("day")
+    if g.empty: continue
     mm = pd.DataFrame({
         f"news_{reg.lower()}__count": g["n"].resample("M").sum(min_count=1),
         f"news_{reg.lower()}__kw": g["kw_mean"].resample("M").mean(),
-        f"news_{reg.lower()}__llm_econ": g["econ_llm"].resample("M").mean(),
-        f"news_{reg.lower()}__llm_unemp": g["unemp_llm"].resample("M").mean(),
+        f"news_{reg.lower()}__vader": g["vader"].resample("M").mean(),
+        f"news_{reg.lower()}__llm_econ": g["llm_econ"].resample("M").mean(),
+        f"news_{reg.lower()}__llm_unemp": g["llm_unemp"].resample("M").mean(),
     })
     if smooth_ma and smooth_ma > 1:
         for c in list(mm.columns):
             mm[c + f"_ma{smooth_ma}"] = mm[c].rolling(smooth_ma, min_periods=1).mean()
     if lead_lag != 0:
         mm = mm.shift(int(lead_lag))
-    M_list.append(mm)
+    monthly_parts.append(mm)
 
-monthly = pd.concat(M_list, axis=1).sort_index() if M_list else pd.DataFrame()
+monthly = pd.concat(monthly_parts, axis=1).sort_index() if monthly_parts else pd.DataFrame()
 state.news_monthly = monthly
 
 st.markdown("**Monthly signals (tail)**")
 st.dataframe(monthly.tail(24), use_container_width=True)
 
 if append_panel and state.panel_monthly is not None:
-    P = state.panel_monthly.copy()
-    P = P.join(monthly, how="outer")
-    state.panel_monthly = P
-    st.success("Appended regional news signals to panel_monthly.")
+    state.panel_monthly = state.panel_monthly.join(monthly, how="outer")
+    st.success("Signals appended to panel_monthly.")
 
-# ----------------------------------------------------------------------------
-# 4) Impact analysis vs target (per region)
-# ----------------------------------------------------------------------------
+# =============================================================================
+# Impact analysis vs target
+# =============================================================================
 
 st.markdown("---")
-st.subheader("4) Impact analysis vs target (per region)")
+st.subheader("4) Impact analysis vs target")
 
 if state.y_monthly is None or state.y_monthly.empty or monthly.empty:
     st.info("Need target and monthly signals.")
 else:
     y = state.y_monthly
-    # Overlay standardized
+    # Overlay (z-scores)
     figm = go.Figure(); figm.add_trace(go.Scatter(x=y.index, y=(y-y.mean())/(y.std(ddof=0)+1e-9), name="Target (z)", mode="lines", line=dict(width=3)))
     for reg in REGIONS:
         col = f"news_{reg.lower()}__llm_unemp"
         if col in monthly.columns:
-            z = (monthly[col] - monthly[col].mean()) / (monthly[col].std(ddof=0)+1e-9)
+            z = (monthly[col] - monthly[col].mean())/(monthly[col].std(ddof=0)+1e-9)
             figm.add_trace(go.Scatter(x=monthly.index, y=z, name=f"{reg}: llm_unemp (z)", mode="lines"))
     figm.update_layout(template="plotly_white", height=420, title="Target vs LLM unemployment impact (z‑scores)")
     st.plotly_chart(figm, use_container_width=True)
@@ -569,35 +579,44 @@ else:
     # Cross‑correlation table (±6)
     rows = []
     for reg in REGIONS:
-        for sig in [f"news_{reg.lower()}__kw", f"news_{reg.lower()}__llm_unemp"]:
-            if sig not in monthly.columns:
-                continue
+        for sig in [f"news_{reg.lower()}__kw", f"news_{reg.lower()}__llm_unemp", f"news_{reg.lower()}__vader"]:
+            if sig not in monthly.columns: continue
             for L in range(-6, 7):
                 if L >= 0:
                     ya, xa = y.align(monthly[sig].shift(L), join="inner")
                 else:
                     ya, xa = y.shift(-L).align(monthly[sig], join="inner")
-                if len(ya) >= 6:
-                    corr = float(np.corrcoef(ya.values, xa.values)[0,1])
-                    rows.append({"region": reg, "feature": sig, "lag": L, "corr": corr})
+                if len(ya) >= 6 and len(xa) == len(ya):
+                    c = float(np.corrcoef(ya.values, xa.values)[0,1])
+                    rows.append({"region": reg, "feature": sig, "lag": L, "corr": c})
     CC = pd.DataFrame(rows)
     if not CC.empty:
-        best = CC.loc[CC.groupby(["region","feature"])]["corr"].idxmax()
-        st.dataframe(CC.loc[best].sort_values("corr", ascending=False), use_container_width=True)
+        best = (CC.sort_values("corr", ascending=False).groupby(["region","feature"]).head(1))
+        st.markdown("**Best cross‑correlations (per region/feature)**")
+        st.dataframe(best.sort_values(["corr"], ascending=False), use_container_width=True)
         figcc = px.bar(CC, x="lag", y="corr", color="region", facet_col="feature", facet_col_wrap=2, title="Cross‑correlation by region")
         figcc.update_layout(template="plotly_white", height=520)
         st.plotly_chart(figcc, use_container_width=True)
 
-# ----------------------------------------------------------------------------
-# 5) Export
-# ----------------------------------------------------------------------------
+# =============================================================================
+# Export + Utilities
+# =============================================================================
 
 st.markdown("---")
 st.subheader("5) Export")
-
 if state.news_daily is not None and not state.news_daily.empty:
     st.download_button("news_daily_scored.csv", state.news_daily.to_csv(index=False).encode("utf-8"), file_name="news_daily_scored.csv")
 if state.news_monthly is not None and not state.news_monthly.empty:
     st.download_button("news_monthly_signals.csv", state.news_monthly.to_csv().encode("utf-8"), file_name="news_monthly_signals.csv")
 
-st.caption("Tip: Toggle regions and run multiple collection passes; the page merges results across runs. LLM scoring is optional and rate‑limited via the slider. If APIs are unavailable, RSS + CSV is sufficient for research workflows.")
+with st.expander("⚙️ Debug & maintenance", expanded=False):
+    st.write("Providers:", {"rss": bool(use_rss and feedparser), "newsapi": use_newsapi, "gdelt": use_gdelt})
+    if state.news_daily is not None:
+        st.write("Daily rows:", len(state.news_daily))
+    if state.news_monthly is not None:
+        st.write("Monthly rows:", len(state.news_monthly))
+    if st.button("Reset news state"):
+        state.news_daily = None; state.news_monthly = None
+        st.success("Cleared.")
+
+st.caption("Note: RSS requires no API and works out‑of‑the‑box, but only covers recent items. For historical archives, use CSV upload or external datasets (e.g., GDELT/NewsAPI) with keys. LLM scoring is optional and can use a local endpoint.")
