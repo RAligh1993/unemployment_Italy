@@ -248,33 +248,57 @@ def get_system_status() -> Dict[str, str]:
         'models': 'none'
     }
     
-    if state.y_monthly is not None and not state.y_monthly.empty:
-        status['target'] = 'ready'
+    # Check target
+    try:
+        if state.y_monthly is not None and not state.y_monthly.empty:
+            status['target'] = 'ready'
+    except:
+        pass
     
-    if state.panel_monthly is not None and not state.panel_monthly.empty:
-        status['panel'] = 'ready'
-        if state.panel_monthly.shape[1] > 10:
-            status['features'] = 'ready'
+    # Check panel
+    try:
+        if state.panel_monthly is not None and not state.panel_monthly.empty:
+            status['panel'] = 'ready'
+            if state.panel_monthly.shape[1] > 10:
+                status['features'] = 'ready'
+    except:
+        pass
     
-    if state.bt_results and len(state.bt_results) > 0:
-        status['models'] = 'ready'
+    # Check models - FIX: Safe check for bt_results
+    try:
+        if hasattr(state, 'bt_results') and state.bt_results is not None:
+            if isinstance(state.bt_results, dict) and len(state.bt_results) > 0:
+                status['models'] = 'ready'
+    except:
+        pass
     
     return status
 
 def calculate_progress() -> int:
     """Calculate overall progress percentage"""
-    status = get_system_status()
-    completed = sum(1 for v in status.values() if v == 'ready')
-    return int((completed / len(status)) * 100)
+    try:
+        status = get_system_status()
+        completed = sum(1 for v in status.values() if v == 'ready')
+        return int((completed / len(status)) * 100)
+    except:
+        return 0
 
 def get_api_status() -> Dict[str, bool]:
     """Check API key availability"""
-    return {
-        'OpenAI': bool(os.getenv('OPENAI_API_KEY')),
-        'Anthropic': bool(os.getenv('ANTHROPIC_API_KEY')),
-        'Google': bool(os.getenv('GOOGLE_API_KEY')),
-        'NewsAPI': bool(os.getenv('NEWSAPI_KEY'))
-    }
+    try:
+        return {
+            'OpenAI': bool(os.getenv('OPENAI_API_KEY')),
+            'Anthropic': bool(os.getenv('ANTHROPIC_API_KEY')),
+            'Google': bool(os.getenv('GOOGLE_API_KEY')),
+            'NewsAPI': bool(os.getenv('NEWSAPI_KEY'))
+        }
+    except:
+        return {
+            'OpenAI': False,
+            'Anthropic': False,
+            'Google': False,
+            'NewsAPI': False
+        }
 
 def detect_date_col(df: pd.DataFrame) -> str:
     """Smart date column detection"""
@@ -400,48 +424,50 @@ def create_mini_sparkline(series: pd.Series, color: str = '#0F766E') -> go.Figur
     return fig
 
 # =============================================================================
-# SIDEBAR NAVIGATION
+# SIDEBAR - Simple version (Streamlit handles navigation automatically)
 # =============================================================================
 
 with st.sidebar:
-    st.markdown("### 📊 Navigation")
-    
-    st.page_link("app.py", label="🏠 Home", icon="🏠")
-    st.page_link("pages/1_Dashboard.py", label="📊 Dashboard", icon="📊")
-    st.page_link("pages/2_Data_Aggregation.py", label="🧱 Data & Aggregation", icon="🧱")
-    st.page_link("pages/3_Feature_Engineering.py", label="🧪 Feature Engineering", icon="🧪")
-    st.page_link("pages/4_Backtesting.py", label="🧮 Backtesting", icon="🧮")
-    st.page_link("pages/5_Results.py", label="📈 Results", icon="📈")
-    st.page_link("pages/6_AI_Assistant.py", label="🤖 AI Assistant", icon="🤖")
-    st.page_link("pages/7_SHAP_Events.py", label="🧭 SHAP & Events", icon="🧭")
-    st.page_link("pages/8_News_Impact.py", label="📰 News Impact", icon="📰")
-    st.page_link("pages/9_Report.py", label="📋 Final Report", icon="📋")
-    
-    st.markdown("---")
-    
     # Version badge
     st.markdown(f"""
-    <div style='text-align: center; padding: 0.5rem; background: linear-gradient(135deg, #0F766E, #14B8A6); 
-                color: white; border-radius: 8px; font-weight: 600;'>
-        v{APP_VERSION}
+    <div style='text-align: center; padding: 0.75rem; background: linear-gradient(135deg, #0F766E, #14B8A6); 
+                color: white; border-radius: 10px; font-weight: 700; font-size: 1rem; margin-bottom: 1.5rem;'>
+        {APP_NAME}<br/>
+        <span style='font-size: 0.875rem; opacity: 0.9;'>v{APP_VERSION}</span>
     </div>
     """, unsafe_allow_html=True)
     
-    st.markdown("---")
-    
     # API Status
-    st.markdown("### 🔑 API Keys")
+    st.markdown("### 🔑 API Status")
     api_status = get_api_status()
     
     for api, available in api_status.items():
         status_color = "#10B981" if available else "#EF4444"
-        status_text = "✓" if available else "✗"
+        status_icon = "✓" if available else "✗"
         st.markdown(f"""
-        <div style='display: flex; justify-content: space-between; padding: 0.25rem 0;'>
-            <span style='color: #64748B;'>{api}</span>
-            <span style='color: {status_color}; font-weight: bold;'>{status_text}</span>
+        <div style='display: flex; justify-content: space-between; align-items: center; 
+                    padding: 0.5rem; margin: 0.25rem 0; background: #F9FAFB; border-radius: 6px;'>
+            <span style='color: #475569; font-weight: 500;'>{api}</span>
+            <span style='color: {status_color}; font-weight: 700; font-size: 1.1rem;'>{status_icon}</span>
         </div>
         """, unsafe_allow_html=True)
+    
+    st.markdown("---")
+    
+    # System Status Summary
+    try:
+        system_status = get_system_status()
+        progress = calculate_progress()
+        
+        st.markdown("### 📊 Quick Status")
+        st.markdown(f"""
+        <div style='text-align: center; padding: 1rem; background: #F9FAFB; border-radius: 8px;'>
+            <div style='font-size: 2rem; font-weight: 700; color: #0F766E;'>{progress}%</div>
+            <div style='color: #64748B; font-size: 0.875rem;'>Complete</div>
+        </div>
+        """, unsafe_allow_html=True)
+    except:
+        pass
 
 # =============================================================================
 # MAIN CONTENT
@@ -609,103 +635,118 @@ if trends_files:
 # DATA PREVIEW
 # =============================================================================
 
-if state.y_monthly is not None and not state.y_monthly.empty:
+if hasattr(state, 'y_monthly') and state.y_monthly is not None and not state.y_monthly.empty:
     st.markdown('<div class="section-header">📈 Data Preview</div>', unsafe_allow_html=True)
     
-    col1, col2 = st.columns([2, 1])
+    try:
+        col1, col2 = st.columns([2, 1])
+        
+        with col1:
+            st.markdown("#### Target Time Series")
+            
+            fig = go.Figure()
+            
+            fig.add_trace(go.Scatter(
+                x=state.y_monthly.index,
+                y=state.y_monthly.values,
+                mode='lines+markers',
+                name='Unemployment Rate',
+                line=dict(color='#0F766E', width=3),
+                marker=dict(size=6)
+            ))
+            
+            fig.update_layout(
+                title='Italian Unemployment Rate',
+                xaxis_title='Date',
+                yaxis_title='Rate (%)',
+                template='plotly_white',
+                height=400,
+                hovermode='x unified'
+            )
+            
+            st.plotly_chart(fig, use_container_width=True)
+        
+        with col2:
+            st.markdown("#### Statistics")
+            
+            stats = {
+                'Observations': len(state.y_monthly),
+                'Start Date': state.y_monthly.index.min().strftime('%Y-%m'),
+                'End Date': state.y_monthly.index.max().strftime('%Y-%m'),
+                'Mean': f"{state.y_monthly.mean():.2f}%",
+                'Std Dev': f"{state.y_monthly.std():.2f}%",
+                'Min': f"{state.y_monthly.min():.2f}%",
+                'Max': f"{state.y_monthly.max():.2f}%"
+            }
+            
+            for label, value in stats.items():
+                st.markdown(f"""
+                <div style='padding: 0.5rem; margin: 0.25rem 0; background: #F9FAFB; border-radius: 6px;'>
+                    <div style='color: #64748B; font-size: 0.75rem; text-transform: uppercase;'>{label}</div>
+                    <div style='color: #1F2937; font-size: 1.25rem; font-weight: 700;'>{value}</div>
+                </div>
+                """, unsafe_allow_html=True)
     
-    with col1:
-        st.markdown("#### Target Time Series")
-        
-        fig = go.Figure()
-        
-        fig.add_trace(go.Scatter(
-            x=state.y_monthly.index,
-            y=state.y_monthly.values,
-            mode='lines+markers',
-            name='Unemployment Rate',
-            line=dict(color='#0F766E', width=3),
-            marker=dict(size=6)
-        ))
-        
-        fig.update_layout(
-            title='Italian Unemployment Rate',
-            xaxis_title='Date',
-            yaxis_title='Rate (%)',
-            template='plotly_white',
-            height=400,
-            hovermode='x unified'
-        )
-        
-        st.plotly_chart(fig, use_container_width=True)
-    
-    with col2:
-        st.markdown("#### Statistics")
-        
-        stats = {
-            'Observations': len(state.y_monthly),
-            'Start Date': state.y_monthly.index.min().strftime('%Y-%m'),
-            'End Date': state.y_monthly.index.max().strftime('%Y-%m'),
-            'Mean': f"{state.y_monthly.mean():.2f}%",
-            'Std Dev': f"{state.y_monthly.std():.2f}%",
-            'Min': f"{state.y_monthly.min():.2f}%",
-            'Max': f"{state.y_monthly.max():.2f}%"
-        }
-        
-        for label, value in stats.items():
-            st.markdown(f"""
-            <div style='padding: 0.5rem; margin: 0.25rem 0; background: #F9FAFB; border-radius: 6px;'>
-                <div style='color: #64748B; font-size: 0.75rem; text-transform: uppercase;'>{label}</div>
-                <div style='color: #1F2937; font-size: 1.25rem; font-weight: 700;'>{value}</div>
-            </div>
-            """, unsafe_allow_html=True)
+    except Exception as e:
+        st.error(f"Could not display data preview: {str(e)}")
 
 # =============================================================================
 # MODEL PERFORMANCE SUMMARY
 # =============================================================================
 
-if state.bt_metrics is not None and not state.bt_metrics.empty:
+if hasattr(state, 'bt_metrics') and state.bt_metrics is not None and not state.bt_metrics.empty:
     st.markdown('<div class="section-header">🏆 Model Performance</div>', unsafe_allow_html=True)
     
-    # Best models
-    top_models = state.bt_metrics.nsmallest(3, 'MAE')
-    
-    col1, col2, col3 = st.columns(3)
-    
-    for i, (col, (_, model)) in enumerate(zip([col1, col2, col3], top_models.iterrows())):
-        with col:
-            rank_emoji = ['🥇', '🥈', '🥉'][i]
-            
-            st.markdown(f"""
-            <div class='info-card'>
-                <div style='font-size: 2rem; text-align: center;'>{rank_emoji}</div>
-                <div style='text-align: center; font-weight: 700; font-size: 1.1rem; margin: 0.5rem 0;'>
-                    {model['model']}
-                </div>
-                <div style='display: flex; justify-content: space-between; margin-top: 1rem;'>
-                    <div>
-                        <div style='color: #64748B; font-size: 0.75rem;'>MAE</div>
-                        <div style='font-weight: 700;'>{model['MAE']:.4f}</div>
+    try:
+        # Best models
+        top_models = state.bt_metrics.nsmallest(3, 'MAE')
+        
+        col1, col2, col3 = st.columns(3)
+        
+        for i, (col, (_, model)) in enumerate(zip([col1, col2, col3], top_models.iterrows())):
+            with col:
+                rank_emoji = ['🥇', '🥈', '🥉'][i]
+                
+                st.markdown(f"""
+                <div class='info-card'>
+                    <div style='font-size: 2rem; text-align: center;'>{rank_emoji}</div>
+                    <div style='text-align: center; font-weight: 700; font-size: 1.1rem; margin: 0.5rem 0;'>
+                        {model.get('model', 'Unknown')}
                     </div>
-                    <div>
-                        <div style='color: #64748B; font-size: 0.75rem;'>RMSE</div>
-                        <div style='font-weight: 700;'>{model['RMSE']:.4f}</div>
+                    <div style='display: flex; justify-content: space-between; margin-top: 1rem;'>
+                        <div>
+                            <div style='color: #64748B; font-size: 0.75rem;'>MAE</div>
+                            <div style='font-weight: 700;'>{model.get('MAE', 0):.4f}</div>
+                        </div>
+                        <div>
+                            <div style='color: #64748B; font-size: 0.75rem;'>RMSE</div>
+                            <div style='font-weight: 700;'>{model.get('RMSE', 0):.4f}</div>
+                        </div>
                     </div>
                 </div>
-            </div>
-            """, unsafe_allow_html=True)
+                """, unsafe_allow_html=True)
+        
+        # Full metrics table
+        st.markdown("#### All Models")
+        
+        format_dict = {}
+        if 'MAE' in state.bt_metrics.columns:
+            format_dict['MAE'] = '{:.4f}'
+        if 'RMSE' in state.bt_metrics.columns:
+            format_dict['RMSE'] = '{:.4f}'
+        if 'SMAPE' in state.bt_metrics.columns:
+            format_dict['SMAPE'] = '{:.2f}'
+        if 'MASE' in state.bt_metrics.columns:
+            format_dict['MASE'] = '{:.4f}'
+        
+        styled_df = state.bt_metrics.style.format(format_dict)
+        if 'MAE' in state.bt_metrics.columns:
+            styled_df = styled_df.background_gradient(subset=['MAE'], cmap='RdYlGn_r')
+        
+        st.dataframe(styled_df, use_container_width=True)
     
-    # Full metrics table
-    st.markdown("#### All Models")
-    st.dataframe(
-        state.bt_metrics.style.format({
-            'MAE': '{:.4f}',
-            'RMSE': '{:.4f}',
-            'SMAPE': '{:.2f}',
-            'MASE': '{:.4f}'
-        }).background_gradient(subset=['MAE'], cmap='RdYlGn_r'),
-        use_container_width=True
-    )
+    except Exception as e:
+        st.info("Model metrics available but couldn't display. Check data format.")
 
 # =============================================================================
 # QUICK ACTIONS
@@ -716,19 +757,19 @@ st.markdown('<div class="section-header">⚡ Quick Actions</div>', unsafe_allow_
 col1, col2, col3, col4 = st.columns(4)
 
 with col1:
-    if st.button("📊 View Dashboard", use_container_width=True):
+    if st.button("📊 View Dashboard", use_container_width=True, key="btn_dashboard"):
         st.switch_page("pages/1_Dashboard.py")
 
 with col2:
-    if st.button("🧱 Build Panel", use_container_width=True):
+    if st.button("🧱 Build Panel", use_container_width=True, key="btn_panel"):
         st.switch_page("pages/2_Data_Aggregation.py")
 
 with col3:
-    if st.button("🧪 Engineer Features", use_container_width=True):
+    if st.button("🧪 Engineer Features", use_container_width=True, key="btn_features"):
         st.switch_page("pages/3_Feature_Engineering.py")
 
 with col4:
-    if st.button("🧮 Run Backtest", use_container_width=True):
+    if st.button("🧮 Run Backtest", use_container_width=True, key="btn_backtest"):
         st.switch_page("pages/4_Backtesting.py")
 
 # =============================================================================
