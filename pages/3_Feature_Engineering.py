@@ -1,450 +1,989 @@
-# pages/3_Feature_Engineering.py — Feature transforms, lags & rolling (EN)
-# ============================================================================
-# Role
-#   • Transform the monthly panel: diff/pct/log/winsorize/z-score
-#   • Generate lags and rolling statistics (mean/std/min/max)
-#   • Handle missing values (ffill/bfill) and preview quality
-#   • Maintain a JSON "recipe" for reproducibility; reset to original
-#
-# Notes
-#   • Page config is centralized in app.py
-#   • Uses utils/* if available; otherwise includes local fallbacks
-# ============================================================================
+"""
+🧪 Feature Engineering Pro v2.0
+===================================
+Advanced feature transformation engine for time series forecasting.
+Features: Smart transforms, lags, rolling stats, recipe management, visual diagnostics.
 
-from __future__ import annotations
+Author: AI Assistant
+Date: October 2025
+"""
 
-import json
-import math
-import typing as t
-from pathlib import Path
-
-import numpy as np
-import pandas as pd
-import plotly.express as px
-import plotly.graph_objs as go
 import streamlit as st
+import pandas as pd
+import numpy as np
+import plotly.express as px
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import json
+from datetime import datetime
+from typing import Optional, List, Dict, Set, Tuple
 
-# ----------------------------------------------------------------------------
-# State (robust import with fallback)
-# ----------------------------------------------------------------------------
+# =============================================================================
+# STATE MANAGEMENT
+# =============================================================================
+
 try:
-    from utils.state import AppState  # type: ignore
+    from utils.state import AppState
 except Exception:
     class _State:
-        def __init__(self) -> None:
-            self.panel_monthly: pd.DataFrame | None = None
-            self.y_monthly: pd.Series | None = None
-            self._panel_monthly_orig: pd.DataFrame | None = None
-            self.bt_results: dict[str, pd.Series] = {}
-            self.bt_metrics: pd.DataFrame | None = None
-    class AppState:  # type: ignore
+        def __init__(self):
+            self.panel_monthly: Optional[pd.DataFrame] = None
+            self.y_monthly: Optional[pd.Series] = None
+            self._panel_monthly_orig: Optional[pd.DataFrame] = None
+    
+    class AppState:
         @staticmethod
-        def init() -> _State:
+        def init():
             if "_app" not in st.session_state:
                 st.session_state["_app"] = _State()
-            return st.session_state["_app"]  # type: ignore
+            return st.session_state["_app"]
+        
         @staticmethod
-        def get() -> _State:
+        def get():
             return AppState.init()
 
 state = AppState.init()
 
-# ----------------------------------------------------------------------------
-# Local helpers (safe EOM & naming) — fall back to utils if present
-# ----------------------------------------------------------------------------
-try:
-    from utils.time_ops import end_of_month as _eom  # type: ignore
-except Exception:
-    def _eom(s: pd.Series) -> pd.Series:
-        return (pd.to_datetime(s, errors="coerce").dt.tz_localize(None) + pd.offsets.MonthEnd(0)).dt.normalize()
+# Initialize recipe in session state
+if 'fe_recipe' not in st.session_state:
+    st.session_state.fe_recipe = []
 
+# =============================================================================
+# UTILITY FUNCTIONS
+# =============================================================================
 
-def _is_numeric(s: pd.Series) -> bool:
-    return pd.api.types.is_integer_dtype(s) or pd.api.types.is_float_dtype(s)
+def slugify(name: str) -> str:
+    """Convert name to clean identifier"""
+    name = str(name).strip().lower()
+    for char in [' ', '/', '(', ')', '-', '%', ':', ',', '.', '__']:
+        name = name.replace(char, '_')
+    while '__' in name:
+        name = name.replace('__', '_')
+    return name.strip('_')
 
+def make_unique_name(base: str, existing: Set[str]) -> str:
+    """Generate unique column name"""
+    if base not in existing:
+        existing.add(base)
+        return base
+    
+    counter = 1
+    while f"{base}_{counter}" in existing:
+        counter += 1
+    
+    new_name = f"{base}_{counter}"
+    existing.add(new_name)
+    return new_name
 
-def _make_unique(name: str, existing: set[str]) -> str:
-    base = name
-    k = 1
-    while name in existing:
-        name = f"{base}__{k}"
-        k += 1
-    existing.add(name)
-    return name
+def is_numeric_column(series: pd.Series) -> bool:
+    """Check if column is numeric"""
+    return pd.api.types.is_numeric_dtype(series)
 
+def get_numeric_columns(df: pd.DataFrame) -> List[str]:
+    """Get list of numeric columns"""
+    return [col for col in df.columns if is_numeric_column(df[col])]
 
-def _slug(s: str) -> str:
-    s = str(s).strip().lower().replace(" ", "_")
-    for ch in ["/", "(", ")", "-", "%", ":", ",", "."]:
-        s = s.replace(ch, "_")
-    while "__" in s:
-        s = s.replace("__", "_")
-    return s
+def calculate_memory_usage(df: pd.DataFrame) -> str:
+    """Calculate and format memory usage"""
+    bytes_usage = df.memory_usage(deep=True).sum()
+    
+    if bytes_usage < 1024:
+        return f"{bytes_usage:.0f} B"
+    elif bytes_usage < 1024**2:
+        return f"{bytes_usage/1024:.1f} KB"
+    elif bytes_usage < 1024**3:
+        return f"{bytes_usage/1024**2:.1f} MB"
+    else:
+        return f"{bytes_usage/1024**3:.2f} GB"
 
-# ----------------------------------------------------------------------------
-# Header & guards
-# ----------------------------------------------------------------------------
+# =============================================================================
+# TRANSFORM FUNCTIONS
+# =============================================================================
 
-st.title("🧪 Feature Engineering")
-st.caption("Transform, lag, roll, and standardize the **monthly** panel. All changes are kept in session state.")
+def safe_log_transform(series: pd.Series) -> pd.Series:
+    """Safe logarithm transform handling negative and zero values"""
+    series = series.astype(float)
+    
+    # Find minimum positive value
+    positive_values = series[series > 0]
+    if len(positive_values) > 0:
+        epsilon = np.nanmin(positive_values) * 1e-6
+    else:
+        epsilon = 1e-9
+    
+    return np.log(series + epsilon)
 
+def winsorize_series(series: pd.Series, lower_pct: float, upper_pct: float) -> pd.Series:
+    """Winsorize series at specified percentiles"""
+    lower_val = np.nanpercentile(series, lower_pct)
+    upper_val = np.nanpercentile(series, upper_pct)
+    return series.clip(lower_val, upper_val)
+
+def apply_transforms(
+    df: pd.DataFrame,
+    columns: List[str],
+    diff: bool = False,
+    pct_change: bool = False,
+    log: bool = False,
+    winsorize: bool = False,
+    winsor_lower: float = 1.0,
+    winsor_upper: float = 99.0
+) -> Tuple[pd.DataFrame, List[str]]:
+    """Apply selected transforms to columns"""
+    
+    result_df = df.copy()
+    existing_cols = set(result_df.columns)
+    new_columns = []
+    
+    for col in columns:
+        if col not in df.columns:
+            continue
+        
+        series = pd.to_numeric(df[col], errors='coerce')
+        
+        if diff:
+            new_col = make_unique_name(f"diff1__{slugify(col)}", existing_cols)
+            result_df[new_col] = series.diff(1)
+            new_columns.append(new_col)
+        
+        if pct_change:
+            new_col = make_unique_name(f"pct1__{slugify(col)}", existing_cols)
+            result_df[new_col] = series.pct_change(1)
+            new_columns.append(new_col)
+        
+        if log:
+            new_col = make_unique_name(f"log__{slugify(col)}", existing_cols)
+            result_df[new_col] = safe_log_transform(series)
+            new_columns.append(new_col)
+        
+        if winsorize:
+            new_col = make_unique_name(
+                f"win__{slugify(col)}_{int(winsor_lower)}_{int(winsor_upper)}", 
+                existing_cols
+            )
+            result_df[new_col] = winsorize_series(series, winsor_lower, winsor_upper)
+            new_columns.append(new_col)
+    
+    return result_df, new_columns
+
+def apply_lags(
+    df: pd.DataFrame,
+    columns: List[str],
+    lags: List[int]
+) -> Tuple[pd.DataFrame, List[str]]:
+    """Apply lag features"""
+    
+    result_df = df.copy()
+    existing_cols = set(result_df.columns)
+    new_columns = []
+    
+    for col in columns:
+        if col not in df.columns:
+            continue
+        
+        series = pd.to_numeric(df[col], errors='coerce')
+        
+        for lag in lags:
+            new_col = make_unique_name(f"lag{lag}__{slugify(col)}", existing_cols)
+            result_df[new_col] = series.shift(lag)
+            new_columns.append(new_col)
+    
+    return result_df, new_columns
+
+def apply_rolling_stats(
+    df: pd.DataFrame,
+    columns: List[str],
+    windows: List[int],
+    stats: List[str]
+) -> Tuple[pd.DataFrame, List[str]]:
+    """Apply rolling statistics"""
+    
+    result_df = df.copy()
+    existing_cols = set(result_df.columns)
+    new_columns = []
+    
+    for col in columns:
+        if col not in df.columns:
+            continue
+        
+        series = pd.to_numeric(df[col], errors='coerce')
+        
+        for window in windows:
+            min_periods = max(1, window // 2)
+            rolling = series.rolling(window, min_periods=min_periods)
+            
+            if 'mean' in stats:
+                new_col = make_unique_name(f"roll{window}_mean__{slugify(col)}", existing_cols)
+                result_df[new_col] = rolling.mean()
+                new_columns.append(new_col)
+            
+            if 'std' in stats:
+                new_col = make_unique_name(f"roll{window}_std__{slugify(col)}", existing_cols)
+                result_df[new_col] = rolling.std(ddof=0)
+                new_columns.append(new_col)
+            
+            if 'min' in stats:
+                new_col = make_unique_name(f"roll{window}_min__{slugify(col)}", existing_cols)
+                result_df[new_col] = rolling.min()
+                new_columns.append(new_col)
+            
+            if 'max' in stats:
+                new_col = make_unique_name(f"roll{window}_max__{slugify(col)}", existing_cols)
+                result_df[new_col] = rolling.max()
+                new_columns.append(new_col)
+    
+    return result_df, new_columns
+
+def apply_standardization(
+    df: pd.DataFrame,
+    columns: List[str],
+    expanding: bool = False
+) -> Tuple[pd.DataFrame, List[str]]:
+    """Apply z-score standardization"""
+    
+    result_df = df.copy()
+    existing_cols = set(result_df.columns)
+    new_columns = []
+    
+    for col in columns:
+        if col not in df.columns:
+            continue
+        
+        series = pd.to_numeric(df[col], errors='coerce')
+        
+        if expanding:
+            mean = series.expanding().mean()
+            std = series.expanding().std(ddof=0)
+        else:
+            mean = series.mean()
+            std = series.std(ddof=0)
+        
+        new_col = make_unique_name(f"{slugify(col)}__z", existing_cols)
+        result_df[new_col] = (series - mean) / (std + 1e-9)
+        new_columns.append(new_col)
+    
+    return result_df, new_columns
+
+def handle_missing_values(
+    df: pd.DataFrame,
+    method: str = 'none',
+    drop_leading: bool = True
+) -> pd.DataFrame:
+    """Handle missing values"""
+    
+    result_df = df.copy()
+    
+    if method == 'ffill':
+        result_df = result_df.ffill()
+    elif method == 'bfill':
+        result_df = result_df.bfill()
+    elif method == 'ffill_then_bfill':
+        result_df = result_df.ffill().bfill()
+    
+    if drop_leading:
+        # Remove leading rows that are all NaN
+        result_df = result_df.loc[~result_df.isna().all(axis=1)]
+    
+    return result_df
+
+# =============================================================================
+# VISUALIZATION FUNCTIONS
+# =============================================================================
+
+def plot_feature_comparison(
+    original: pd.Series,
+    transformed: pd.Series,
+    feature_name: str
+):
+    """Compare original and transformed feature"""
+    
+    fig = make_subplots(
+        rows=2, cols=1,
+        subplot_titles=('Original', 'Transformed'),
+        vertical_spacing=0.15
+    )
+    
+    # Original
+    fig.add_trace(
+        go.Scatter(
+            x=original.index,
+            y=original.values,
+            mode='lines',
+            name='Original',
+            line=dict(color='#3B82F6', width=2)
+        ),
+        row=1, col=1
+    )
+    
+    # Transformed
+    fig.add_trace(
+        go.Scatter(
+            x=transformed.index,
+            y=transformed.values,
+            mode='lines',
+            name='Transformed',
+            line=dict(color='#10B981', width=2)
+        ),
+        row=2, col=1
+    )
+    
+    fig.update_layout(
+        title=f'Feature Comparison: {feature_name}',
+        template='plotly_white',
+        height=500,
+        showlegend=True
+    )
+    
+    return fig
+
+def plot_missing_values_heatmap(df: pd.DataFrame, n_rows: int = 60):
+    """Plot missing values heatmap"""
+    
+    presence = df.tail(n_rows).notna().astype(int)
+    
+    fig = px.imshow(
+        presence.T,
+        aspect='auto',
+        color_continuous_scale=['#EF4444', '#10B981'],
+        labels={'color': 'Present'},
+        title=f'Data Presence (Last {n_rows} Months)'
+    )
+    
+    fig.update_layout(
+        height=500,
+        template='plotly_white',
+        xaxis_title='Date',
+        yaxis_title='Feature',
+        coloraxis_showscale=True
+    )
+    
+    return fig
+
+def plot_correlation_with_target(
+    panel: pd.DataFrame,
+    target: pd.Series,
+    top_n: int = 15
+):
+    """Plot correlation with target"""
+    
+    y_aligned, X_aligned = target.align(panel, join='inner')
+    
+    if X_aligned.empty:
+        return None
+    
+    correlations = X_aligned.corrwith(y_aligned).sort_values()
+    
+    # Get top positive and negative correlations
+    top_corr = pd.concat([
+        correlations.head(top_n // 2),
+        correlations.tail(top_n // 2)
+    ])
+    
+    colors = ['#EF4444' if x < 0 else '#10B981' for x in top_corr.values]
+    
+    fig = go.Figure()
+    
+    fig.add_trace(go.Bar(
+        x=top_corr.values,
+        y=top_corr.index,
+        orientation='h',
+        marker=dict(color=colors),
+        text=[f'{x:.3f}' for x in top_corr.values],
+        textposition='outside'
+    ))
+    
+    fig.update_layout(
+        title=f'Top {top_n} Correlations with Target',
+        xaxis_title='Correlation',
+        yaxis_title='Feature',
+        template='plotly_white',
+        height=600,
+        showlegend=False
+    )
+    
+    return fig
+
+# =============================================================================
+# UI CONFIGURATION
+# =============================================================================
+
+st.set_page_config(
+    page_title="Feature Engineering Pro",
+    page_icon="🧪",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# Custom CSS
+st.markdown("""
+<style>
+    .main-title {
+        font-size: 3rem;
+        font-weight: 700;
+        text-align: center;
+        background: linear-gradient(120deg, #7c3aed, #c026d3);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        margin-bottom: 0.5rem;
+    }
+    .subtitle {
+        text-align: center;
+        color: #6b7280;
+        font-size: 1.1rem;
+        margin-bottom: 2rem;
+    }
+    .step-header {
+        background: linear-gradient(90deg, #7c3aed, #c026d3);
+        color: white;
+        padding: 1rem;
+        border-radius: 8px;
+        margin: 1.5rem 0;
+    }
+    .metric-card {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        padding: 1.5rem;
+        border-radius: 10px;
+        color: white;
+        text-align: center;
+    }
+    .stTabs [data-baseweb="tab-list"] {
+        gap: 8px;
+    }
+    .stTabs [data-baseweb="tab"] {
+        height: 50px;
+        padding: 0 24px;
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        color: white;
+        border-radius: 8px;
+    }
+    .stTabs [aria-selected="true"] {
+        background: linear-gradient(135deg, #7c3aed 0%, #c026d3 100%);
+    }
+</style>
+""", unsafe_allow_html=True)
+
+# =============================================================================
+# MAIN APPLICATION
+# =============================================================================
+
+# Header
+st.markdown('<h1 class="main-title">🧪 Feature Engineering Pro</h1>', unsafe_allow_html=True)
+st.markdown('<p class="subtitle">Transform, lag, and enhance your time series features</p>', unsafe_allow_html=True)
+
+# Check if panel exists
 if state.panel_monthly is None or state.panel_monthly.empty:
-    st.warning("Monthly panel is empty. Build it in **Data & Aggregation** first.")
+    st.error("⚠️ **No monthly panel found!**")
+    st.info("👉 Please go to **Data & Aggregation** page first to build your panel.")
     st.stop()
 
-# Create an original snapshot once
-if getattr(state, "_panel_monthly_orig", None) is None:
+# Create original snapshot if not exists
+if state._panel_monthly_orig is None:
     state._panel_monthly_orig = state.panel_monthly.copy()
 
-panel = state.panel_monthly.copy()
-all_cols = [c for c in panel.columns if _is_numeric(panel[c])]
-
-# ----------------------------------------------------------------------------
-# Sidebar — global options
-# ----------------------------------------------------------------------------
+# Sidebar
 with st.sidebar:
-    st.header("Global options")
-    cap_preview = st.checkbox("Limit preview to last 120 months", value=True)
+    st.header("⚙️ Settings")
+    
+    st.subheader("🔍 Display Options")
+    show_last_n = st.slider(
+        "Preview last N months",
+        min_value=12,
+        max_value=240,
+        value=60,
+        step=12
+    )
+    
     show_memory = st.checkbox("Show memory usage", value=False)
-
+    
     st.markdown("---")
-    if st.button("Reset panel to original", help="Restore the very first monthly panel snapshot."):
-        state.panel_monthly = state._panel_monthly_orig.copy() if state._panel_monthly_orig is not None else state.panel_monthly
-        st.experimental_rerun()
+    st.subheader("📊 Panel Info")
+    
+    current_shape = state.panel_monthly.shape
+    original_shape = state._panel_monthly_orig.shape if state._panel_monthly_orig is not None else (0, 0)
+    
+    st.metric("Rows", current_shape[0])
+    st.metric("Features", current_shape[1])
+    
+    if original_shape[1] > 0:
+        new_features = current_shape[1] - original_shape[1]
+        st.metric("New Features", new_features, delta=f"+{new_features}")
+    
+    if show_memory:
+        memory = calculate_memory_usage(state.panel_monthly)
+        st.metric("Memory", memory)
+    
+    st.markdown("---")
+    st.subheader("🔄 Reset")
+    
+    if st.button("🔙 Reset to Original", use_container_width=True, type="secondary"):
+        if state._panel_monthly_orig is not None:
+            state.panel_monthly = state._panel_monthly_orig.copy()
+            st.session_state.fe_recipe = []
+            st.success("✅ Reset to original panel!")
+            st.rerun()
+    
+    if st.button("🗑️ Clear Recipe", use_container_width=True):
+        st.session_state.fe_recipe = []
+        st.success("✅ Recipe cleared!")
 
-# ----------------------------------------------------------------------------
-# Tabs: Transforms | Lags & Rolling | Missing | Standardize | Recipe
-# ----------------------------------------------------------------------------
+# Get numeric columns
+numeric_cols = get_numeric_columns(state.panel_monthly)
 
-T1, T2, T3, T4, T5 = st.tabs([
-    "Transforms",
-    "Lags & Rolling",
-    "Missing handling",
-    "Standardize",
-    "Recipe",
+if not numeric_cols:
+    st.error("⚠️ No numeric columns found in panel!")
+    st.stop()
+
+# =============================================================================
+# TABS
+# =============================================================================
+
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    "🔄 Transforms",
+    "⏱️ Lags & Rolling",
+    "🔧 Missing Values",
+    "📊 Standardize",
+    "📋 Recipe"
 ])
 
-# =============
-# TAB 1 — Transforms
-# =============
-with T1:
-    st.subheader("Deterministic transforms")
-    cols_sel = st.multiselect("Select numeric features", options=all_cols, default=all_cols[: min(10, len(all_cols))])
-    c1, c2, c3, c4 = st.columns(4)
-    with c1:
-        do_diff = st.checkbox("diff(1)", value=False)
-    with c2:
-        do_pct = st.checkbox("pct_change(1)", value=False)
-    with c3:
-        do_log = st.checkbox("log(x)", value=False, help="Safe log: log(x) after shifting by a small epsilon if needed")
-    with c4:
-        do_winsor = st.checkbox("winsorize", value=False)
+# =============================================================================
+# TAB 1: TRANSFORMS
+# =============================================================================
 
-    c5, c6 = st.columns(2)
-    with c5:
-        w_low = st.slider("Winsor lower pctl", 0.0, 10.0, 1.0, step=0.5)
-    with c6:
-        w_high = st.slider("Winsor upper pctl", 90.0, 100.0, 99.0, step=0.5)
-
-    st.markdown("— New columns will be appended with prefixes: `diff1__`, `pct1__`, `log__`, `win__`. Naming is collision‑safe.")
-
-    def _safe_log(s: pd.Series) -> pd.Series:
-        s = s.astype(float)
-        eps = max(1e-9, np.nanmin(s[s > 0]) * 1e-6) if np.any(s > 0) else 1e-6
-        return np.log(s + eps)
-
-    def _winsor(s: pd.Series, lo: float, hi: float) -> pd.Series:
-        lo_v = np.nanpercentile(s, lo)
-        hi_v = np.nanpercentile(s, hi)
-        return s.clip(lo_v, hi_v)
-
-    if st.button("Apply transforms", type="primary"):
-        if not cols_sel:
-            st.warning("Select at least one feature.")
+with tab1:
+    st.markdown('<div class="step-header"><h3>📐 Deterministic Transforms</h3></div>', unsafe_allow_html=True)
+    
+    col1, col2 = st.columns([2, 1])
+    
+    with col1:
+        selected_cols = st.multiselect(
+            "Select features to transform:",
+            options=numeric_cols,
+            default=numeric_cols[:min(5, len(numeric_cols))],
+            key='transform_cols'
+        )
+    
+    with col2:
+        st.markdown("#### Transform Options")
+        do_diff = st.checkbox("📉 Difference (1st)", value=False)
+        do_pct = st.checkbox("📊 Percent Change", value=False)
+        do_log = st.checkbox("📈 Logarithm", value=False)
+        do_winsor = st.checkbox("✂️ Winsorize", value=False)
+    
+    if do_winsor:
+        col1, col2 = st.columns(2)
+        with col1:
+            winsor_lower = st.slider("Lower percentile", 0.0, 10.0, 1.0, 0.5)
+        with col2:
+            winsor_upper = st.slider("Upper percentile", 90.0, 100.0, 99.0, 0.5)
+    else:
+        winsor_lower = 1.0
+        winsor_upper = 99.0
+    
+    st.info("💡 **Tip:** New columns will have prefixes like `diff1__`, `pct1__`, `log__`, `win__`")
+    
+    if st.button("🚀 Apply Transforms", type="primary", use_container_width=True):
+        if not selected_cols:
+            st.warning("⚠️ Please select at least one feature")
+        elif not any([do_diff, do_pct, do_log, do_winsor]):
+            st.warning("⚠️ Please select at least one transform")
         else:
-            df = state.panel_monthly.copy()
-            existing = set(df.columns)
-            for c in cols_sel:
-                s = pd.to_numeric(df[c], errors="coerce")
-                if do_diff:
-                    name = _make_unique(f"diff1__{_slug(c)}", existing)
-                    df[name] = s.diff(1)
-                if do_pct:
-                    name = _make_unique(f"pct1__{_slug(c)}", existing)
-                    df[name] = s.pct_change(1)
-                if do_log:
-                    name = _make_unique(f"log__{_slug(c)}", existing)
-                    df[name] = _safe_log(s)
-                if do_winsor:
-                    name = _make_unique(f"win__{_slug(c)}_{int(w_low)}_{int(w_high)}", existing)
-                    df[name] = _winsor(s, w_low, w_high)
-            state.panel_monthly = df
-            # update recipe
-            rec = st.session_state.get("fe_recipe", [])
-            rec.append({
-                "op": "transform",
-                "columns": cols_sel,
-                "params": {"diff": do_diff, "pct1": do_pct, "log": do_log, "winsor": do_winsor, "w_low": w_low, "w_high": w_high},
+            with st.spinner("Applying transforms..."):
+                state.panel_monthly, new_cols = apply_transforms(
+                    state.panel_monthly,
+                    selected_cols,
+                    diff=do_diff,
+                    pct_change=do_pct,
+                    log=do_log,
+                    winsorize=do_winsor,
+                    winsor_lower=winsor_lower,
+                    winsor_upper=winsor_upper
+                )
+                
+                # Update recipe
+                st.session_state.fe_recipe.append({
+                    'operation': 'transform',
+                    'columns': selected_cols,
+                    'params': {
+                        'diff': do_diff,
+                        'pct_change': do_pct,
+                        'log': do_log,
+                        'winsorize': do_winsor,
+                        'winsor_lower': winsor_lower,
+                        'winsor_upper': winsor_upper
+                    },
+                    'timestamp': datetime.now().isoformat()
+                })
+                
+                st.success(f"✅ Created {len(new_cols)} new features!")
+                st.rerun()
+
+# =============================================================================
+# TAB 2: LAGS & ROLLING
+# =============================================================================
+
+with tab2:
+    st.markdown('<div class="step-header"><h3>⏱️ Temporal Features</h3></div>', unsafe_allow_html=True)
+    
+    selected_cols_lag = st.multiselect(
+        "Select features for lags/rolling:",
+        options=numeric_cols,
+        default=numeric_cols[:min(5, len(numeric_cols))],
+        key='lag_cols'
+    )
+    
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        st.markdown("#### 📅 Lags")
+        lag_input = st.text_input(
+            "Lag periods (comma-separated)",
+            value="1,3,6,12",
+            help="e.g., 1,3,6,12 for 1, 3, 6, and 12 month lags"
+        )
+        
+        # Parse lags
+        lags = []
+        if lag_input.strip():
+            for val in lag_input.split(','):
+                try:
+                    lag = int(val.strip())
+                    if lag > 0:
+                        lags.append(lag)
+                except:
+                    pass
+        lags = sorted(set(lags))
+    
+    with col2:
+        st.markdown("#### 📊 Rolling Windows")
+        window_input = st.text_input(
+            "Window sizes (comma-separated)",
+            value="3,6,12",
+            help="e.g., 3,6,12 for 3, 6, and 12 month windows"
+        )
+        
+        # Parse windows
+        windows = []
+        if window_input.strip():
+            for val in window_input.split(','):
+                try:
+                    window = int(val.strip())
+                    if window > 0:
+                        windows.append(window)
+                except:
+                    pass
+        windows = sorted(set(windows))
+    
+    with col3:
+        st.markdown("#### 📈 Statistics")
+        roll_stats = st.multiselect(
+            "Rolling statistics:",
+            options=['mean', 'std', 'min', 'max'],
+            default=['mean', 'std']
+        )
+    
+    st.info(f"💡 **Will create:** {len(selected_cols_lag)} cols × ({len(lags)} lags + {len(windows)} windows × {len(roll_stats)} stats) = {len(selected_cols_lag) * (len(lags) + len(windows) * len(roll_stats))} features")
+    
+    if st.button("🚀 Generate Features", type="primary", use_container_width=True):
+        if not selected_cols_lag:
+            st.warning("⚠️ Please select at least one feature")
+        elif not lags and not windows:
+            st.warning("⚠️ Please specify lags or rolling windows")
+        else:
+            progress = st.progress(0)
+            status = st.empty()
+            
+            all_new_cols = []
+            
+            # Apply lags
+            if lags:
+                status.text("Creating lag features...")
+                progress.progress(0.3)
+                state.panel_monthly, lag_cols = apply_lags(
+                    state.panel_monthly,
+                    selected_cols_lag,
+                    lags
+                )
+                all_new_cols.extend(lag_cols)
+            
+            # Apply rolling
+            if windows and roll_stats:
+                status.text("Creating rolling features...")
+                progress.progress(0.6)
+                state.panel_monthly, roll_cols = apply_rolling_stats(
+                    state.panel_monthly,
+                    selected_cols_lag,
+                    windows,
+                    roll_stats
+                )
+                all_new_cols.extend(roll_cols)
+            
+            progress.progress(1.0)
+            status.empty()
+            progress.empty()
+            
+            # Update recipe
+            st.session_state.fe_recipe.append({
+                'operation': 'lags_rolling',
+                'columns': selected_cols_lag,
+                'params': {
+                    'lags': lags,
+                    'windows': windows,
+                    'stats': roll_stats
+                },
+                'timestamp': datetime.now().isoformat()
             })
-            st.session_state["fe_recipe"] = rec
-            st.success("Transforms applied and recipe updated.")
+            
+            st.success(f"✅ Created {len(all_new_cols)} new features!")
+            st.rerun()
 
-# =============
-# TAB 2 — Lags & Rolling
-# =============
-with T2:
-    st.subheader("Generate lags and rolling features")
-    cols_sel2 = st.multiselect("Select features for lags/rolling", options=all_cols, default=all_cols[: min(8, len(all_cols))], key="lag_cols")
-    c1, c2 = st.columns(2)
-    with c1:
-        lag_list_str = st.text_input("Lags (comma‑sep)", value="1,3,6,12")
-    with c2:
-        roll_list_str = st.text_input("Rolling windows (comma‑sep)", value="3,6,12")
+# =============================================================================
+# TAB 3: MISSING VALUES
+# =============================================================================
 
-    r_stats = st.multiselect("Rolling stats", options=["mean", "std", "min", "max"], default=["mean", "std"]) 
+with tab3:
+    st.markdown('<div class="step-header"><h3>🔧 Handle Missing Values</h3></div>', unsafe_allow_html=True)
+    
+    # Calculate current missing stats
+    total_values = state.panel_monthly.size
+    missing_values = state.panel_monthly.isna().sum().sum()
+    missing_pct = (missing_values / total_values * 100) if total_values > 0 else 0
+    
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Total Values", f"{total_values:,}")
+    col2.metric("Missing Values", f"{missing_values:,}")
+    col3.metric("Missing %", f"{missing_pct:.2f}%")
+    
+    st.markdown("---")
+    
+    col1, col2 = st.columns([2, 1])
+    
+    with col1:
+        fill_method = st.selectbox(
+            "Fill method:",
+            options=['none', 'ffill', 'bfill', 'ffill_then_bfill'],
+            format_func=lambda x: {
+                'none': 'None (Keep as is)',
+                'ffill': 'Forward Fill (Use last valid)',
+                'bfill': 'Backward Fill (Use next valid)',
+                'ffill_then_bfill': 'Forward then Backward Fill'
+            }[x]
+        )
+    
+    with col2:
+        drop_leading = st.checkbox(
+            "Drop leading empty rows",
+            value=True,
+            help="Remove rows at the start that are completely empty"
+        )
+    
+    if st.button("🚀 Apply Fill Method", type="primary", use_container_width=True):
+        with st.spinner("Handling missing values..."):
+            state.panel_monthly = handle_missing_values(
+                state.panel_monthly,
+                method=fill_method,
+                drop_leading=drop_leading
+            )
+            
+            # Update recipe
+            st.session_state.fe_recipe.append({
+                'operation': 'fill_missing',
+                'params': {
+                    'method': fill_method,
+                    'drop_leading': drop_leading
+                },
+                'timestamp': datetime.now().isoformat()
+            })
+            
+            st.success("✅ Missing values handled!")
+            st.rerun()
 
-    def _parse_int_list(s: str) -> list[int]:
-        nums = []
-        for tok in s.split(","):
-            tok = tok.strip()
-            if not tok:
-                continue
-            try:
-                v = int(tok)
-                if v > 0:
-                    nums.append(v)
-            except Exception:
-                pass
-        return sorted(set(nums))
+# =============================================================================
+# TAB 4: STANDARDIZE
+# =============================================================================
 
-    if st.button("Apply lags/rolling", type="primary"):
-        L = _parse_int_list(lag_list_str)
-        W = _parse_int_list(roll_list_str)
-        if not cols_sel2 or (not L and not W):
-            st.warning("Provide at least one column and one lag/window.")
+with tab4:
+    st.markdown('<div class="step-header"><h3>📊 Z-Score Standardization</h3></div>', unsafe_allow_html=True)
+    
+    col1, col2 = st.columns([2, 1])
+    
+    with col1:
+        selected_cols_std = st.multiselect(
+            "Select features to standardize:",
+            options=numeric_cols,
+            default=[],
+            key='std_cols'
+        )
+    
+    with col2:
+        st.markdown("#### Options")
+        use_expanding = st.checkbox(
+            "📈 Expanding window",
+            value=False,
+            help="Use expanding mean/std to avoid look-ahead bias (important for time series!)"
+        )
+    
+    st.info("💡 **New columns** will have `__z` suffix. Z-score = (x - mean) / std")
+    
+    if st.button("🚀 Apply Standardization", type="primary", use_container_width=True):
+        if not selected_cols_std:
+            st.warning("⚠️ Please select at least one feature")
         else:
-            df = state.panel_monthly.copy()
-            existing = set(df.columns)
-            for c in cols_sel2:
-                s = pd.to_numeric(df[c], errors="coerce")
-                for l in L:
-                    name = _make_unique(f"lag{l}__{_slug(c)}", existing)
-                    df[name] = s.shift(l)
-                for w in W:
-                    r = s.rolling(w, min_periods=max(1, w // 2))
-                    if "mean" in r_stats:
-                        name = _make_unique(f"roll{w}_mean__{_slug(c)}", existing)
-                        df[name] = r.mean()
-                    if "std" in r_stats:
-                        name = _make_unique(f"roll{w}_std__{_slug(c)}", existing)
-                        df[name] = r.std(ddof=0)
-                    if "min" in r_stats:
-                        name = _make_unique(f"roll{w}_min__{_slug(c)}", existing)
-                        df[name] = r.min()
-                    if "max" in r_stats:
-                        name = _make_unique(f"roll{w}_max__{_slug(c)}", existing)
-                        df[name] = r.max()
-            state.panel_monthly = df
-            rec = st.session_state.get("fe_recipe", [])
-            rec.append({"op": "lags_rolling", "columns": cols_sel2, "params": {"lags": L, "windows": W, "stats": r_stats}})
-            st.session_state["fe_recipe"] = rec
-            st.success("Lags/Rolling features generated.")
+            with st.spinner("Standardizing features..."):
+                state.panel_monthly, new_cols = apply_standardization(
+                    state.panel_monthly,
+                    selected_cols_std,
+                    expanding=use_expanding
+                )
+                
+                # Update recipe
+                st.session_state.fe_recipe.append({
+                    'operation': 'standardize',
+                    'columns': selected_cols_std,
+                    'params': {
+                        'expanding': use_expanding
+                    },
+                    'timestamp': datetime.now().isoformat()
+                })
+                
+                st.success(f"✅ Created {len(new_cols)} standardized features!")
+                st.rerun()
 
-# =============
-# TAB 3 — Missing handling
-# =============
-with T3:
-    st.subheader("Missing values")
-    method = st.selectbox("Fill method", ["none", "ffill", "bfill", "ffill_then_bfill"], index=0)
-    drop_leading = st.checkbox("Drop leading all‑NA rows after fill", value=True)
+# =============================================================================
+# TAB 5: RECIPE
+# =============================================================================
 
-    if st.button("Apply fill", type="primary"):
-        df = state.panel_monthly.copy()
-        if method == "ffill":
-            df = df.ffill()
-        elif method == "bfill":
-            df = df.bfill()
-        elif method == "ffill_then_bfill":
-            df = df.ffill().bfill()
-        # optional drop leading NaN rows
-        if drop_leading:
-            df = df.loc[~df.isna().all(axis=1)]
-        state.panel_monthly = df
-        rec = st.session_state.get("fe_recipe", [])
-        rec.append({"op": "fill", "params": {"method": method, "drop_leading": drop_leading}})
-        st.session_state["fe_recipe"] = rec
-        st.success("Missing value handling applied.")
-
-# =============
-# TAB 4 — Standardize
-# =============
-with T4:
-    st.subheader("Z-score standardization")
-    cols_std = st.multiselect("Select features to z‑score (create new __z columns)", options=all_cols, default=[])
-    expanding = st.checkbox("Use expanding mean/std (time‑aware)", value=False, help="If checked, uses expanding moments to avoid look‑ahead bias.")
-
-    if st.button("Apply z‑score", type="primary"):
-        df = state.panel_monthly.copy()
-        existing = set(df.columns)
-        for c in cols_std:
-            s = pd.to_numeric(df[c], errors="coerce")
-            if expanding:
-                mu = s.expanding().mean()
-                sd = s.expanding().std(ddof=0)
+with tab5:
+    st.markdown('<div class="step-header"><h3>📋 Feature Engineering Recipe</h3></div>', unsafe_allow_html=True)
+    
+    recipe = st.session_state.fe_recipe
+    
+    if not recipe:
+        st.info("📝 No operations recorded yet. Apply transforms to build your recipe!")
+    else:
+        st.markdown(f"**Total operations:** {len(recipe)}")
+        
+        # Display recipe
+        recipe_json = json.dumps(recipe, indent=2)
+        st.code(recipe_json, language='json')
+        
+        # Export recipe
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            st.download_button(
+                "📥 Download Recipe (JSON)",
+                data=recipe_json.encode('utf-8'),
+                file_name='feature_recipe.json',
+                mime='application/json',
+                use_container_width=True
+            )
+        
+        with col2:
+            if st.button("🗑️ Clear Recipe", use_container_width=True):
+                st.session_state.fe_recipe = []
+                st.success("✅ Recipe cleared!")
+                st.rerun()
+        
+        with col3:
+            if st.button("📊 Recipe Summary", use_container_width=True):
+                st.session_state['show_recipe_summary'] = True
+    
+    st.markdown("---")
+    
+    # Import recipe
+    st.markdown("### 📤 Import Recipe")
+    
+    recipe_input = st.text_area(
+        "Paste JSON recipe here:",
+        height=200,
+        placeholder='[{"operation": "transform", ...}]'
+    )
+    
+    if st.button("🚀 Apply Imported Recipe", type="primary"):
+        try:
+            imported_recipe = json.loads(recipe_input)
+            
+            if not isinstance(imported_recipe, list):
+                st.error("❌ Recipe must be a JSON array")
             else:
-                mu = s.mean(); sd = s.std(ddof=0)
-            z = (s - mu) / (sd + 1e-9)
-            name = _make_unique(f"{_slug(c)}__z", existing)
-            df[name] = z
-        state.panel_monthly = df
-        rec = st.session_state.get("fe_recipe", [])
-        rec.append({"op": "zscore", "columns": cols_std, "params": {"expanding": expanding}})
-        st.session_state["fe_recipe"] = rec
-        st.success("Z-score features appended.")
+                st.session_state.fe_recipe = imported_recipe
+                st.success(f"✅ Imported {len(imported_recipe)} operations!")
+                st.info("💡 Recipe loaded. You may need to reapply operations.")
+        
+        except json.JSONDecodeError as e:
+            st.error(f"❌ Invalid JSON: {str(e)}")
+    
+    # Recipe summary
+    if recipe and st.session_state.get('show_recipe_summary', False):
+        st.markdown("---")
+        st.markdown("### 📊 Recipe Summary")
+        
+        # Count operations by type
+        op_counts = {}
+        for step in recipe:
+            op = step.get('operation', 'unknown')
+            op_counts[op] = op_counts.get(op, 0) + 1
+        
+        summary_df = pd.DataFrame(list(op_counts.items()), columns=['Operation', 'Count'])
+        st.dataframe(summary_df, use_container_width=True)
 
-# =============
-# TAB 5 — Recipe (export/import/apply)
-# =============
-with T5:
-    st.subheader("Recipe (JSON)")
-    recipe = st.session_state.get("fe_recipe", [])
-    st.code(json.dumps(recipe, indent=2), language="json")
-
-    st.markdown("**Import recipe**")
-    rec_txt = st.text_area("Paste JSON recipe here", value="", height=120)
-    c1, c2, c3 = st.columns(3)
-
-    def _apply_recipe(df: pd.DataFrame, rec: list[dict]) -> pd.DataFrame:
-        existing = set(df.columns)
-        def safe_log(s: pd.Series) -> pd.Series:
-            s = s.astype(float); eps = max(1e-9, np.nanmin(s[s > 0]) * 1e-6) if np.any(s > 0) else 1e-6
-            return np.log(s + eps)
-        def winsor(s: pd.Series, lo: float, hi: float) -> pd.Series:
-            return s.clip(np.nanpercentile(s, lo), np.nanpercentile(s, hi))
-        def slug(x: str) -> str:
-            return _slug(x)
-        for step in rec:
-            op = step.get("op")
-            if op == "transform":
-                cols = step.get("columns", [])
-                P = step.get("params", {})
-                for c in cols:
-                    s = pd.to_numeric(df[c], errors="coerce") if c in df.columns else None
-                    if s is None: continue
-                    if P.get("diff"):
-                        df[_make_unique(f"diff1__{slug(c)}", existing)] = s.diff(1)
-                    if P.get("pct1"):
-                        df[_make_unique(f"pct1__{slug(c)}", existing)] = s.pct_change(1)
-                    if P.get("log"):
-                        df[_make_unique(f"log__{slug(c)}", existing)] = safe_log(s)
-                    if P.get("winsor"):
-                        df[_make_unique(f"win__{slug(c)}_{int(P.get('w_low',1))}_{int(P.get('w_high',99))}", existing)] = winsor(s, float(P.get('w_low',1.0)), float(P.get('w_high',99.0)))
-            elif op == "lags_rolling":
-                cols = step.get("columns", [])
-                P = step.get("params", {})
-                L = P.get("lags", []) or []
-                W = P.get("windows", []) or []
-                stats = P.get("stats", ["mean"]) or []
-                for c in cols:
-                    if c not in df.columns: continue
-                    s = pd.to_numeric(df[c], errors="coerce")
-                    for l in L:
-                        df[_make_unique(f"lag{int(l)}__{slug(c)}", existing)] = s.shift(int(l))
-                    for w in W:
-                        r = s.rolling(int(w), min_periods=max(1, int(w)//2))
-                        if "mean" in stats:
-                            df[_make_unique(f"roll{int(w)}_mean__{slug(c)}", existing)] = r.mean()
-                        if "std" in stats:
-                            df[_make_unique(f"roll{int(w)}_std__{slug(c)}", existing)] = r.std(ddof=0)
-                        if "min" in stats:
-                            df[_make_unique(f"roll{int(w)}_min__{slug(c)}", existing)] = r.min()
-                        if "max" in stats:
-                            df[_make_unique(f"roll{int(w)}_max__{slug(c)}", existing)] = r.max()
-            elif op == "fill":
-                P = step.get("params", {})
-                m = P.get("method", "none")
-                if m == "ffill": df = df.ffill()
-                elif m == "bfill": df = df.bfill()
-                elif m == "ffill_then_bfill": df = df.ffill().bfill()
-                if P.get("drop_leading", True):
-                    df = df.loc[~df.isna().all(axis=1)]
-            elif op == "zscore":
-                cols = step.get("columns", [])
-                P = step.get("params", {})
-                expanding = bool(P.get("expanding", False))
-                for c in cols:
-                    if c not in df.columns: continue
-                    s = pd.to_numeric(df[c], errors="coerce")
-                    if expanding:
-                        mu = s.expanding().mean(); sd = s.expanding().std(ddof=0)
-                    else:
-                        mu = s.mean(); sd = s.std(ddof=0)
-                    df[_make_unique(f"{slug(c)}__z", existing)] = (s - mu) / (sd + 1e-9)
-        return df
-
-    with c1:
-        if st.button("Apply imported recipe", use_container_width=True):
-            try:
-                rec_in = json.loads(rec_txt) if rec_txt.strip() else []
-                df = _apply_recipe(state.panel_monthly.copy(), rec_in)
-                state.panel_monthly = df
-                st.success("Imported recipe applied to panel.")
-            except Exception as e:
-                st.error(f"Invalid recipe JSON: {e}")
-    with c2:
-        if st.button("Clear recipe", use_container_width=True):
-            st.session_state["fe_recipe"] = []
-            st.info("Recipe cleared. Existing panel untouched.")
-    with c3:
-        if st.button("Download recipe.json", use_container_width=True):
-            st.download_button("Click to download", data=json.dumps(recipe, indent=2).encode("utf-8"), file_name="feature_recipe.json")
-
-# ----------------------------------------------------------------------------
-# Preview & diagnostics
-# ----------------------------------------------------------------------------
+# =============================================================================
+# PREVIEW & DIAGNOSTICS
+# =============================================================================
 
 st.markdown("---")
-st.subheader("Preview & diagnostics")
+st.markdown('<div class="step-header"><h2>🔍 Panel Preview & Diagnostics</h2></div>', unsafe_allow_html=True)
 
-pm = state.panel_monthly
-if cap_preview and len(pm) > 120:
-    pm_prev = pm.tail(120)
-else:
-    pm_prev = pm
+panel_preview = state.panel_monthly.tail(show_last_n)
 
-st.markdown(f"**Panel shape:** {pm.shape[0]} rows × {pm.shape[1]} cols")
-if show_memory:
-    mem_mb = pm.memory_usage(deep=True).sum() / (1024 ** 2)
-    st.caption(f"Approx. memory: {mem_mb:.2f} MB")
+# Summary metrics
+col1, col2, col3, col4 = st.columns(4)
 
-st.dataframe(pm_prev.tail(24), use_container_width=True)
+col1.metric("📅 Total Months", state.panel_monthly.shape[0])
+col2.metric("📊 Total Features", state.panel_monthly.shape[1])
 
-# Presence heatmap
-try:
-    presence = pm_prev.notna().astype(int)
-    hm = px.imshow(
-        presence.T,
-        aspect="auto",
-        color_continuous_scale=[[0, "#F3F4F6"], [1, "#0EA5E9"]],
-        title="Presence heatmap (preview)",
-    )
-    hm.update_layout(height=520, template="plotly_white", coloraxis_showscale=False, margin=dict(l=20, r=20, t=40, b=20))
-    st.plotly_chart(hm, use_container_width=True)
-except Exception:
-    pass
+coverage = panel_preview.notna().mean().mean()
+col3.metric("✅ Avg Coverage", f"{coverage:.1%}")
 
-# Optional overlay with target
+if state.y_monthly is not None:
+    y_aligned, X_aligned = state.y_monthly.align(state.panel_monthly, join='inner')
+    col4.metric("🎯 Overlap with Target", f"{len(y_aligned)} months")
+
+# Data preview
+st.markdown("### 📋 Data Preview")
+st.dataframe(
+    panel_preview.tail(24).style.format("{:.4f}"),
+    use_container_width=True,
+    height=400
+)
+
+# Missing values heatmap
+st.markdown("### 🔍 Data Coverage Heatmap")
+heatmap_fig = plot_missing_values_heatmap(state.panel_monthly, show_last_n)
+st.plotly_chart(heatmap_fig, use_container_width=True)
+
+# Correlation with target
 if state.y_monthly is not None and not state.y_monthly.empty:
-    st.markdown("**Overlay with target (pick a feature):**")
-    num_cols = [c for c in pm.columns if _is_numeric(pm[c])]
-    if num_cols:
-        f = st.selectbox("Feature", options=num_cols, index=0)
-        y, x = state.y_monthly.align(pm[f], join="inner")
-        xz = (x - x.mean()) / (x.std(ddof=0) + 1e-9)
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(x=y.index, y=y.values, mode="lines", name="Target", line=dict(width=3)))
-        fig.add_trace(go.Scatter(x=xz.index, y=xz.values, mode="lines", name=f"std({f})"))
-        fig.update_layout(template="plotly_white", height=360, title="Target vs standardized feature")
-        st.plotly_chart(fig, use_container_width=True)
+    st.markdown("### 📈 Correlation with Target")
+    
+    corr_fig = plot_correlation_with_target(
+        state.panel_monthly,
+        state.y_monthly,
+        top_n=20
+    )
+    
+    if corr_fig:
+        st.plotly_chart(corr_fig, use_container_width=True)
 
-st.caption("Feature‑engineered panel is now ready for Backtesting.")
+# Footer
+st.markdown("---")
+col1, col2, col3 = st.columns(3)
+
+with col1:
+    st.caption(f"🔧 {len(st.session_state.fe_recipe)} operations in recipe")
+
+with col2:
+    st.caption("💾 Changes persisted in session state")
+
+with col3:
+    st.caption("💻 Built with Streamlit Pro")
