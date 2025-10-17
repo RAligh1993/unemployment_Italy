@@ -373,12 +373,23 @@ else:
         news["vader_compound"] = np.nan
 
 # LLM scoring (econ_impact & unemp_impact in [-1,1])
-LLM_PROMPT = (
-    "You are an economic analyst. Read headline+summary and return strict JSON: "
-    "{\\"econ_impact\\": [-1..1], \\"unemp_impact\\": [-1..1], \\"rationale\\": string<=60}. "
-    "econ_impact = macro/financial direction; unemp_impact = direction on unemployment (higher→more unemployment). "
-    "Be conservative; 0 if unclear."
-)
+LLM_PROMPT = """
+You are an economic analyst. Read the headline and the short summary and return
+a STRICT JSON object with this exact schema:
+
+{"econ_impact": 0.0, "unemp_impact": 0.0, "rationale": ""}
+
+Constraints:
+- econ_impact ∈ [-1, 1]
+- unemp_impact ∈ [-1, 1]
+- rationale ≤ 60 words
+Guidance:
+- econ_impact = macro/financial direction.
+- unemp_impact = direction on unemployment (higher => more unemployment).
+- If unsure, return zeros.
+Output ONLY the JSON object, no extra text.
+"""
+
 
 
 def _llm_client(provider: str, model: str):
