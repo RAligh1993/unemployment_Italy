@@ -3,6 +3,7 @@ streamlit>=1.36
 pandas>=2.2
 numpy>=1.26
 plotly>=5.20
+streamlit==1.37.0
 
 # Modeling
 scikit-learn>=1.3
