@@ -1,1021 +1,533 @@
 """
-═══════════════════════════════════════════════════════════════════════════════
-🇮🇹 ITALIAN UNEMPLOYMENT DATA - AUTOMATIC FETCHING SYSTEM
-═══════════════════════════════════════════════════════════════════════════════
+🇮🇹 ITALIAN UNEMPLOYMENT DATA – HARDENED, FULLY AUTOMATED BUILD
+Version: 3.1
+Date: 2025-10-18
 
-A professional, production-ready system for automatically fetching Italian 
-unemployment and related economic data from official sources.
+Run locally:
+  streamlit run italian_auto_fetch_app_hardened.py
 
-Features:
-- ✅ Eurostat (Unemployment, CCI, HICP, Industrial Production)
-- ✅ Yahoo Finance (FTSE MIB, VIX)
-- ✅ Google Trends (Italian job keywords)
-- ✅ Real-time data validation
-- ✅ Interactive visualizations
-- ✅ Export to CSV/Excel
+Key changes vs v3.0:
+- Robust Eurostat fetch with *dynamic* dimension resolution + multi-step fallbacks
+- Reliable Yahoo Finance with multi-ticker + start/period fallback + retry/backoff
+- Google Trends with chunking, exponential backoff, and automatic column merge
+- Concurrent fetching for speed (ThreadPoolExecutor)
+- Better status/logging, clearer errors, deterministic caching
+- Trends tab shows multi-series selector
 
-Author: Professional Data Team
-Version: 3.0 (Production)
-Date: October 2025
-
-Save as: italian_auto_fetch_app.py
-Run: streamlit run italian_auto_fetch_app.py
-═══════════════════════════════════════════════════════════════════════════════
+Dependencies (requirements.txt):
+streamlit
+pandas
+numpy
+plotly
+scipy
+eurostat
+yfinance
+pytrends
+requests
+xlsxwriter
 """
+
+import os
+import time
+import math
+import random
+from io import BytesIO
+from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Dict, Optional, Tuple, List
 
 import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
-import plotly.express as px
-from datetime import datetime
-import warnings
-from io import BytesIO
-from typing import Dict, Optional, Tuple
-warnings.filterwarnings('ignore')
 
-# ═══════════════════════════════════════════════════════════════════════════
-# PAGE CONFIGURATION
-# ═══════════════════════════════════════════════════════════════════════════
-
+# -----------------------------------------------------------------------------
+# PAGE CONFIG
+# -----------------------------------------------------------------------------
 st.set_page_config(
-    page_title="Italian Data Auto-Fetch",
+    page_title="Italian Data Auto‑Fetch (Hardened)",
     page_icon="🇮🇹",
     layout="wide",
     initial_sidebar_state="expanded",
-    menu_items={
-        'Get Help': 'https://github.com/yourusername/italian-data',
-        'About': """
-        # Italian Unemployment Auto-Fetch System
-        **Version:** 3.0 Production
-        
-        Automatically fetch Italian economic data from official sources.
-        """
-    }
 )
 
-# ═══════════════════════════════════════════════════════════════════════════
-# CUSTOM CSS - PROFESSIONAL STYLING
-# ═══════════════════════════════════════════════════════════════════════════
+# -----------------------------------------------------------------------------
+# STYLE
+# -----------------------------------------------------------------------------
+st.markdown(
+    """
+    <style>
+    .hero{background:linear-gradient(90deg,#009246 0%,#fff 33%,#fff 66%,#CE2B37 100%);padding:36px;border-radius:16px;text-align:center;margin-bottom:24px}
+    .hero h1{margin:0;font-weight:900}
+    .kpi{background:linear-gradient(135deg,#667eea,#764ba2);color:#fff;padding:18px;border-radius:14px;text-align:center}
+    .card{border:1px solid #e5e7eb;border-radius:14px;padding:16px;margin-bottom:12px}
+    code{white-space:pre-wrap}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
-st.markdown("""
-<style>
-    /* Main header with Italian flag gradient */
-    .hero-header {
-        background: linear-gradient(90deg, #009246 0%, #FFFFFF 33%, #FFFFFF 66%, #CE2B37 100%);
-        padding: 50px 30px;
-        border-radius: 20px;
-        text-align: center;
-        margin-bottom: 40px;
-        box-shadow: 0 10px 40px rgba(0,0,0,0.15);
-    }
-    
-    .hero-header h1 {
-        color: #2c3e50;
-        font-size: 3.5rem;
-        font-weight: 900;
-        margin: 0;
-        text-shadow: 2px 2px 4px rgba(0,0,0,0.1);
-    }
-    
-    .hero-header p {
-        color: #34495e;
-        font-size: 1.4rem;
-        margin: 15px 0 0 0;
-        font-weight: 600;
-    }
-    
-    /* Data source cards */
-    .source-card {
-        background: white;
-        border: 2px solid #e0e0e0;
-        border-radius: 15px;
-        padding: 25px;
-        margin: 15px 0;
-        box-shadow: 0 4px 15px rgba(0,0,0,0.08);
-        transition: all 0.3s ease;
-    }
-    
-    .source-card:hover {
-        border-color: #667eea;
-        box-shadow: 0 6px 25px rgba(102, 126, 234, 0.2);
-        transform: translateY(-3px);
-    }
-    
-    .source-card.available {
-        border-left: 5px solid #10B981;
-    }
-    
-    .source-card.unavailable {
-        border-left: 5px solid #EF4444;
-        opacity: 0.6;
-    }
-    
-    .source-header {
-        font-size: 1.4rem;
-        font-weight: 700;
-        color: #2c3e50;
-        margin-bottom: 10px;
-    }
-    
-    .source-description {
-        color: #6c757d;
-        font-size: 1rem;
-        line-height: 1.6;
-        margin-bottom: 15px;
-    }
-    
-    .source-metadata {
-        background: #f8f9fa;
-        padding: 12px;
-        border-radius: 8px;
-        font-size: 0.9rem;
-        color: #495057;
-    }
-    
-    .badge {
-        display: inline-block;
-        padding: 4px 12px;
-        border-radius: 12px;
-        font-size: 0.85rem;
-        font-weight: 600;
-        margin: 4px 4px 4px 0;
-    }
-    
-    .badge-success {
-        background: #10B981;
-        color: white;
-    }
-    
-    .badge-warning {
-        background: #F59E0B;
-        color: white;
-    }
-    
-    .badge-info {
-        background: #3B82F6;
-        color: white;
-    }
-    
-    .badge-danger {
-        background: #EF4444;
-        color: white;
-    }
-    
-    /* Status indicators */
-    .status-box {
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-        color: white;
-        padding: 30px;
-        border-radius: 15px;
-        text-align: center;
-        box-shadow: 0 5px 20px rgba(0,0,0,0.15);
-    }
-    
-    .status-box h3 {
-        font-size: 2.5rem;
-        margin: 0;
-        font-weight: 800;
-    }
-    
-    .status-box p {
-        font-size: 1.1rem;
-        margin: 10px 0 0 0;
-        opacity: 0.95;
-    }
-    
-    /* Section headers */
-    .section-title {
-        font-size: 2.2rem;
-        font-weight: 700;
-        color: #2c3e50;
-        margin: 50px 0 25px 0;
-        padding-bottom: 15px;
-        border-bottom: 3px solid #667eea;
-    }
-    
-    /* Data quality indicators */
-    .quality-indicator {
-        display: inline-flex;
-        align-items: center;
-        padding: 8px 16px;
-        border-radius: 20px;
-        font-weight: 600;
-        margin: 5px;
-    }
-    
-    .quality-excellent {
-        background: #D1FAE5;
-        color: #065F46;
-    }
-    
-    .quality-good {
-        background: #DBEAFE;
-        color: #1E40AF;
-    }
-    
-    .quality-fair {
-        background: #FEF3C7;
-        color: #92400E;
-    }
-    
-    /* Buttons */
-    .stButton > button {
-        font-size: 1.2rem;
-        font-weight: 700;
-        padding: 18px 40px;
-        border-radius: 12px;
-        transition: all 0.3s ease;
-    }
-    
-    /* Info boxes */
-    .info-box {
-        background: linear-gradient(135deg, #667eea 10%, #764ba2 100%);
-        color: white;
-        padding: 25px;
-        border-radius: 12px;
-        margin: 20px 0;
-    }
-    
-    .info-box h4 {
-        margin-top: 0;
-        font-size: 1.3rem;
-    }
-</style>
-""", unsafe_allow_html=True)
-
-# ═══════════════════════════════════════════════════════════════════════════
-# DATA SOURCE DEFINITIONS & AVAILABILITY
-# ═══════════════════════════════════════════════════════════════════════════
-
-DATA_SOURCES = {
-    'unemployment': {
-        'name': 'Italian Unemployment Rate',
-        'provider': 'Eurostat',
-        'dataset': 'une_rt_m',
-        'frequency': 'Monthly',
-        'coverage': '2000-Present',
-        'update': 'Monthly (T+30 days)',
-        'description': 'Seasonally adjusted unemployment rate for Italy. Official statistics from Eurostat statistical office.',
-        'mandatory': True,
-        'available': True,
-        'url': 'https://ec.europa.eu/eurostat',
-        'quality': 'excellent',
-        'icon': '🎯'
-    },
-    'cci': {
-        'name': 'Consumer Confidence Index',
-        'provider': 'Eurostat',
-        'dataset': 'ei_bsco_m',
-        'frequency': 'Monthly',
-        'coverage': '2000-Present',
-        'update': 'Monthly (T+5 days)',
-        'description': 'Consumer confidence indicator reflecting household expectations about economic conditions.',
-        'mandatory': False,
-        'available': True,
-        'url': 'https://ec.europa.eu/eurostat',
-        'quality': 'excellent',
-        'icon': '📊'
-    },
-    'hicp': {
-        'name': 'HICP Inflation Index',
-        'provider': 'Eurostat',
-        'dataset': 'prc_hicp_midx',
-        'frequency': 'Monthly',
-        'coverage': '2000-Present',
-        'update': 'Monthly (T+15 days)',
-        'description': 'Harmonized Index of Consumer Prices - official inflation measure for Italy.',
-        'mandatory': False,
-        'available': True,
-        'url': 'https://ec.europa.eu/eurostat',
-        'quality': 'excellent',
-        'icon': '📈'
-    },
-    'iip': {
-        'name': 'Industrial Production Index',
-        'provider': 'Eurostat',
-        'dataset': 'sts_inpr_m',
-        'frequency': 'Monthly',
-        'coverage': '2000-Present',
-        'update': 'Monthly (T+40 days)',
-        'description': 'Index of industrial production measuring output in manufacturing sector.',
-        'mandatory': False,
-        'available': True,
-        'url': 'https://ec.europa.eu/eurostat',
-        'quality': 'good',
-        'icon': '🏭'
-    },
-    'stock': {
-        'name': 'FTSE MIB Stock Index',
-        'provider': 'Yahoo Finance',
-        'dataset': '^FTSEMIB',
-        'frequency': 'Daily',
-        'coverage': '2000-Present',
-        'update': 'Real-time (15min delay)',
-        'description': 'Italian stock market benchmark index. Includes close price, volume, and returns.',
-        'mandatory': False,
-        'available': True,
-        'url': 'https://finance.yahoo.com',
-        'quality': 'good',
-        'icon': '📈'
-    },
-    'vix': {
-        'name': 'V2TX / VIX Volatility',
-        'provider': 'Yahoo Finance / CBOE',
-        'dataset': '^V2TX, ^VIX',
-        'frequency': 'Daily',
-        'coverage': '2000-Present',
-        'update': 'Real-time (15min delay)',
-        'description': 'European/US volatility indices. Market fear gauge and risk indicator.',
-        'mandatory': False,
-        'available': True,
-        'url': 'https://finance.yahoo.com',
-        'quality': 'good',
-        'icon': '📊'
-    },
-    'trends': {
-        'name': 'Google Trends',
-        'provider': 'Google Trends',
-        'dataset': 'Italian job keywords',
-        'frequency': 'Weekly',
-        'coverage': '2015-Present',
-        'update': 'Real-time',
-        'description': 'Search interest data for job-related keywords in Italy. Includes: lavoro, disoccupazione, naspi, etc.',
-        'mandatory': False,
-        'available': True,
-        'url': 'https://trends.google.com',
-        'quality': 'fair',
-        'icon': '🔍'
-    }
-}
-
-# Italian job keywords for Google Trends
+# -----------------------------------------------------------------------------
+# GLOBALS
+# -----------------------------------------------------------------------------
 ITALIAN_KEYWORDS = [
-    'offerte di lavoro',
-    'disoccupazione',
-    'naspi',
-    'indeed lavoro',
-    'ricerca lavoro',
-    'cerco lavoro',
-    'centro per l\'impiego',
-    'cassa integrazione',
-    'reddito di cittadinanza',
-    'curriculum vitae'
+    "offerte di lavoro",
+    "disoccupazione",
+    "naspi",
+    "indeed lavoro",
+    "ricerca lavoro",
+    "cerco lavoro",
+    "centro per l'impiego",
+    "cassa integrazione",
+    "reddito di cittadinanza",
+    "curriculum vitae",
 ]
 
-# ═══════════════════════════════════════════════════════════════════════════
-# DATA FETCHING FUNCTIONS
-# ═══════════════════════════════════════════════════════════════════════════
+DATA_SOURCES = {
+    "unemp": {
+        "name": "Italian Unemployment Rate",
+        "provider": "Eurostat",
+        "dataset": "une_rt_m",
+        "mandatory": True,
+    },
+    "cci": {
+        "name": "Consumer Confidence Index",
+        "provider": "Eurostat",
+        "dataset": "ei_bsco_m",
+        "mandatory": False,
+    },
+    "hicp": {
+        "name": "HICP (All items)",
+        "provider": "Eurostat",
+        "dataset": "prc_hicp_midx",
+        "mandatory": False,
+    },
+    "iip": {
+        "name": "Industrial Production Index",
+        "provider": "Eurostat",
+        "dataset": "sts_inpr_m",
+        "mandatory": False,
+    },
+    "mib": {
+        "name": "FTSE MIB Index",
+        "provider": "Yahoo Finance",
+        "dataset": "^FTSEMIB",
+        "mandatory": False,
+    },
+    "vix": {
+        "name": "V2TX/VIX Volatility",
+        "provider": "Yahoo Finance",
+        "dataset": "^V2TX",
+        "mandatory": False,
+    },
+    "trends": {
+        "name": "Google Trends (job keywords)",
+        "provider": "Google Trends",
+        "dataset": "keywords",
+        "mandatory": False,
+    },
+}
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_eurostat_data(dataset: str, filters: Dict, start_year: int = 2000) -> Tuple[Optional[pd.DataFrame], str]:
-    """
-    Fetch data from Eurostat
-    Returns: (dataframe, status_message)
-    """
+# -----------------------------------------------------------------------------
+# UTILITIES
+# -----------------------------------------------------------------------------
+
+def _backoff_sleep(base=1.5, attempt=1, max_seconds=30):
+    # exponential backoff with jitter
+    delay = min(max_seconds, base ** attempt + random.uniform(0, 0.5))
+    time.sleep(delay)
+
+
+def _internet_ok(url="https://www.google.com", timeout=5) -> bool:
+    try:
+        import requests
+        requests.get(url, timeout=timeout)
+        return True
+    except Exception:
+        return False
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def _eurostat_pars(dataset: str) -> Dict[str, List[str]]:
+    # Cache parameter spaces to avoid repeated metadata calls
+    import eurostat
+    return eurostat.get_par_values(dataset)
+
+
+def _eurostat_resolve(dataset: str, prefs: Dict[str, List[str]]) -> Dict[str, str]:
+    """Pick the first available value for each dimension based on preferences."""
+    pars = _eurostat_pars(dataset)
+    resolved = {}
+    # Only choose for dims that actually exist
+    for dim, pref_list in prefs.items():
+        options = pars.get(dim, [])
+        for v in pref_list:
+            if v in options:
+                resolved[dim] = v
+                break
+    return resolved
+
+
+@st.cache_data(ttl=3600)
+def fetch_eurostat(dataset: str, preferred_filters: Dict[str, List[str]], start_year: int) -> Tuple[Optional[pd.DataFrame], str]:
+    """Robust Eurostat fetch: resolve dims, try filtered pulls, fallbacks, tidy output."""
     try:
         import eurostat
-        
-        # Fetch dataset
-        df = eurostat.get_data_df(dataset, flags=False)
-        
-        # Apply filters
-        for key, value in filters.items():
-            if key in df.columns:
-                df = df[df[key] == value]
-        
-        if df.empty:
-            return None, "❌ No data found after filtering"
-        
-        # Find time columns
-        time_cols = [c for c in df.columns if 'M' in str(c) and len(str(c)) >= 6]
-        if not time_cols:
-            return None, "❌ No time columns found"
-        
-        # Melt to long format
-        id_cols = [c for c in df.columns if c not in time_cols]
-        melted = df.melt(
-            id_vars=id_cols,
-            value_vars=time_cols,
-            var_name='period',
-            value_name='value'
-        )
-        
-        # Parse dates
-        melted['period'] = melted['period'].astype(str).str.replace('M', '-')
-        melted['date'] = pd.to_datetime(melted['period'], format='%Y-%m', errors='coerce')
-        melted['date'] = melted['date'] + pd.offsets.MonthEnd(0)
-        melted['value'] = pd.to_numeric(melted['value'], errors='coerce')
-        
-        # Final cleanup
-        result = melted[['date', 'value']].dropna().sort_values('date')
-        result = result[result['date'].dt.year >= start_year]
-        
-        if result.empty:
-            return None, "❌ No data in date range"
-        
-        return result, f"✅ Success: {len(result)} months"
-        
+        # 1) try preferred resolution
+        resolved = _eurostat_resolve(dataset, preferred_filters)
+        attempts: List[Dict[str, str]] = []
+        if resolved:
+            attempts.append(resolved)
+        # 2) fallbacks (drop the strict dims one by one)
+        # common dimension priorities to relax
+        relax_order = ["s_adj", "unit", "sex", "age", "indic", "indic_bt", "nace_r2"]
+        for dim in relax_order:
+            if dim in resolved:
+                att = {k: v for k, v in resolved.items() if k != dim}
+                if att not in attempts:
+                    attempts.append(att)
+        last_err = None
+        for filt in attempts:
+            try:
+                df = eurostat.get_data_df(dataset, filter_pars=filt, flags=False)
+                if df is None or df.empty:
+                    continue
+                # tidy
+                # time cols look like '2000M01' etc.
+                time_cols = [c for c in df.columns if isinstance(c, str) and "M" in c and c.replace("M", "").isdigit()]
+                if not time_cols:
+                    # some tables come already tidy; attempt to find 'time' column
+                    if "time" in df.columns and "values" in df.columns:
+                        tidy = df[["time", "values"]].rename(columns={"time": "date", "values": "value"})
+                        tidy["date"] = pd.to_datetime(tidy["date"]) + pd.offsets.MonthEnd(0)
+                        tidy = tidy.sort_values("date")
+                        tidy = tidy[tidy["date"].dt.year >= start_year]
+                        if tidy.empty:
+                            continue
+                        return tidy.reset_index(drop=True), f"✅ {dataset} fetched with filters {filt}"
+                    continue
+                id_cols = [c for c in df.columns if c not in time_cols]
+                melted = df.melt(id_vars=id_cols, value_vars=time_cols, var_name="period", value_name="value")
+                melted["period"] = melted["period"].astype(str).str.replace("M", "-")
+                melted["date"] = pd.to_datetime(melted["period"], format="%Y-%m", errors="coerce") + pd.offsets.MonthEnd(0)
+                melted["value"] = pd.to_numeric(melted["value"], errors="coerce")
+                out = melted[["date", "value"]].dropna().sort_values("date")
+                out = out[out["date"].dt.year >= start_year]
+                if out.empty:
+                    continue
+                return out.reset_index(drop=True), f"✅ {dataset} fetched with filters {filt}"
+            except Exception as e:
+                last_err = e
+                continue
+        if last_err:
+            return None, f"❌ Eurostat error: {last_err}"
+        return None, "❌ Eurostat: no data with given filters/fallbacks"
     except ImportError:
-        return None, "❌ eurostat package not installed (pip install eurostat)"
-    except Exception as e:
-        return None, f"❌ Error: {str(e)}"
+        return None, "❌ eurostat not installed"
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_yahoo_data(ticker: str, start_year: int = 2000) -> Tuple[Optional[pd.DataFrame], str]:
-    """
-    Fetch data from Yahoo Finance
-    Returns: (dataframe, status_message)
-    """
+@st.cache_data(ttl=3600)
+def fetch_yahoo(tickers: List[str], start_year: int) -> Tuple[Optional[pd.DataFrame], str]:
     try:
         import yfinance as yf
-        
-        ticker_obj = yf.Ticker(ticker)
-        df = ticker_obj.history(start=f"{start_year}-01-01", auto_adjust=True)
-        
-        if df.empty:
-            return None, f"❌ No data for {ticker}"
-        
-        result = pd.DataFrame({
-            'date': df.index,
-            'close': df['Close'].values,
-            'volume': df['Volume'].values
-        })
-        result['date'] = pd.to_datetime(result['date']).dt.tz_localize(None)
-        result = result.reset_index(drop=True)
-        
-        return result, f"✅ Success: {len(result)} days"
-        
     except ImportError:
-        return None, "❌ yfinance package not installed (pip install yfinance)"
-    except Exception as e:
-        return None, f"❌ Error: {str(e)}"
+        return None, "❌ yfinance not installed"
+    start = f"{start_year}-01-01"
+    errors = []
+    for t in tickers:
+        for attempt in range(1, 4):
+            try:
+                # Try history via Ticker first
+                df = yf.Ticker(t).history(start=start, auto_adjust=True)
+                if df is None or df.empty:
+                    # fallback: period=max
+                    df = yf.download(t, period="max", auto_adjust=True, progress=False)
+                if df is not None and not df.empty:
+                    res = pd.DataFrame({
+                        "date": pd.to_datetime(df.index).tz_localize(None),
+                        "close": df["Close"].values,
+                        "volume": df.get("Volume", pd.Series([np.nan]*len(df))).values,
+                    })
+                    res = res[res["date"].dt.year >= start_year].reset_index(drop=True)
+                    if not res.empty:
+                        return res, f"✅ {t} {len(res)} rows"
+            except Exception as e:
+                errors.append(str(e))
+                _backoff_sleep(attempt=attempt)
+                continue
+    return None, f"❌ Yahoo: all tickers failed ({'; '.join(errors[-2:])})"
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_google_trends_data(keywords: list, geo: str = 'IT', start_year: int = 2015) -> Tuple[Optional[pd.DataFrame], str]:
-    """
-    Fetch Google Trends data
-    Returns: (dataframe, status_message)
-    """
+@st.cache_data(ttl=1800)
+def fetch_trends(keywords: List[str], geo: str, start_year: int) -> Tuple[Optional[pd.DataFrame], str]:
     try:
         from pytrends.request import TrendReq
-        
-        pytrends = TrendReq(hl='it-IT', tz=60, timeout=(10, 25))
-        
-        # Build payload
-        pytrends.build_payload(
-            keywords,
-            cat=0,
-            timeframe=f'{start_year}-01-01 {datetime.now().strftime("%Y-%m-%d")}',
-            geo=geo
-        )
-        
-        # Get data
-        df = pytrends.interest_over_time()
-        
-        if df.empty:
-            return None, "❌ No trends data available"
-        
-        # Clean up
-        if 'isPartial' in df.columns:
-            df = df.drop(columns=['isPartial'])
-        
-        df = df.reset_index()
-        df['date'] = pd.to_datetime(df['date'])
-        
-        # Rename columns
-        rename_map = {k: f"gt_{k.replace(' ', '_')}" for k in keywords}
-        df = df.rename(columns=rename_map)
-        
-        return df, f"✅ Success: {len(df)} weeks, {len(keywords)} keywords"
-        
     except ImportError:
-        return None, "❌ pytrends package not installed (pip install pytrends)"
-    except Exception as e:
-        return None, f"❌ Error: {str(e)}"
+        return None, "❌ pytrends not installed"
+    if not keywords:
+        return None, "❌ no keywords"
+    end_date = datetime.now().strftime("%Y-%m-%d")
+    py = TrendReq(hl="it-IT", tz=60, timeout=(10, 30), retries=0)
+    chunks = [keywords[i:i+5] for i in range(0, len(keywords), 5)]
+    merged = None
+    for chunk in chunks:
+        ok = False
+        for attempt in range(1, 4):
+            try:
+                py.build_payload(chunk, cat=0, timeframe=f"{start_year}-01-01 {end_date}", geo=geo)
+                df = py.interest_over_time()
+                if df is None or df.empty:
+                    raise RuntimeError("empty trends")
+                df = df.drop(columns=[c for c in df.columns if c.lower()=="ispartial"], errors="ignore")
+                df = df.reset_index().rename(columns={"date": "date"})
+                df["date"] = pd.to_datetime(df["date"]) + pd.offsets.Week(weekday=6)  # align to week end
+                # rename columns to safe names
+                rename = {c: f"gt_{c.replace(' ', '_')}" for c in df.columns if c != "date"}
+                df = df.rename(columns=rename)
+                merged = df if merged is None else pd.merge(merged, df, on="date", how="outer")
+                ok = True
+                break
+            except Exception:
+                _backoff_sleep(attempt=attempt)
+        if not ok:
+            return None, "❌ Google Trends rate-limited or unavailable"
+    merged = merged.sort_values("date").reset_index(drop=True)
+    # drop all-NaN cols (rare)
+    merged = merged.dropna(axis=1, how="all")
+    return merged, f"✅ Trends {len(merged)} weeks, {len(keywords)} keywords"
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# VISUALIZATION FUNCTIONS
-# ═══════════════════════════════════════════════════════════════════════════
+# -----------------------------------------------------------------------------
+# VISUALS
+# -----------------------------------------------------------------------------
 
-def create_time_series_chart(df: pd.DataFrame, title: str, y_label: str, color: str = '#e74c3c'):
-    """Create professional time series chart"""
+def line_fig(df: pd.DataFrame, y_cols: List[str], title: str):
     fig = go.Figure()
-    
-    fig.add_trace(go.Scatter(
-        x=df['date'],
-        y=df.iloc[:, 1],  # Assumes second column is value
-        mode='lines+markers',
-        name=title,
-        line=dict(color=color, width=3),
-        marker=dict(size=5, color=color),
-        hovertemplate='<b>%{x|%Y-%m-%d}</b><br>Value: %{y:.2f}<extra></extra>'
-    ))
-    
-    # Add trend line
-    if len(df) > 10:
-        from scipy import stats
-        x_numeric = np.arange(len(df))
-        y_values = df.iloc[:, 1].values
-        slope, intercept, r_value, _, _ = stats.linregress(x_numeric, y_values)
-        trend_line = slope * x_numeric + intercept
-        
+    for col in y_cols:
         fig.add_trace(go.Scatter(
-            x=df['date'],
-            y=trend_line,
-            mode='lines',
-            name='Trend',
-            line=dict(color='rgba(100,100,100,0.3)', width=2, dash='dash'),
-            hovertemplate='Trend: %{y:.2f}<extra></extra>'
+            x=df["date"], y=df[col], mode="lines", name=col,
+            hovertemplate="<b>%{x|%Y-%m-%d}</b><br>%{y:.2f}<extra></extra>",
         ))
-    
     fig.update_layout(
-        title={
-            'text': title,
-            'x': 0.5,
-            'xanchor': 'center',
-            'font': {'size': 20, 'color': '#2c3e50', 'family': 'Arial Black'}
-        },
-        xaxis_title='Date',
-        yaxis_title=y_label,
-        template='plotly_white',
-        height=500,
-        hovermode='x unified',
-        showlegend=True,
-        legend=dict(
-            orientation="h",
-            yanchor="bottom",
-            y=1.02,
-            xanchor="right",
-            x=1
-        ),
-        plot_bgcolor='rgba(250,250,250,0.5)',
-        paper_bgcolor='white'
+        title=title, template="plotly_white", height=480,
+        hovermode="x unified", legend=dict(orientation="h", y=1.02, x=1, xanchor="right"),
+        xaxis_title="Date", yaxis_title="Value"
     )
-    
     return fig
 
 
-def create_summary_stats_table(df: pd.DataFrame, name: str) -> pd.DataFrame:
-    """Create summary statistics table"""
-    values = df.iloc[:, 1].values
-    
+def describe_series(df: pd.DataFrame, value_col: str) -> pd.DataFrame:
+    s = pd.to_numeric(df[value_col], errors="coerce").dropna()
+    if s.empty:
+        return pd.DataFrame({"Metric": ["Observations"], "Value": ["0"]})
     stats = {
-        'Metric': [
-            'Latest Value',
-            'Mean',
-            'Median',
-            'Std Dev',
-            'Min',
-            'Max',
-            'Range',
-            'Observations'
-        ],
-        'Value': [
-            f"{values[-1]:.2f}",
-            f"{np.mean(values):.2f}",
-            f"{np.median(values):.2f}",
-            f"{np.std(values):.2f}",
-            f"{np.min(values):.2f}",
-            f"{np.max(values):.2f}",
-            f"{np.max(values) - np.min(values):.2f}",
-            f"{len(values)}"
-        ]
+        "Metric": ["Latest", "Mean", "Median", "Std", "Min", "Max", "Range", "Observations"],
+        "Value": [f"{s.iloc[-1]:.2f}", f"{s.mean():.2f}", f"{s.median():.2f}", f"{s.std():.2f}", f"{s.min():.2f}", f"{s.max():.2f}", f"{(s.max()-s.min()):.2f}", f"{len(s)}"],
     }
-    
     return pd.DataFrame(stats)
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# MAIN APPLICATION
-# ═══════════════════════════════════════════════════════════════════════════
+# -----------------------------------------------------------------------------
+# SIDEBAR
+# -----------------------------------------------------------------------------
+with st.sidebar:
+    st.image("https://upload.wikimedia.org/wikipedia/en/thumb/0/03/Flag_of_Italy.svg/320px-Flag_of_Italy.svg.png", width=96)
+    st.markdown("### ⚙️ Settings")
+    start_year = st.slider("Start Year", min_value=2000, max_value=datetime.now().year, value=2010)
 
-def main():
-    
-    # ═══════════════════════════════════════════════════════════════════════
-    # HEADER
-    # ═══════════════════════════════════════════════════════════════════════
-    
-    st.markdown("""
-    <div class="hero-header">
-        <h1>🇮🇹 Italian Economic Data</h1>
-        <p>Automatic Fetching from Official Sources</p>
-    </div>
-    """, unsafe_allow_html=True)
-    
-    # ═══════════════════════════════════════════════════════════════════════
-    # SIDEBAR CONFIGURATION
-    # ═══════════════════════════════════════════════════════════════════════
-    
-    with st.sidebar:
-        st.image("https://upload.wikimedia.org/wikipedia/en/thumb/0/03/Flag_of_Italy.svg/320px-Flag_of_Italy.svg.png", 
-                 width=120)
-        
-        st.markdown("### ⚙️ Configuration")
-        
-        start_year = st.slider(
-            "Start Year",
-            min_value=2000,
-            max_value=2024,
-            value=2010,
-            help="Select the starting year for data retrieval"
-        )
-        
-        st.markdown("---")
-        st.markdown("### 📊 Select Data Sources")
-        st.caption("Check the data sources you want to fetch")
-        
-        # Data source selection
-        selected_sources = {}
-        
-        for key, info in DATA_SOURCES.items():
-            if info['mandatory']:
-                selected_sources[key] = st.checkbox(
-                    f"{info['icon']} {info['name']}",
-                    value=True,
-                    disabled=True,
-                    help="Mandatory data source"
-                )
-            else:
-                selected_sources[key] = st.checkbox(
-                    f"{info['icon']} {info['name']}",
-                    value=False,
-                    help=info['description']
-                )
-        
-        # Google Trends keyword selection
-        if selected_sources.get('trends', False):
-            st.markdown("#### 🔍 Trends Keywords")
-            n_keywords = st.slider(
-                "Number of keywords",
-                min_value=1,
-                max_value=10,
-                value=5,
-                help="More keywords = slower fetching due to rate limits"
-            )
-            selected_keywords = ITALIAN_KEYWORDS[:n_keywords]
+    st.markdown("---")
+    st.markdown("### 📊 Data Sources")
+    selected = {}
+    for key, info in DATA_SOURCES.items():
+        if info.get("mandatory", False):
+            selected[key] = st.checkbox(f"{info['name']} (mandatory)", value=True, disabled=True)
         else:
-            selected_keywords = []
-        
-        st.markdown("---")
-        
-        # Fetch button
-        fetch_button = st.button(
-            "🚀 Fetch Data",
-            type="primary",
-            use_container_width=True,
-            help="Click to start fetching data from selected sources"
-        )
-        
-        # Clear cache button
-        if st.button("🔄 Clear Cache", use_container_width=True):
-            st.cache_data.clear()
-            st.success("✅ Cache cleared!")
-        
-        st.markdown("---")
-        
-        # System info
-        st.markdown("### 📍 System Info")
-        st.info(f"""
-        **Date:** {datetime.now().strftime('%Y-%m-%d')}  
-        **Version:** 3.0  
-        **Sources:** {len([s for s in selected_sources.values() if s])} selected
-        """)
-    
-    # ═══════════════════════════════════════════════════════════════════════
-    # MAIN CONTENT - BEFORE FETCH
-    # ═══════════════════════════════════════════════════════════════════════
-    
-    if not fetch_button:
-        
-        # Show available data sources
-        st.markdown('<h2 class="section-title">📋 Available Data Sources</h2>', unsafe_allow_html=True)
-        
-        st.info("""
-        💡 **How to use:**
-        1. Select your desired data sources from the sidebar
-        2. Configure the start year
-        3. Click "🚀 Fetch Data" to retrieve data automatically
-        4. View, analyze, and download the results
-        """)
-        
-        # Display data sources in cards
-        for key, info in DATA_SOURCES.items():
-            quality_class = f"quality-{info['quality']}"
-            availability_class = "available" if info['available'] else "unavailable"
-            
-            st.markdown(f"""
-            <div class="source-card {availability_class}">
-                <div class="source-header">
-                    {info['icon']} {info['name']}
-                    <span class="badge badge-{'success' if info['available'] else 'danger'}">
-                        {'Available' if info['available'] else 'Unavailable'}
-                    </span>
-                    {f'<span class="badge badge-warning">Mandatory</span>' if info['mandatory'] else ''}
-                </div>
-                <div class="source-description">
-                    {info['description']}
-                </div>
-                <div class="source-metadata">
-                    <strong>Provider:</strong> {info['provider']}<br>
-                    <strong>Dataset:</strong> {info['dataset']}<br>
-                    <strong>Frequency:</strong> {info['frequency']}<br>
-                    <strong>Coverage:</strong> {info['coverage']}<br>
-                    <strong>Update:</strong> {info['update']}<br>
-                    <strong>Quality:</strong> <span class="quality-indicator {quality_class}">{info['quality'].upper()}</span>
-                </div>
-            </div>
-            """, unsafe_allow_html=True)
-        
-        # Technical information
-        st.markdown('<h2 class="section-title">🔧 Technical Information</h2>', unsafe_allow_html=True)
-        
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            st.markdown("""
-            ### 📦 Requirements
-            
-            ```bash
-            pip install streamlit pandas numpy
-            pip install plotly scipy
-            pip install eurostat yfinance pytrends
-            ```
-            """)
-        
-        with col2:
-            st.markdown("""
-            ### 📊 Data Quality
-            
-            - **Excellent:** Official statistics, fully validated
-            - **Good:** Reliable, minor delays possible
-            - **Fair:** Best-effort, subject to limitations
-            """)
-        
-        st.stop()
-    
-    # ═══════════════════════════════════════════════════════════════════════
-    # DATA FETCHING
-    # ═══════════════════════════════════════════════════════════════════════
-    
-    st.markdown('<h2 class="section-title">⏳ Fetching Data...</h2>', unsafe_allow_html=True)
-    
-    # Progress tracking
-    total_sources = sum(selected_sources.values())
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-    
-    # Storage for fetched data
-    fetched_data = {}
-    fetch_status = {}
-    
-    current_progress = 0
-    
-    # Fetch Unemployment (mandatory)
-    if selected_sources['unemployment']:
-        status_text.text("📥 Fetching unemployment rate...")
-        df, msg = fetch_eurostat_data(
-            'une_rt_m',
-            {'geo': 'IT', 's_adj': 'SA', 'age': 'TOTAL'},
-            start_year
-        )
-        fetched_data['unemployment'] = df
-        fetch_status['unemployment'] = msg
-        current_progress += 1
-        progress_bar.progress(current_progress / total_sources)
-    
-    # Fetch CCI
-    if selected_sources['cci']:
-        status_text.text("📊 Fetching consumer confidence...")
-        df, msg = fetch_eurostat_data(
-            'ei_bsco_m',
-            {'geo': 'IT', 'indic': 'BS-CSMCI-BAL'},
-            start_year
-        )
-        fetched_data['cci'] = df
-        fetch_status['cci'] = msg
-        current_progress += 1
-        progress_bar.progress(current_progress / total_sources)
-    
-    # Fetch HICP
-    if selected_sources['hicp']:
-        status_text.text("📈 Fetching inflation index...")
-        df, msg = fetch_eurostat_data(
-            'prc_hicp_midx',
-            {'geo': 'IT', 'coicop': 'CP00'},
-            start_year
-        )
-        fetched_data['hicp'] = df
-        fetch_status['hicp'] = msg
-        current_progress += 1
-        progress_bar.progress(current_progress / total_sources)
-    
-    # Fetch IIP
-    if selected_sources['iip']:
-        status_text.text("🏭 Fetching industrial production...")
-        df, msg = fetch_eurostat_data(
-            'sts_inpr_m',
-            {'geo': 'IT', 's_adj': 'SA', 'nace_r2': 'B-D'},
-            start_year
-        )
-        fetched_data['iip'] = df
-        fetch_status['iip'] = msg
-        current_progress += 1
-        progress_bar.progress(current_progress / total_sources)
-    
-    # Fetch Stock
-    if selected_sources['stock']:
-        status_text.text("📈 Fetching FTSE MIB...")
-        # Try multiple tickers
-        for ticker in ['^FTSEMIB', 'FTSEMIB.MI', 'EWI']:
-            df, msg = fetch_yahoo_data(ticker, start_year)
-            if df is not None:
-                fetched_data['stock'] = df
-                fetch_status['stock'] = msg
-                break
-        if 'stock' not in fetched_data:
-            fetch_status['stock'] = "❌ All tickers failed"
-        current_progress += 1
-        progress_bar.progress(current_progress / total_sources)
-    
-    # Fetch VIX
-    if selected_sources['vix']:
-        status_text.text("📊 Fetching volatility index...")
-        for ticker in ['^V2TX', '^VIX']:
-            df, msg = fetch_yahoo_data(ticker, start_year)
-            if df is not None:
-                fetched_data['vix'] = df
-                fetch_status['vix'] = msg
-                break
-        if 'vix' not in fetched_data:
-            fetch_status['vix'] = "❌ All tickers failed"
-        current_progress += 1
-        progress_bar.progress(current_progress / total_sources)
-    
-    # Fetch Google Trends
-    if selected_sources['trends']:
-        status_text.text("🔍 Fetching Google Trends...")
-        df, msg = fetch_google_trends_data(selected_keywords, 'IT', max(start_year, 2015))
-        fetched_data['trends'] = df
-        fetch_status['trends'] = msg
-        current_progress += 1
-        progress_bar.progress(current_progress / total_sources)
-    
-    # Complete
-    progress_bar.progress(1.0)
-    status_text.empty()
-    progress_bar.empty()
-    
-    # ═══════════════════════════════════════════════════════════════════════
-    # RESULTS DISPLAY
-    # ═══════════════════════════════════════════════════════════════════════
-    
-    st.markdown('<h2 class="section-title">📊 Fetch Results</h2>', unsafe_allow_html=True)
-    
-    # Summary metrics
-    successful = sum(1 for df in fetched_data.values() if df is not None)
-    failed = total_sources - successful
-    
-    col1, col2, col3, col4 = st.columns(4)
-    
-    with col1:
-        st.markdown(f"""
-        <div class="status-box">
-            <h3>{total_sources}</h3>
-            <p>Total Sources</p>
-        </div>
-        """, unsafe_allow_html=True)
-    
-    with col2:
-        st.markdown(f"""
-        <div class="status-box" style="background: linear-gradient(135deg, #10B981 0%, #059669 100%);">
-            <h3>{successful}</h3>
-            <p>Successful</p>
-        </div>
-        """, unsafe_allow_html=True)
-    
-    with col3:
-        st.markdown(f"""
-        <div class="status-box" style="background: linear-gradient(135deg, #EF4444 0%, #DC2626 100%);">
-            <h3>{failed}</h3>
-            <p>Failed</p>
-        </div>
-        """, unsafe_allow_html=True)
-    
-    with col4:
-        total_rows = sum(len(df) for df in fetched_data.values() if df is not None)
-        st.markdown(f"""
-        <div class="status-box" style="background: linear-gradient(135deg, #3B82F6 0%, #2563EB 100%);">
-            <h3>{total_rows:,}</h3>
-            <p>Data Points</p>
-        </div>
-        """, unsafe_allow_html=True)
-    
-    # Status messages
-    st.markdown("### 📋 Detailed Status")
-    for source_key, status in fetch_status.items():
-        if "✅" in status:
-            st.success(f"**{DATA_SOURCES[source_key]['name']}:** {status}")
-        else:
-            st.error(f"**{DATA_SOURCES[source_key]['name']}:** {status}")
-    
-    # ═══════════════════════════════════════════════════════════════════════
-    # DATA VISUALIZATION & ANALYSIS
-    # ═══════════════════════════════════════════════════════════════════════
-    
-    if successful > 0:
-        
-        st.markdown('<h2 class="section-title">📈 Data Visualization</h2>', unsafe_allow_html=True)
-        
-        # Create tabs for each dataset
-        tab_names = [DATA_SOURCES[k]['name'] for k in fetched_data.keys() if fetched_data[k] is not None]
-        tabs = st.tabs(tab_names)
-        
-        tab_idx = 0
-        for source_key, df in fetched_data.items():
-            if df is None:
-                continue
-            
-            with tabs[tab_idx]:
-                info = DATA_SOURCES[source_key]
-                
-                # Chart
-                if 'date' in df.columns:
-                    fig = create_time_series_chart(
-                        df,
-                        info['name'],
-                        'Value',
-                        color='#e74c3c' if source_key == 'unemployment' else '#3B82F6'
-                    )
-                    st.plotly_chart(fig, use_container_width=True)
-                
-                # Statistics
-                col1, col2 = st.columns([1, 1])
-                
-                with col1:
-                    st.markdown("#### 📊 Summary Statistics")
-                    stats_df = create_summary_stats_table(df, info['name'])
-                    st.dataframe(stats_df, use_container_width=True, hide_index=True)
-                
-                with col2:
-                    st.markdown("#### 📋 Data Preview")
-                    st.dataframe(df.tail(10), use_container_width=True)
-                
-                # Download button
-                csv = df.to_csv(index=False).encode('utf-8')
-                st.download_button(
-                    f"📥 Download {info['name']} (CSV)",
-                    csv,
-                    f"{source_key}_{datetime.now().strftime('%Y%m%d')}.csv",
-                    "text/csv",
-                    use_container_width=True
-                )
-            
-            tab_idx += 1
-        
-        # ═══════════════════════════════════════════════════════════════════
-        # BULK EXPORT
-        # ═══════════════════════════════════════════════════════════════════
-        
-        st.markdown('<h2 class="section-title">💾 Bulk Export</h2>', unsafe_allow_html=True)
-        
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            # Export all as Excel
-            if st.button("📥 Download All Data (Excel)", use_container_width=True, type="primary"):
-                output = BytesIO()
-                with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-                    for source_key, df in fetched_data.items():
-                        if df is not None:
-                            df.to_excel(writer, sheet_name=DATA_SOURCES[source_key]['name'][:31], index=False)
-                
-                excel_data = output.getvalue()
-                st.download_button(
-                    "💾 Save Excel File",
-                    excel_data,
-                    f"italian_data_{datetime.now().strftime('%Y%m%d')}.xlsx",
-                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True
-                )
-        
-        with col2:
-            st.info("""
-            **📊 Excel Export includes:**
-            - All fetched datasets in separate sheets
-            - Ready for analysis
-            - Preserves all metadata
-            """)
-    
+            selected[key] = st.checkbox(info["name"], value=(key in ["cci", "hicp"]))
+
+    if selected.get("trends", False):
+        n_kw = st.slider("Keywords count", 1, 10, 5)
+        chosen_kw = ITALIAN_KEYWORDS[:n_kw]
     else:
-        st.error("❌ No data was successfully fetched. Please check your internet connection and try again.")
+        chosen_kw = []
 
-# ═══════════════════════════════════════════════════════════════════════════
-# RUN APPLICATION
-# ═══════════════════════════════════════════════════════════════════════════
+    st.markdown("---")
+    auto_resolve = st.toggle("Auto‑resolve Eurostat dimensions", value=True, help="Pick best available codes (unit/s_adj/etc) dynamically with fallbacks.")
+    concurrent = st.toggle("Concurrent fetching", value=True)
 
-if __name__ == "__main__":
-    main()
+    st.markdown("---")
+    fetch = st.button("🚀 Fetch Data", type="primary", use_container_width=True)
+    clr = st.button("🔄 Clear Cache", use_container_width=True)
+    if clr:
+        st.cache_data.clear()
+        st.success("Cache cleared")
+
+# -----------------------------------------------------------------------------
+# MAIN
+# -----------------------------------------------------------------------------
+st.markdown('<div class="hero"><h1>Italian Economic Data – Auto Fetch</h1><p>Eurostat • Yahoo Finance • Google Trends</p></div>', unsafe_allow_html=True)
+
+if not fetch:
+    st.info("Select sources in the sidebar and hit **Fetch Data**. No manual downloads needed.")
+    st.stop()
+
+# Health check
+if not _internet_ok():
+    st.error("No internet connectivity. Check connection and retry.")
+    st.stop()
+
+# Preferences for Eurostat dimensions (priority-ordered lists)
+EUROSTAT_PREFS = {
+    # Unemployment rate
+    "une_rt_m": {
+        "geo": ["IT"],
+        "s_adj": ["SA", "SCA", "NSA"],
+        "sex": ["T"],
+        "age": ["TOTAL", "Y15-74", "Y15-64"],
+        "unit": ["PC_ACT", "PC_POP", "PC_Y15-74"],
+    },
+    # Consumer Confidence
+    "ei_bsco_m": {
+        "geo": ["IT"],
+        "indic": ["BS-CSMCI", "BS-CSMCI-BAL"],
+        "s_adj": ["NSA", "SA"],
+        "unit": ["BAL"],
+    },
+    # HICP
+    "prc_hicp_midx": {
+        "geo": ["IT"],
+        "coicop": ["CP00"],
+        "unit": ["I15", "I21", "I2015=100", "I2015"],
+    },
+    # Industrial Production
+    "sts_inpr_m": {
+        "geo": ["IT"],
+        "s_adj": ["SCA", "SA", "NSA"],
+        "nace_r2": ["B-E", "B-D"],
+        "indic_bt": ["PRD"],
+        "unit": ["I15", "I21", "I2015=100", "I2015"],
+    },
+}
+
+# -----------------------------------------------------------------------------
+# FETCH PIPELINE
+# -----------------------------------------------------------------------------
+
+jobs = []
+results: Dict[str, Tuple[Optional[pd.DataFrame], str]] = {}
+log_box = st.empty()
+progress = st.progress(0.0)
+sel_keys = [k for k, v in selected.items() if v]
+
+
+def submit_job(key: str):
+    info = DATA_SOURCES[key]
+    if info["provider"] == "Eurostat":
+        prefs = EUROSTAT_PREFS.get(info["dataset"], {}) if auto_resolve else {}
+        return fetch_eurostat(info["dataset"], prefs, start_year)
+    elif info["provider"] == "Yahoo Finance":
+        if key == "mib":
+            tickers = ["^FTSEMIB", "FTSEMIB.MI", "EWI"]
+        else:
+            tickers = ["^V2TX", "^VIX"]
+        return fetch_yahoo(tickers, start_year)
+    elif info["provider"] == "Google Trends":
+        return fetch_trends(chosen_kw, "IT", max(start_year, 2015))
+    else:
+        return None, "❌ unknown provider"
+
+
+if concurrent and len(sel_keys) > 1:
+    with ThreadPoolExecutor(max_workers=min(6, len(sel_keys))) as ex:
+        future_map = {ex.submit(submit_job, k): k for k in sel_keys}
+        done = 0
+        for fut in as_completed(future_map):
+            k = future_map[fut]
+            try:
+                results[k] = fut.result()
+            except Exception as e:
+                results[k] = (None, f"❌ {e}")
+            done += 1
+            progress.progress(done / len(sel_keys))
+else:
+    for i, k in enumerate(sel_keys, 1):
+        results[k] = submit_job(k)
+        progress.progress(i / len(sel_keys))
+
+progress.progress(1.0)
+
+# -----------------------------------------------------------------------------
+# RESULTS
+# -----------------------------------------------------------------------------
+
+succ = {k: v for k, v in results.items() if v[0] is not None}
+fail = {k: v for k, v in results.items() if v[0] is None}
+
+c1, c2, c3 = st.columns(3)
+with c1:
+    st.markdown(f"<div class='kpi'><h3>Total Sources</h3><h2>{len(sel_keys)}</h2></div>", unsafe_allow_html=True)
+with c2:
+    st.markdown(f"<div class='kpi' style='background:linear-gradient(135deg,#10B981,#059669)'><h3>Successful</h3><h2>{len(succ)}</h2></div>", unsafe_allow_html=True)
+with c3:
+    st.markdown(f"<div class='kpi' style='background:linear-gradient(135deg,#EF4444,#DC2626)'><h3>Failed</h3><h2>{len(fail)}</h2></div>", unsafe_allow_html=True)
+
+st.markdown("### Status")
+for k in sel_keys:
+    name = DATA_SOURCES[k]["name"]
+    msg = results[k][1]
+    (st.success if (k in succ) else st.error)(f"**{name}:** {msg}")
+
+if not succ:
+    st.stop()
+
+# Tabs per dataset
+tabs = st.tabs([DATA_SOURCES[k]["name"] for k in succ.keys()])
+for (tab, (k, (df, _))) in zip(tabs, succ.items()):
+    with tab:
+        name = DATA_SOURCES[k]["name"]
+        st.markdown(f"#### {name}")
+        if k in ["unemp", "cci", "hicp", "iip"]:
+            # single value column named 'value'
+            fig = line_fig(df, ["value"], name)
+            st.plotly_chart(fig, use_container_width=True)
+            st.dataframe(df.tail(10), use_container_width=True)
+            st.dataframe(describe_series(df, "value"), use_container_width=True, hide_index=True)
+        elif k in ["mib", "vix"]:
+            fig = line_fig(df, ["close"], name)
+            st.plotly_chart(fig, use_container_width=True)
+            st.dataframe(df.tail(10), use_container_width=True)
+            st.dataframe(describe_series(df, "close"), use_container_width=True, hide_index=True)
+        elif k == "trends":
+            # multi-series: let user pick
+            value_cols = [c for c in df.columns if c != "date"]
+            pick = st.multiselect("Series", value_cols, default=value_cols[: min(4,len(value_cols))])
+            if pick:
+                st.plotly_chart(line_fig(df, pick, name), use_container_width=True)
+            st.dataframe(df.tail(10), use_container_width=True)
+
+        # downloads
+        csv = df.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            f"📥 Download {name} (CSV)",
+            csv,
+            f"{k}_{datetime.now().strftime('%Y%m%d')}.csv",
+            "text/csv",
+            use_container_width=True,
+        )
+
+# Bulk export
+st.markdown("### 💾 Bulk Export")
+if st.button("Download all as Excel", type="primary"):
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+        for k, (df, _) in succ.items():
+            sheet = DATA_SOURCES[k]["name"][:31]
+            df.to_excel(writer, sheet_name=sheet, index=False)
+    st.download_button(
+        "Save Excel",
+        output.getvalue(),
+        f"italian_data_{datetime.now().strftime('%Y%m%d')}.xlsx",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+    )
+
+st.caption("This app auto-resolves Eurostat dimensions and applies sane fallbacks. No manual files needed.")
