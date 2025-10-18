@@ -1,533 +1,315 @@
-"""
-🇮🇹 ITALIAN UNEMPLOYMENT DATA – HARDENED, FULLY AUTOMATED BUILD
-Version: 3.1
-Date: 2025-10-18
-
-Run locally:
-  streamlit run italian_auto_fetch_app_hardened.py
-
-Key changes vs v3.0:
-- Robust Eurostat fetch with *dynamic* dimension resolution + multi-step fallbacks
-- Reliable Yahoo Finance with multi-ticker + start/period fallback + retry/backoff
-- Google Trends with chunking, exponential backoff, and automatic column merge
-- Concurrent fetching for speed (ThreadPoolExecutor)
-- Better status/logging, clearer errors, deterministic caching
-- Trends tab shows multi-series selector
-
-Dependencies (requirements.txt):
-streamlit
-pandas
-numpy
-plotly
-scipy
-eurostat
-yfinance
-pytrends
-requests
-xlsxwriter
-"""
-
-import os
-import time
-import math
-import random
-from io import BytesIO
+# app_nowcast_it.py
+# 🇮🇹 Fully-automatic fetch + baseline nowcast for Italian unemployment
+import io, itertools, json
 from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Dict, Optional, Tuple, List
+from typing import Dict, List, Tuple, Optional
 
-import streamlit as st
-import pandas as pd
 import numpy as np
+import pandas as pd
+import requests
+import streamlit as st
 import plotly.graph_objects as go
+from sklearn.linear_model import Ridge
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import Pipeline
+from sklearn.model_selection import TimeSeriesSplit
 
-# -----------------------------------------------------------------------------
-# PAGE CONFIG
-# -----------------------------------------------------------------------------
-st.set_page_config(
-    page_title="Italian Data Auto‑Fetch (Hardened)",
-    page_icon="🇮🇹",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
+st.set_page_config(page_title="IT Unemployment Nowcast", page_icon="🇮🇹", layout="wide")
 
-# -----------------------------------------------------------------------------
-# STYLE
-# -----------------------------------------------------------------------------
-st.markdown(
-    """
-    <style>
-    .hero{background:linear-gradient(90deg,#009246 0%,#fff 33%,#fff 66%,#CE2B37 100%);padding:36px;border-radius:16px;text-align:center;margin-bottom:24px}
-    .hero h1{margin:0;font-weight:900}
-    .kpi{background:linear-gradient(135deg,#667eea,#764ba2);color:#fff;padding:18px;border-radius:14px;text-align:center}
-    .card{border:1px solid #e5e7eb;border-radius:14px;padding:16px;margin-bottom:12px}
-    code{white-space:pre-wrap}
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+# ========= Eurostat JSON-stat 2.0 (generic) =========
+BASE = "https://ec.europa.eu/eurostat/api/dissemination/statistics/1.0/data/"
 
-# -----------------------------------------------------------------------------
-# GLOBALS
-# -----------------------------------------------------------------------------
-ITALIAN_KEYWORDS = [
-    "offerte di lavoro",
-    "disoccupazione",
-    "naspi",
-    "indeed lavoro",
-    "ricerca lavoro",
-    "cerco lavoro",
-    "centro per l'impiego",
-    "cassa integrazione",
-    "reddito di cittadinanza",
-    "curriculum vitae",
-]
+def _get_jsonstat(dataset: str, params: Dict[str,str]) -> dict:
+    url = f"{BASE}{dataset}?lang=EN&" + "&".join([f"{k}={v}" for k,v in params.items()])
+    r = requests.get(url, timeout=20)
+    if r.status_code != 200:
+        return {}
+    return r.json()
 
-DATA_SOURCES = {
-    "unemp": {
-        "name": "Italian Unemployment Rate",
-        "provider": "Eurostat",
-        "dataset": "une_rt_m",
-        "mandatory": True,
-    },
-    "cci": {
-        "name": "Consumer Confidence Index",
-        "provider": "Eurostat",
-        "dataset": "ei_bsco_m",
-        "mandatory": False,
-    },
-    "hicp": {
-        "name": "HICP (All items)",
-        "provider": "Eurostat",
-        "dataset": "prc_hicp_midx",
-        "mandatory": False,
-    },
-    "iip": {
-        "name": "Industrial Production Index",
-        "provider": "Eurostat",
-        "dataset": "sts_inpr_m",
-        "mandatory": False,
-    },
-    "mib": {
-        "name": "FTSE MIB Index",
-        "provider": "Yahoo Finance",
-        "dataset": "^FTSEMIB",
-        "mandatory": False,
-    },
-    "vix": {
-        "name": "V2TX/VIX Volatility",
-        "provider": "Yahoo Finance",
-        "dataset": "^V2TX",
-        "mandatory": False,
-    },
-    "trends": {
-        "name": "Google Trends (job keywords)",
-        "provider": "Google Trends",
-        "dataset": "keywords",
-        "mandatory": False,
-    },
+def _get_dims(dataset: str) -> Tuple[List[str], Dict[str, List[str]]]:
+    js = _get_jsonstat(dataset, {"lastTimePeriod":"1"})
+    if not js or js.get("class") != "dataset":
+        raise RuntimeError("Eurostat metadata fetch failed")
+    ids = js["id"]
+    dim = js["dimension"]
+    avail = {}
+    for d in ids:
+        cats = dim[d]["category"]["index"]  # dict code->ordinal
+        avail[d] = [c for c,_ in sorted(cats.items(), key=lambda x: x[1])]
+    return ids, avail
+
+def _parse_jsonstat_timeseries(js: dict, fixed: Dict[str,str]) -> pd.DataFrame:
+    ids = js["id"]; sizes = js["size"]; dim = js["dimension"]
+    idx = {d:i for i,d in enumerate(ids)}
+    if "time" not in idx: raise ValueError("No time dim")
+    t_i = idx["time"]
+    t_sorted = sorted(dim["time"]["category"]["index"].items(), key=lambda x: x[1])
+    labels = [dim["time"]["category"]["label"].get(code, code) for code,_ in t_sorted]
+    pos = [0]*len(ids)
+    for d in ids:
+        if d=="time": continue
+        cat_index = dim[d]["category"]["index"]
+        if d in fixed and fixed[d] in cat_index:
+            pos[idx[d]] = cat_index[fixed[d]]
+        elif len(cat_index)==1:
+            pos[idx[d]] = next(iter(cat_index.values()))
+        else:
+            pos[idx[d]] = 0
+    strides = [1]*len(ids)
+    for i in range(len(ids)-2, -1, -1):
+        strides[i] = strides[i+1]*sizes[i+1]
+    values = js["value"]
+    out = []
+    for code, tpos in t_sorted:
+        pos[t_i] = tpos
+        lin = sum(pos[k]*strides[k] for k in range(len(ids)))
+        if isinstance(values, list):
+            v = values[lin] if lin < len(values) else None
+        else:
+            v = values.get(str(lin), None)
+        out.append((code, v))
+    df = pd.DataFrame(out, columns=["period","value"])
+    df["date"] = pd.to_datetime(df["period"], errors="coerce")
+    if df["date"].isna().any():
+        df["date"] = pd.to_datetime(df["period"].astype(str).str.replace("M","-"), format="%Y-%m", errors="coerce")
+    df["date"] = df["date"] + pd.offsets.MonthEnd(0)
+    df["value"] = pd.to_numeric(df["value"], errors="coerce")
+    return df.dropna().sort_values("date")[["date","value"]].reset_index(drop=True)
+
+def eurostat_fetch(dataset: str, prefs: Dict[str, List[str]], start_year: int) -> Tuple[Optional[pd.DataFrame], str, Dict[str,str]]:
+    ids, avail = _get_dims(dataset)
+    # build candidates by intersecting prefs with availability
+    cand = {}
+    for d in ids:
+        if d == "time": continue
+        want = prefs.get(d, [])
+        have = avail.get(d, [])
+        if want:
+            inter = [x for x in want if x in have]
+            cand[d] = inter if inter else (have[:1] if have else [])
+        else:
+            cand[d] = have[:1] if have else []
+    order = [d for d in ["freq","geo","sex","age","s_adj","unit","indic","coicop","nace_r2","indic_bt"] if d in cand]
+    tries = [dict(zip(order, combo)) for combo in itertools.product(*[cand[d] for d in order])]
+    last = None
+    for i, filt in enumerate(tries, 1):
+        js = _get_jsonstat(dataset, filt)
+        if not js or js.get("class") != "dataset":
+            last = f"bad response for {filt}"
+            continue
+        df = _parse_jsonstat_timeseries(js, filt)
+        df = df[df["date"].dt.year >= start_year]
+        if not df.empty:
+            return df, f"✅ {dataset} attempt#{i} {len(df)} rows", filt
+        last = f"empty for {filt}"
+    return None, f"❌ {dataset} failed. Last: {last}", {}
+
+EUROSTAT_PREFS = {
+    "une_rt_m": {"freq":["M"], "geo":["IT"], "sex":["T"], "age":["TOTAL","Y15-74"], "s_adj":["SA","SCA","NSA"], "unit":["PC_ACT","PC_POP"]},
+    "ei_bsco_m": {"freq":["M"], "geo":["IT"], "indic":["BS-CSMCI","BS-CSMCI-BAL"], "s_adj":["NSA","SA"], "unit":["BAL"]},
+    "prc_hicp_midx": {"freq":["M"], "geo":["IT"], "coicop":["CP00"], "unit":["I21","I15"]},
+    "sts_inpr_m": {"freq":["M"], "geo":["IT"], "s_adj":["SCA","SA","NSA"], "nace_r2":["B-E","B-D"], "indic_bt":["PRD"], "unit":["I21","I15"]},
 }
 
-# -----------------------------------------------------------------------------
-# UTILITIES
-# -----------------------------------------------------------------------------
-
-def _backoff_sleep(base=1.5, attempt=1, max_seconds=30):
-    # exponential backoff with jitter
-    delay = min(max_seconds, base ** attempt + random.uniform(0, 0.5))
-    time.sleep(delay)
-
-
-def _internet_ok(url="https://www.google.com", timeout=5) -> bool:
+# ========= Finance (Stooq/FRED/CBOE) =========
+def stooq_csv(symbol: str) -> Optional[pd.DataFrame]:
     try:
-        import requests
-        requests.get(url, timeout=timeout)
-        return True
+        url = f"https://stooq.com/q/d/l/?s={symbol}&i=d"
+        r = requests.get(url, timeout=12)
+        if r.status_code != 200 or not r.text.strip(): return None
+        df = pd.read_csv(io.StringIO(r.text))
+        if {"Date","Close"}.issubset(df.columns):
+            out = df.rename(columns={"Date":"date","Close":"close"})
+            out["date"] = pd.to_datetime(out["date"])
+            return out[["date","close"]].sort_values("date").reset_index(drop=True)
     except Exception:
-        return False
+        return None
+    return None
 
-
-@st.cache_data(ttl=1800, show_spinner=False)
-def _eurostat_pars(dataset: str) -> Dict[str, List[str]]:
-    # Cache parameter spaces to avoid repeated metadata calls
-    import eurostat
-    return eurostat.get_par_values(dataset)
-
-
-def _eurostat_resolve(dataset: str, prefs: Dict[str, List[str]]) -> Dict[str, str]:
-    """Pick the first available value for each dimension based on preferences."""
-    pars = _eurostat_pars(dataset)
-    resolved = {}
-    # Only choose for dims that actually exist
-    for dim, pref_list in prefs.items():
-        options = pars.get(dim, [])
-        for v in pref_list:
-            if v in options:
-                resolved[dim] = v
-                break
-    return resolved
-
-
-@st.cache_data(ttl=3600)
-def fetch_eurostat(dataset: str, preferred_filters: Dict[str, List[str]], start_year: int) -> Tuple[Optional[pd.DataFrame], str]:
-    """Robust Eurostat fetch: resolve dims, try filtered pulls, fallbacks, tidy output."""
+def fred_vix_csv() -> Optional[pd.DataFrame]:
     try:
-        import eurostat
-        # 1) try preferred resolution
-        resolved = _eurostat_resolve(dataset, preferred_filters)
-        attempts: List[Dict[str, str]] = []
-        if resolved:
-            attempts.append(resolved)
-        # 2) fallbacks (drop the strict dims one by one)
-        # common dimension priorities to relax
-        relax_order = ["s_adj", "unit", "sex", "age", "indic", "indic_bt", "nace_r2"]
-        for dim in relax_order:
-            if dim in resolved:
-                att = {k: v for k, v in resolved.items() if k != dim}
-                if att not in attempts:
-                    attempts.append(att)
-        last_err = None
-        for filt in attempts:
-            try:
-                df = eurostat.get_data_df(dataset, filter_pars=filt, flags=False)
-                if df is None or df.empty:
-                    continue
-                # tidy
-                # time cols look like '2000M01' etc.
-                time_cols = [c for c in df.columns if isinstance(c, str) and "M" in c and c.replace("M", "").isdigit()]
-                if not time_cols:
-                    # some tables come already tidy; attempt to find 'time' column
-                    if "time" in df.columns and "values" in df.columns:
-                        tidy = df[["time", "values"]].rename(columns={"time": "date", "values": "value"})
-                        tidy["date"] = pd.to_datetime(tidy["date"]) + pd.offsets.MonthEnd(0)
-                        tidy = tidy.sort_values("date")
-                        tidy = tidy[tidy["date"].dt.year >= start_year]
-                        if tidy.empty:
-                            continue
-                        return tidy.reset_index(drop=True), f"✅ {dataset} fetched with filters {filt}"
-                    continue
-                id_cols = [c for c in df.columns if c not in time_cols]
-                melted = df.melt(id_vars=id_cols, value_vars=time_cols, var_name="period", value_name="value")
-                melted["period"] = melted["period"].astype(str).str.replace("M", "-")
-                melted["date"] = pd.to_datetime(melted["period"], format="%Y-%m", errors="coerce") + pd.offsets.MonthEnd(0)
-                melted["value"] = pd.to_numeric(melted["value"], errors="coerce")
-                out = melted[["date", "value"]].dropna().sort_values("date")
-                out = out[out["date"].dt.year >= start_year]
-                if out.empty:
-                    continue
-                return out.reset_index(drop=True), f"✅ {dataset} fetched with filters {filt}"
-            except Exception as e:
-                last_err = e
-                continue
-        if last_err:
-            return None, f"❌ Eurostat error: {last_err}"
-        return None, "❌ Eurostat: no data with given filters/fallbacks"
-    except ImportError:
-        return None, "❌ eurostat not installed"
+        url = "https://fred.stlouisfed.org/series/VIXCLS/downloaddata/VIXCLS.csv"
+        r = requests.get(url, timeout=12, allow_redirects=True)
+        df = pd.read_csv(io.StringIO(r.text))
+        if {"DATE","VIXCLS"}.issubset(df.columns):
+            df = df.rename(columns={"DATE":"date","VIXCLS":"close"})
+            df["date"] = pd.to_datetime(df["date"]); df["close"] = pd.to_numeric(df["close"], errors="coerce")
+            return df.dropna().sort_values("date").reset_index(drop=True)
+    except Exception:
+        return None
+    return None
 
-
-@st.cache_data(ttl=3600)
-def fetch_yahoo(tickers: List[str], start_year: int) -> Tuple[Optional[pd.DataFrame], str]:
+def cboe_vix_csv() -> Optional[pd.DataFrame]:
     try:
-        import yfinance as yf
-    except ImportError:
-        return None, "❌ yfinance not installed"
-    start = f"{start_year}-01-01"
-    errors = []
-    for t in tickers:
-        for attempt in range(1, 4):
-            try:
-                # Try history via Ticker first
-                df = yf.Ticker(t).history(start=start, auto_adjust=True)
-                if df is None or df.empty:
-                    # fallback: period=max
-                    df = yf.download(t, period="max", auto_adjust=True, progress=False)
-                if df is not None and not df.empty:
-                    res = pd.DataFrame({
-                        "date": pd.to_datetime(df.index).tz_localize(None),
-                        "close": df["Close"].values,
-                        "volume": df.get("Volume", pd.Series([np.nan]*len(df))).values,
-                    })
-                    res = res[res["date"].dt.year >= start_year].reset_index(drop=True)
-                    if not res.empty:
-                        return res, f"✅ {t} {len(res)} rows"
-            except Exception as e:
-                errors.append(str(e))
-                _backoff_sleep(attempt=attempt)
-                continue
-    return None, f"❌ Yahoo: all tickers failed ({'; '.join(errors[-2:])})"
+        url = "https://cdn.cboe.com/api/global/us_indices/daily_prices/VIX_History.csv"
+        r = requests.get(url, timeout=12)
+        df = pd.read_csv(io.StringIO(r.text))
+        cols = {c.lower(): c for c in df.columns}
+        if not cols.get("date") or not cols.get("close"): return None
+        df = df.rename(columns={cols["date"]:"date", cols["close"]:"close"})[["date","close"]]
+        df["date"] = pd.to_datetime(df["date"]); df["close"] = pd.to_numeric(df["close"], errors="coerce")
+        return df.dropna().sort_values("date").reset_index(drop=True)
+    except Exception:
+        return None
+    return None
 
+def finance_fetch(start_year: int):
+    mib = stooq_csv("^fmib")
+    vix = fred_vix_csv() or cboe_vix_csv() or stooq_csv("vi.f")
+    out = {}
+    if mib is not None and not mib.empty:
+        out["mib"] = mib[mib["date"].dt.year >= start_year].copy()
+    if vix is not None and not vix.empty:
+        out["vix"] = vix[vix["date"].dt.year >= start_year].copy()
+    return out
 
-@st.cache_data(ttl=1800)
-def fetch_trends(keywords: List[str], geo: str, start_year: int) -> Tuple[Optional[pd.DataFrame], str]:
-    try:
-        from pytrends.request import TrendReq
-    except ImportError:
-        return None, "❌ pytrends not installed"
-    if not keywords:
-        return None, "❌ no keywords"
-    end_date = datetime.now().strftime("%Y-%m-%d")
-    py = TrendReq(hl="it-IT", tz=60, timeout=(10, 30), retries=0)
-    chunks = [keywords[i:i+5] for i in range(0, len(keywords), 5)]
-    merged = None
-    for chunk in chunks:
-        ok = False
-        for attempt in range(1, 4):
-            try:
-                py.build_payload(chunk, cat=0, timeframe=f"{start_year}-01-01 {end_date}", geo=geo)
-                df = py.interest_over_time()
-                if df is None or df.empty:
-                    raise RuntimeError("empty trends")
-                df = df.drop(columns=[c for c in df.columns if c.lower()=="ispartial"], errors="ignore")
-                df = df.reset_index().rename(columns={"date": "date"})
-                df["date"] = pd.to_datetime(df["date"]) + pd.offsets.Week(weekday=6)  # align to week end
-                # rename columns to safe names
-                rename = {c: f"gt_{c.replace(' ', '_')}" for c in df.columns if c != "date"}
-                df = df.rename(columns=rename)
-                merged = df if merged is None else pd.merge(merged, df, on="date", how="outer")
-                ok = True
-                break
-            except Exception:
-                _backoff_sleep(attempt=attempt)
-        if not ok:
-            return None, "❌ Google Trends rate-limited or unavailable"
-    merged = merged.sort_values("date").reset_index(drop=True)
-    # drop all-NaN cols (rare)
-    merged = merged.dropna(axis=1, how="all")
-    return merged, f"✅ Trends {len(merged)} weeks, {len(keywords)} keywords"
-
-
-# -----------------------------------------------------------------------------
-# VISUALS
-# -----------------------------------------------------------------------------
-
-def line_fig(df: pd.DataFrame, y_cols: List[str], title: str):
+# ========= Utility =========
+def line_fig(df: pd.DataFrame, y_col: str, title: str):
     fig = go.Figure()
-    for col in y_cols:
-        fig.add_trace(go.Scatter(
-            x=df["date"], y=df[col], mode="lines", name=col,
-            hovertemplate="<b>%{x|%Y-%m-%d}</b><br>%{y:.2f}<extra></extra>",
-        ))
-    fig.update_layout(
-        title=title, template="plotly_white", height=480,
-        hovermode="x unified", legend=dict(orientation="h", y=1.02, x=1, xanchor="right"),
-        xaxis_title="Date", yaxis_title="Value"
-    )
+    fig.add_trace(go.Scatter(x=df["date"], y=df[y_col], mode="lines", name=title))
+    fig.update_layout(title=title, template="plotly_white", hovermode="x unified", height=420)
     return fig
 
+def month_end(df, date_col="date"):
+    df = df.copy()
+    df[date_col] = pd.to_datetime(df[date_col]) + pd.offsets.MonthEnd(0)
+    return df
 
-def describe_series(df: pd.DataFrame, value_col: str) -> pd.DataFrame:
-    s = pd.to_numeric(df[value_col], errors="coerce").dropna()
-    if s.empty:
-        return pd.DataFrame({"Metric": ["Observations"], "Value": ["0"]})
-    stats = {
-        "Metric": ["Latest", "Mean", "Median", "Std", "Min", "Max", "Range", "Observations"],
-        "Value": [f"{s.iloc[-1]:.2f}", f"{s.mean():.2f}", f"{s.median():.2f}", f"{s.std():.2f}", f"{s.min():.2f}", f"{s.max():.2f}", f"{(s.max()-s.min()):.2f}", f"{len(s)}"],
-    }
-    return pd.DataFrame(stats)
+def to_monthly_finance(df: pd.DataFrame) -> pd.DataFrame:
+    # EOM close + monthly return
+    m = df.set_index("date").resample("M").last().rename_axis("date").reset_index()
+    m["ret"] = m["close"].pct_change()
+    return m
 
-
-# -----------------------------------------------------------------------------
-# SIDEBAR
-# -----------------------------------------------------------------------------
+# ========= Sidebar =========
 with st.sidebar:
-    st.image("https://upload.wikimedia.org/wikipedia/en/thumb/0/03/Flag_of_Italy.svg/320px-Flag_of_Italy.svg.png", width=96)
-    st.markdown("### ⚙️ Settings")
-    start_year = st.slider("Start Year", min_value=2000, max_value=datetime.now().year, value=2010)
+    st.header("⚙️ Settings")
+    start_year = st.slider("Start year", 2000, datetime.now().year, 2010)
+    fetch_btn = st.button("🚀 Fetch data", type="primary", use_container_width=True)
+    st.caption("Sources: Eurostat API • Stooq • FRED/CBOE")
 
-    st.markdown("---")
-    st.markdown("### 📊 Data Sources")
-    selected = {}
-    for key, info in DATA_SOURCES.items():
-        if info.get("mandatory", False):
-            selected[key] = st.checkbox(f"{info['name']} (mandatory)", value=True, disabled=True)
-        else:
-            selected[key] = st.checkbox(info["name"], value=(key in ["cci", "hicp"]))
+st.title("🇮🇹 Italian Unemployment — Auto Fetch & Nowcast")
 
-    if selected.get("trends", False):
-        n_kw = st.slider("Keywords count", 1, 10, 5)
-        chosen_kw = ITALIAN_KEYWORDS[:n_kw]
-    else:
-        chosen_kw = []
-
-    st.markdown("---")
-    auto_resolve = st.toggle("Auto‑resolve Eurostat dimensions", value=True, help="Pick best available codes (unit/s_adj/etc) dynamically with fallbacks.")
-    concurrent = st.toggle("Concurrent fetching", value=True)
-
-    st.markdown("---")
-    fetch = st.button("🚀 Fetch Data", type="primary", use_container_width=True)
-    clr = st.button("🔄 Clear Cache", use_container_width=True)
-    if clr:
-        st.cache_data.clear()
-        st.success("Cache cleared")
-
-# -----------------------------------------------------------------------------
-# MAIN
-# -----------------------------------------------------------------------------
-st.markdown('<div class="hero"><h1>Italian Economic Data – Auto Fetch</h1><p>Eurostat • Yahoo Finance • Google Trends</p></div>', unsafe_allow_html=True)
-
-if not fetch:
-    st.info("Select sources in the sidebar and hit **Fetch Data**. No manual downloads needed.")
+if not fetch_btn:
+    st.info("از سایدبار **Fetch data** را بزن. هیچ دانلود دستی لازم نیست.")
     st.stop()
 
-# Health check
-if not _internet_ok():
-    st.error("No internet connectivity. Check connection and retry.")
-    st.stop()
+# ========= Fetch block =========
+status = []
+data = {}
 
-# Preferences for Eurostat dimensions (priority-ordered lists)
-EUROSTAT_PREFS = {
-    # Unemployment rate
-    "une_rt_m": {
-        "geo": ["IT"],
-        "s_adj": ["SA", "SCA", "NSA"],
-        "sex": ["T"],
-        "age": ["TOTAL", "Y15-74", "Y15-64"],
-        "unit": ["PC_ACT", "PC_POP", "PC_Y15-74"],
-    },
-    # Consumer Confidence
-    "ei_bsco_m": {
-        "geo": ["IT"],
-        "indic": ["BS-CSMCI", "BS-CSMCI-BAL"],
-        "s_adj": ["NSA", "SA"],
-        "unit": ["BAL"],
-    },
-    # HICP
-    "prc_hicp_midx": {
-        "geo": ["IT"],
-        "coicop": ["CP00"],
-        "unit": ["I15", "I21", "I2015=100", "I2015"],
-    },
-    # Industrial Production
-    "sts_inpr_m": {
-        "geo": ["IT"],
-        "s_adj": ["SCA", "SA", "NSA"],
-        "nace_r2": ["B-E", "B-D"],
-        "indic_bt": ["PRD"],
-        "unit": ["I15", "I21", "I2015=100", "I2015"],
-    },
-}
+# Eurostat: Unemployment (mandatory)
+df_u, msg_u, filt_u = eurostat_fetch("une_rt_m", EUROSTAT_PREFS["une_rt_m"], start_year)
+status.append(("Unemployment (Eurostat)", msg_u))
+if df_u is not None:
+    data["unemp"] = df_u
 
-# -----------------------------------------------------------------------------
-# FETCH PIPELINE
-# -----------------------------------------------------------------------------
+# Optional Eurostat: CCI/HICP/IIP
+for code, label in [("ei_bsco_m","CCI"), ("prc_hicp_midx","HICP (All)"), ("sts_inpr_m","IIP")]:
+    df, msg, filt = eurostat_fetch(code, EUROSTAT_PREFS[code], start_year)
+    status.append((label, msg))
+    if df is not None:
+        data[code] = df
 
-jobs = []
-results: Dict[str, Tuple[Optional[pd.DataFrame], str]] = {}
-log_box = st.empty()
-progress = st.progress(0.0)
-sel_keys = [k for k, v in selected.items() if v]
-
-
-def submit_job(key: str):
-    info = DATA_SOURCES[key]
-    if info["provider"] == "Eurostat":
-        prefs = EUROSTAT_PREFS.get(info["dataset"], {}) if auto_resolve else {}
-        return fetch_eurostat(info["dataset"], prefs, start_year)
-    elif info["provider"] == "Yahoo Finance":
-        if key == "mib":
-            tickers = ["^FTSEMIB", "FTSEMIB.MI", "EWI"]
-        else:
-            tickers = ["^V2TX", "^VIX"]
-        return fetch_yahoo(tickers, start_year)
-    elif info["provider"] == "Google Trends":
-        return fetch_trends(chosen_kw, "IT", max(start_year, 2015))
-    else:
-        return None, "❌ unknown provider"
-
-
-if concurrent and len(sel_keys) > 1:
-    with ThreadPoolExecutor(max_workers=min(6, len(sel_keys))) as ex:
-        future_map = {ex.submit(submit_job, k): k for k in sel_keys}
-        done = 0
-        for fut in as_completed(future_map):
-            k = future_map[fut]
-            try:
-                results[k] = fut.result()
-            except Exception as e:
-                results[k] = (None, f"❌ {e}")
-            done += 1
-            progress.progress(done / len(sel_keys))
+# Finance: MIB + VIX
+fin = finance_fetch(start_year)
+if "mib" in fin:
+    status.append(("FTSE MIB (Stooq)", f"✅ {len(fin['mib'])} rows"))
+    data["mib_m"] = to_monthly_finance(month_end(fin["mib"]))
 else:
-    for i, k in enumerate(sel_keys, 1):
-        results[k] = submit_job(k)
-        progress.progress(i / len(sel_keys))
+    status.append(("FTSE MIB (Stooq)", "❌ fail"))
+if "vix" in fin:
+    status.append(("VIX (FRED/CBOE/Stooq)", f"✅ {len(fin['vix'])} rows"))
+    data["vix_m"] = to_monthly_finance(month_end(fin["vix"]))
+else:
+    status.append(("VIX (FRED/CBOE/Stooq)", "❌ fail"))
 
-progress.progress(1.0)
+# Show status
+cols = st.columns(2)
+for i,(name,msg) in enumerate(status):
+    (cols[i%2].success if "✅" in msg else cols[i%2].warning)(f"**{name}:** {msg}")
 
-# -----------------------------------------------------------------------------
-# RESULTS
-# -----------------------------------------------------------------------------
-
-succ = {k: v for k, v in results.items() if v[0] is not None}
-fail = {k: v for k, v in results.items() if v[0] is None}
-
-c1, c2, c3 = st.columns(3)
-with c1:
-    st.markdown(f"<div class='kpi'><h3>Total Sources</h3><h2>{len(sel_keys)}</h2></div>", unsafe_allow_html=True)
-with c2:
-    st.markdown(f"<div class='kpi' style='background:linear-gradient(135deg,#10B981,#059669)'><h3>Successful</h3><h2>{len(succ)}</h2></div>", unsafe_allow_html=True)
-with c3:
-    st.markdown(f"<div class='kpi' style='background:linear-gradient(135deg,#EF4444,#DC2626)'><h3>Failed</h3><h2>{len(fail)}</h2></div>", unsafe_allow_html=True)
-
-st.markdown("### Status")
-for k in sel_keys:
-    name = DATA_SOURCES[k]["name"]
-    msg = results[k][1]
-    (st.success if (k in succ) else st.error)(f"**{name}:** {msg}")
-
-if not succ:
+if "unemp" not in data:
+    st.error("نرخ بیکاری نگرفتیم؛ بدون آن الآن کاری نمی‌کنیم.")
     st.stop()
 
-# Tabs per dataset
-tabs = st.tabs([DATA_SOURCES[k]["name"] for k in succ.keys()])
-for (tab, (k, (df, _))) in zip(tabs, succ.items()):
-    with tab:
-        name = DATA_SOURCES[k]["name"]
-        st.markdown(f"#### {name}")
-        if k in ["unemp", "cci", "hicp", "iip"]:
-            # single value column named 'value'
-            fig = line_fig(df, ["value"], name)
-            st.plotly_chart(fig, use_container_width=True)
-            st.dataframe(df.tail(10), use_container_width=True)
-            st.dataframe(describe_series(df, "value"), use_container_width=True, hide_index=True)
-        elif k in ["mib", "vix"]:
-            fig = line_fig(df, ["close"], name)
-            st.plotly_chart(fig, use_container_width=True)
-            st.dataframe(df.tail(10), use_container_width=True)
-            st.dataframe(describe_series(df, "close"), use_container_width=True, hide_index=True)
-        elif k == "trends":
-            # multi-series: let user pick
-            value_cols = [c for c in df.columns if c != "date"]
-            pick = st.multiselect("Series", value_cols, default=value_cols[: min(4,len(value_cols))])
-            if pick:
-                st.plotly_chart(line_fig(df, pick, name), use_container_width=True)
-            st.dataframe(df.tail(10), use_container_width=True)
+# ========= Charts =========
+st.subheader("📈 Series")
+st.plotly_chart(line_fig(data["unemp"], "value", "Unemployment rate (%)"), use_container_width=True)
+with st.expander("Preview tables"):
+    for k,v in data.items():
+        st.write(k, v.tail(6))
 
-        # downloads
-        csv = df.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            f"📥 Download {name} (CSV)",
-            csv,
-            f"{k}_{datetime.now().strftime('%Y%m%d')}.csv",
-            "text/csv",
-            use_container_width=True,
-        )
+# ========= Baseline Nowcast (Ridge, expanding window) =========
+st.subheader("🤖 Baseline Nowcast (expanding Ridge)")
+# Build monthly features
+feat = []
+# Eurostat predictors (same-month rhs):
+if "ei_bsco_m" in data: feat.append(data["ei_bsco_m"].rename(columns={"value":"cci"}))
+if "prc_hicp_midx" in data: feat.append(data["prc_hicp_midx"].rename(columns={"value":"hicp"}))
+if "sts_inpr_m" in data: feat.append(data["sts_inpr_m"].rename(columns={"value":"iip"}))
+# Finance monthly (returns / levels)
+if "mib_m" in data: feat.append(data["mib_m"][["date","ret"]].rename(columns={"ret":"mib_ret"}))
+if "vix_m" in data: 
+    v = data["vix_m"].rename(columns={"close":"vix"}); v = v[["date","vix"]]
+    feat.append(v)
 
-# Bulk export
-st.markdown("### 💾 Bulk Export")
-if st.button("Download all as Excel", type="primary"):
-    output = BytesIO()
-    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
-        for k, (df, _) in succ.items():
-            sheet = DATA_SOURCES[k]["name"][:31]
-            df.to_excel(writer, sheet_name=sheet, index=False)
-    st.download_button(
-        "Save Excel",
-        output.getvalue(),
-        f"italian_data_{datetime.now().strftime('%Y%m%d')}.xlsx",
-        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True,
-    )
+X = None
+if feat:
+    X = feat[0]
+    for z in feat[1:]:
+        X = pd.merge(X, z, on="date", how="outer")
+    # Add first differences & lags (simple)
+    for c in [c for c in X.columns if c not in ["date"]]:
+        X[f"d_{c}"] = X[c].diff()
+        X[f"lag1_{c}"] = X[c].shift(1)
+else:
+    X = pd.DataFrame({"date": data["unemp"]["date"]})
 
-st.caption("This app auto-resolves Eurostat dimensions and applies sane fallbacks. No manual files needed.")
+# target
+y = data["unemp"].rename(columns={"value":"u"}).copy()
+
+# align
+dfm = pd.merge(y, X, on="date", how="left").sort_values("date").reset_index(drop=True)
+# we model u(t) with rhs available by end-of-month t (approximation)
+dfm = dfm.dropna(subset=["u"]).copy()
+
+# minimal feature selection
+feature_cols = [c for c in dfm.columns if c not in ["date","u"]]
+df_train = dfm.dropna(subset=feature_cols).copy()
+if len(df_train) > 60 and len(feature_cols) > 0:
+    # expanding-window CV for alpha
+    alphas = [0.1, 0.3, 1.0, 3.0, 10.0]
+    best_alpha, best_mae = None, 1e9
+    for a in alphas:
+        maes = []
+        for split in range(48, len(df_train)-1):  # start after 4y data
+            tr = df_train.iloc[:split]
+            va = df_train.iloc[split:split+1]
+            model = Pipeline([("sc", StandardScaler(with_mean=True, with_std=True)),
+                              ("rg", Ridge(alpha=a))])
+            model.fit(tr[feature_cols], tr["u"])
+            pred = model.predict(va[feature_cols])[0]
+            maes.append(abs(pred - va["u"].values[0]))
+        m = float(np.mean(maes)) if maes else 1e9
+        if m < best_mae: best_mae, best_alpha = m, a
+
+    # final fit on all data until last-1 (to nowcast last)
+    model = Pipeline([("sc", StandardScaler()), ("rg", Ridge(alpha=best_alpha))])
+    model.fit(df_train[feature_cols], df_train["u"])
+
+    # last available month in dfm (target known) + next month (nowcast) using latest features
+    last_month = dfm["date"].max()
+    # construct feature row for current month end
+    cur_date = (pd.to_datetime(datetime.now().date()) + pd.offsets.MonthEnd(0)).normalize()
+    # forward-fill features to current EOM
+    fx = dfm.set_index("date")[feature_cols].sort_index().copy()
+    fx = fx.reindex(pd.date_range(fx.index.min(), cur_date, freq="M")).ffill().iloc[[-1]]
+    nowcast = float(model.predict(fx[feature_cols])[0])
+    resid_sd = float(np.std(model.named_steps["rg"].predict(df_train[feature_cols]) - df_train["u"]))
+    lo, hi = nowcast - 1.0*resid_sd, nowcast + 1.0*resid_sd
+
+    st.success(f"Nowcast for {cur_date.date()}: **{nowcast:.2f}%**  (±{resid_sd:.2f}, 68% CI ≈ [{lo:.2f}, {hi:.2f}])")
+    st.caption(f"Best alpha={best_alpha}, expanding-window MAE≈{best_mae:.2f}. Features: {len(feature_cols)}")
+else:
+    st.warning("برای nowcast دادهٔ پیش‌بین کافی/پاک در دسترس نیست؛ یا فیچرها خیلی کم‌اند.")
