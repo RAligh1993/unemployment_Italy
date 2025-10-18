@@ -1,529 +1,610 @@
 """
-Correlation Lab - Advanced correlation analysis with instant feedback
+═══════════════════════════════════════════════════════════════════════════════
+📤 MANUAL DATA UPLOAD & PANEL BUILDER
+═══════════════════════════════════════════════════════════════════════════════
+
+Upload your own CSV files and build custom time series panels.
+
+This is the COMPLETE Data Aggregation Pro from your thesis, 
+integrated into the multi-page system.
+
+═══════════════════════════════════════════════════════════════════════════════
 """
 
 import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.express as px
-import plotly.graph_objs as go
-from scipy import stats
-import seaborn as sns
+import plotly.graph_objects as go
+from datetime import datetime
+from pathlib import Path
+from io import BytesIO
+from typing import Optional, List, Dict, Tuple
 
-st.set_page_config(page_title="Correlation Lab", page_icon="🔬", layout="wide")
+st.set_page_config(
+    page_title="Manual Upload",
+    page_icon="📤",
+    layout="wide"
+)
 
-# Custom CSS
-st.markdown("""
-<style>
-    .correlation-matrix-container {
-        background: rgba(30, 41, 59, 0.5);
-        border-radius: 20px;
-        padding: 20px;
-        backdrop-filter: blur(10px);
-    }
-    
-    .feature-card {
-        background: linear-gradient(135deg, rgba(99, 102, 241, 0.1), rgba(16, 185, 129, 0.1));
-        border: 1px solid rgba(99, 102, 241, 0.3);
-        border-radius: 15px;
-        padding: 20px;
-        margin: 10px 0;
-        cursor: pointer;
-        transition: all 0.3s ease;
-    }
-    
-    .feature-card:hover {
-        transform: translateX(5px);
-        box-shadow: 0 5px 20px rgba(99, 102, 241, 0.3);
-    }
-    
-    .corr-value-high {
-        color: #10B981;
-        font-size: 24px;
-        font-weight: 700;
-    }
-    
-    .corr-value-med {
-        color: #F59E0B;
-        font-size: 24px;
-        font-weight: 700;
-    }
-    
-    .corr-value-low {
-        color: #EF4444;
-        font-size: 24px;
-        font-weight: 700;
-    }
-    
-    .analysis-card {
-        background: rgba(30, 41, 59, 0.8);
-        border-left: 4px solid #6366F1;
-        padding: 15px;
-        margin: 15px 0;
-        border-radius: 10px;
-    }
-    
-    .lag-indicator {
-        display: inline-block;
-        padding: 4px 12px;
-        background: rgba(99, 102, 241, 0.2);
-        border: 1px solid #6366F1;
-        border-radius: 15px;
-        font-size: 12px;
-        font-weight: 600;
-        color: #6366F1;
-        margin: 2px;
-    }
-</style>
-""", unsafe_allow_html=True)
+# ═══════════════════════════════════════════════════════════════════════════
+# STATE MANAGEMENT
+# ═══════════════════════════════════════════════════════════════════════════
 
-# Initialize session state
-if 'selected_features' not in st.session_state:
-    st.session_state.selected_features = []
-if 'correlation_data' not in st.session_state:
-    st.session_state.correlation_data = None
+if 'manual_state' not in st.session_state:
+    st.session_state.manual_state = {
+        'y_monthly': None,
+        'panel_monthly': None,
+        'panel_quarterly': None,
+        'raw_daily': [],
+        'google_trends': None
+    }
+
+state = st.session_state.manual_state
+
+# ═══════════════════════════════════════════════════════════════════════════
+# HELPER FUNCTIONS
+# ═══════════════════════════════════════════════════════════════════════════
+
+def to_datetime_safe(series: pd.Series) -> pd.Series:
+    """Convert to datetime and normalize"""
+    return pd.to_datetime(series, errors='coerce').dt.tz_localize(None).dt.normalize()
+
+def end_of_month(series: pd.Series) -> pd.Series:
+    """Align dates to end of month"""
+    dt = to_datetime_safe(series)
+    return (dt + pd.offsets.MonthEnd(0)).dt.normalize()
+
+def slugify(name: str) -> str:
+    """Convert name to clean identifier"""
+    return (name.strip().lower()
+            .replace(' ', '_')
+            .replace('/', '_')
+            .replace('(', '')
+            .replace(')', '')
+            .replace('-', '_')
+            .replace('%', 'pct')
+            .replace('__', '_'))
+
+def detect_date_column(df: pd.DataFrame) -> str:
+    """Smart detection of date column"""
+    for name in ['date', 'Date', 'ds', 'time', 'Time', 'period', 'Week', 'Month', 'Day']:
+        if name in df.columns:
+            return name
+    for col in df.columns:
+        if pd.api.types.is_datetime64_any_dtype(df[col]):
+            return col
+    return df.columns[0]
+
+def validate_dataframe(df: pd.DataFrame, name: str) -> Tuple[bool, str]:
+    """Validate uploaded dataframe"""
+    if df is None or df.empty:
+        return False, f"{name} is empty"
+    if len(df.columns) < 2:
+        return False, f"{name} must have at least 2 columns"
+    return True, "Valid"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# DATA LOADING
+# ═══════════════════════════════════════════════════════════════════════════
+
+def load_target_series(file) -> Optional[pd.Series]:
+    """Load monthly target variable"""
+    try:
+        df = pd.read_csv(file)
+        valid, msg = validate_dataframe(df, "Target")
+        if not valid:
+            st.error(f"❌ {msg}")
+            return None
+        
+        date_col = detect_date_column(df)
+        value_cols = [c for c in df.columns if c != date_col]
+        if not value_cols:
+            st.error("❌ No value column found")
+            return None
+        
+        df = df[[date_col, value_cols[0]]].copy()
+        df.columns = ['date', 'value']
+        df['date'] = end_of_month(df['date'])
+        df['value'] = pd.to_numeric(df['value'], errors='coerce')
+        df = df.dropna().drop_duplicates(subset=['date'], keep='last')
+        
+        return df.set_index('date')['value'].sort_index()
+    except Exception as e:
+        st.error(f"❌ Error: {str(e)}")
+        return None
+
+def load_daily_data(file) -> Optional[pd.DataFrame]:
+    """Load daily time series"""
+    try:
+        df = pd.read_csv(file)
+        valid, msg = validate_dataframe(df, "Daily")
+        if not valid:
+            st.warning(f"⚠️ {msg}")
+            return None
+        
+        date_col = detect_date_column(df)
+        df = df.rename(columns={date_col: 'date'})
+        df['date'] = to_datetime_safe(df['date'])
+        df = df.dropna(subset=['date'])
+        
+        numeric_cols = []
+        for col in df.columns:
+            if col == 'date':
+                continue
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+            if df[col].notna().sum() > 0:
+                numeric_cols.append(col)
+        
+        if not numeric_cols:
+            st.warning(f"⚠️ No valid columns in {file.name}")
+            return None
+        
+        df = df[['date'] + numeric_cols].sort_values('date')
+        file_prefix = slugify(Path(file.name).stem)
+        rename_map = {col: f"{file_prefix}__{slugify(col)}" for col in numeric_cols}
+        df = df.rename(columns=rename_map)
+        
+        return df
+    except Exception as e:
+        st.error(f"❌ Error loading {file.name}: {str(e)}")
+        return None
+
+def load_google_trends(files: List) -> Optional[pd.DataFrame]:
+    """Load and merge Google Trends files"""
+    if not files:
+        return None
     
+    frames = []
+    for file in files:
+        try:
+            df = pd.read_csv(file)
+            date_col = 'Week' if 'Week' in df.columns else ('Month' if 'Month' in df.columns else detect_date_column(df))
+            series_cols = [c for c in df.columns if c != date_col]
+            
+            if not series_cols:
+                st.warning(f"⚠️ No data in {file.name}")
+                continue
+            
+            df = df[[date_col] + series_cols].copy()
+            df = df.rename(columns={date_col: 'date'})
+            df['date'] = to_datetime_safe(df['date'])
+            
+            new_cols = [f"gt__{slugify(col)}" for col in series_cols]
+            df.columns = ['date'] + new_cols
+            
+            for col in new_cols:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+            
+            frames.append(df)
+        except Exception as e:
+            st.warning(f"⚠️ Error: {str(e)}")
+            continue
+    
+    if not frames:
+        return None
+    
+    result = frames[0]
+    for df in frames[1:]:
+        result = pd.merge(result, df, on='date', how='outer')
+    
+    return result.sort_values('date').reset_index(drop=True)
+
+# ═══════════════════════════════════════════════════════════════════════════
+# AGGREGATION
+# ═══════════════════════════════════════════════════════════════════════════
+
+def aggregate_to_monthly(
+    df: pd.DataFrame,
+    method: str = 'mean',
+    business_days_only: bool = False,
+    min_days: int = 10
+) -> pd.DataFrame:
+    """Aggregate daily to monthly"""
+    if df is None or df.empty:
+        return pd.DataFrame()
+    
+    df = df.copy()
+    df['date'] = to_datetime_safe(df['date'])
+    
+    if business_days_only:
+        df = df[df['date'].dt.dayofweek < 5]
+    
+    df = df.set_index('date')
+    
+    if method == 'sum':
+        monthly = df.resample('M').sum(min_count=1)
+    elif method == 'last':
+        monthly = df.resample('M').last()
+    else:
+        monthly = df.resample('M').mean()
+    
+    counts = df.resample('M').count()
+    monthly[counts < min_days] = np.nan
+    
+    monthly = monthly.reset_index()
+    monthly['date'] = end_of_month(monthly['date'])
+    
+    return monthly
+
+def build_panel(
+    daily_frames: List[pd.DataFrame],
+    trends_df: Optional[pd.DataFrame],
+    method: str,
+    business_days: bool,
+    min_days: int
+) -> pd.DataFrame:
+    """Build unified monthly panel"""
+    panel = None
+    
+    for df in daily_frames:
+        if df is None or df.empty:
+            continue
+        monthly = aggregate_to_monthly(df, method, business_days, min_days)
+        if panel is None:
+            panel = monthly
+        else:
+            panel = pd.merge(panel, monthly, on='date', how='outer')
+    
+    if trends_df is not None and not trends_df.empty:
+        gt_monthly = trends_df.set_index('date').resample('M').mean().reset_index()
+        gt_monthly['date'] = end_of_month(gt_monthly['date'])
+        if panel is None:
+            panel = gt_monthly
+        else:
+            panel = pd.merge(panel, gt_monthly, on='date', how='outer')
+    
+    if panel is None or panel.empty:
+        return pd.DataFrame()
+    
+    panel = panel.sort_values('date').set_index('date')
+    for col in panel.columns:
+        panel[col] = pd.to_numeric(panel[col], errors='coerce')
+    
+    return panel
+
+def create_quarterly_panel(monthly_panel: pd.DataFrame, method: str = 'mean') -> pd.DataFrame:
+    """Aggregate to quarterly"""
+    if monthly_panel is None or monthly_panel.empty:
+        return pd.DataFrame()
+    
+    if method == 'last':
+        return monthly_panel.resample('Q').last()
+    elif method == 'sum':
+        return monthly_panel.resample('Q').sum(min_count=1)
+    else:
+        return monthly_panel.resample('Q').mean()
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CLEANING
+# ═══════════════════════════════════════════════════════════════════════════
+
+def remove_constant_columns(df: pd.DataFrame, tolerance: float = 1e-12) -> pd.DataFrame:
+    """Remove zero variance columns"""
+    if df is None or df.empty:
+        return df
+    
+    keep_cols = []
+    removed_cols = []
+    
+    for col in df.columns:
+        values = df[col].dropna().values
+        if len(values) == 0:
+            removed_cols.append(col)
+            continue
+        if np.ptp(values) > tolerance:
+            keep_cols.append(col)
+        else:
+            removed_cols.append(col)
+    
+    if removed_cols:
+        st.info(f"🧹 Removed {len(removed_cols)} constant columns")
+    
+    return df[keep_cols]
+
+def remove_correlated_duplicates(df: pd.DataFrame, threshold: float = 0.95) -> pd.DataFrame:
+    """Remove highly correlated columns"""
+    if df is None or df.empty:
+        return df
+    
+    corr_matrix = df.corr().abs()
+    upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
+    to_drop = [col for col in upper.columns if any(upper[col] > threshold)]
+    
+    if to_drop:
+        st.info(f"🧹 Removed {len(to_drop)} correlated columns (>{threshold:.0%})")
+    
+    return df.drop(columns=to_drop, errors='ignore')
+
+# ═══════════════════════════════════════════════════════════════════════════
+# VISUALIZATION
+# ═══════════════════════════════════════════════════════════════════════════
+
+def plot_target_series(series: pd.Series):
+    """Plot target"""
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=series.index,
+        y=series.values,
+        mode='lines+markers',
+        name='Target',
+        line=dict(color='#3B82F6', width=3),
+        marker=dict(size=6)
+    ))
+    fig.update_layout(
+        title='Monthly Target Variable',
+        xaxis_title='Date',
+        yaxis_title='Value',
+        template='plotly_white',
+        height=400,
+        hovermode='x unified'
+    )
+    return fig
+
+def plot_coverage_heatmap(df: pd.DataFrame, n_months: int = 60):
+    """Coverage heatmap"""
+    presence = df.notna().astype(int).tail(n_months)
+    fig = px.imshow(
+        presence.T,
+        aspect='auto',
+        color_continuous_scale=['#EF4444', '#10B981'],
+        labels={'color': 'Present'},
+        title=f'Data Coverage (Last {n_months} Months)'
+    )
+    fig.update_layout(
+        height=500,
+        template='plotly_white',
+        xaxis_title='Date',
+        yaxis_title='Feature'
+    )
+    return fig
+
+def plot_correlation_with_target(panel: pd.DataFrame, target: pd.Series, top_n: int = 15):
+    """Correlation plot"""
+    y_aligned, X_aligned = target.align(panel, join='inner')
+    if X_aligned.empty:
+        return None
+    
+    correlations = X_aligned.corrwith(y_aligned).sort_values(ascending=False)
+    top_corr = pd.concat([correlations.head(top_n//2), correlations.tail(top_n//2)])
+    
+    fig = go.Figure()
+    colors = ['#10B981' if x > 0 else '#EF4444' for x in top_corr.values]
+    fig.add_trace(go.Bar(
+        x=top_corr.values,
+        y=top_corr.index,
+        orientation='h',
+        marker=dict(color=colors),
+        text=[f'{x:.3f}' for x in top_corr.values],
+        textposition='outside'
+    ))
+    fig.update_layout(
+        title=f'Top {top_n} Correlations with Target',
+        xaxis_title='Correlation',
+        yaxis_title='Feature',
+        template='plotly_white',
+        height=600
+    )
+    return fig
+
+# ═══════════════════════════════════════════════════════════════════════════
+# EXPORT
+# ═══════════════════════════════════════════════════════════════════════════
+
+def export_to_excel(
+    monthly_panel: pd.DataFrame,
+    quarterly_panel: Optional[pd.DataFrame],
+    target: Optional[pd.Series],
+    config: dict
+) -> bytes:
+    """Export to Excel"""
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+        if monthly_panel is not None and not monthly_panel.empty:
+            monthly_panel.reset_index().to_excel(writer, sheet_name='Monthly_Panel', index=False)
+        if quarterly_panel is not None and not quarterly_panel.empty:
+            quarterly_panel.reset_index().to_excel(writer, sheet_name='Quarterly_Panel', index=False)
+        if target is not None and not target.empty:
+            target.reset_index().to_excel(writer, sheet_name='Target', index=False)
+        config_df = pd.DataFrame([config])
+        config_df.to_excel(writer, sheet_name='Configuration', index=False)
+    return output.getvalue()
+
+# ═══════════════════════════════════════════════════════════════════════════
+# UI
+# ═══════════════════════════════════════════════════════════════════════════
+
 # Header
 st.markdown("""
-<h1 style="margin: 0;">🔬 Correlation Laboratory</h1>
-<p style="color: #9CA3AF; margin-top: 10px;">
-    Advanced correlation analysis with real-time feature selection and lag detection
-</p>
+<div style='text-align: center; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding: 40px; border-radius: 15px; margin-bottom: 30px;'>
+    <h1 style='color: white; margin: 0;'>📤 Manual Data Upload</h1>
+    <p style='color: white; margin: 10px 0 0 0; font-size: 1.2rem;'>Upload CSV files and build custom panels</p>
+</div>
 """, unsafe_allow_html=True)
 
-st.markdown("---")
+# Sidebar
+with st.sidebar:
+    st.header("⚙️ Settings")
+    
+    st.subheader("📊 Aggregation")
+    agg_method = st.selectbox("Method:", ['mean', 'sum', 'last'])
+    use_business_days = st.checkbox("Business days only", False)
+    min_days = st.slider("Min days/month", 1, 28, 10)
+    
+    st.markdown("---")
+    st.subheader("🧹 Cleaning")
+    drop_constant = st.checkbox("Remove constant", True)
+    drop_correlated = st.checkbox("Remove correlated", False)
+    if drop_correlated:
+        corr_threshold = st.slider("Correlation threshold", 0.80, 0.99, 0.95, 0.01)
+    else:
+        corr_threshold = 0.95
+    
+    st.markdown("---")
+    export_format = st.radio("Export:", ['CSV', 'Excel'])
+    
+    st.markdown("---")
+    if st.button("🗑️ Clear All", use_container_width=True):
+        state['y_monthly'] = None
+        state['panel_monthly'] = None
+        state['panel_quarterly'] = None
+        state['raw_daily'] = []
+        state['google_trends'] = None
+        st.success("✅ Cleared!")
+        st.rerun()
+    
+    if st.button("🏠 Home", use_container_width=True):
+        st.switch_page("app.py")
 
-# Data upload section
-col1, col2 = st.columns([1, 2])
+# Upload section
+st.markdown("### 📤 Step 1: Upload Data")
+
+col1, col2, col3 = st.columns(3)
 
 with col1:
-    st.markdown("### 📁 Data Upload")
-    
-    uploaded_file = st.file_uploader(
-        "Upload your dataset",
-        type=['csv', 'xlsx'],
-        help="Upload a CSV or Excel file with time series data"
-    )
-    
-    if uploaded_file:
-        # Load data
-        if uploaded_file.name.endswith('.csv'):
-            df = pd.read_csv(uploaded_file)
-        else:
-            df = pd.read_excel(uploaded_file)
-        
-        st.session_state.correlation_data = df
-        
-        # Basic info
-        st.markdown("#### 📊 Dataset Overview")
-        st.metric("Total Records", len(df))
-        st.metric("Total Features", len(df.columns))
-        st.metric("Missing Values", df.isna().sum().sum())
-        
-        # Target selection
-        st.markdown("#### 🎯 Select Target Variable")
-        numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-        
-        target = st.selectbox(
-            "Target variable",
-            numeric_cols,
-            index=0 if numeric_cols else None
-        )
-        
-        # Feature selection
-        st.markdown("#### ✨ Feature Selection")
-        
-        if st.checkbox("Select All Features"):
-            st.session_state.selected_features = [col for col in numeric_cols if col != target]
-        else:
-            st.session_state.selected_features = st.multiselect(
-                "Choose features to analyze",
-                [col for col in numeric_cols if col != target],
-                default=st.session_state.selected_features
-            )
+    st.markdown("##### 🎯 Target Variable")
+    target_file = st.file_uploader("Monthly target (CSV)", type=['csv'], key='target')
+    if target_file:
+        state['y_monthly'] = load_target_series(target_file)
+        if state['y_monthly'] is not None:
+            st.success(f"✅ {len(state['y_monthly'])} months")
 
 with col2:
-    if uploaded_file and target and st.session_state.selected_features:
-        st.markdown("### 🎯 Instant Correlation Analysis")
-        
-        # Calculate correlations
-        correlations = {}
-        for feature in st.session_state.selected_features:
-            corr_value = df[target].corr(df[feature])
-            correlations[feature] = corr_value
-        
-        # Sort by absolute correlation
-        sorted_corr = dict(sorted(correlations.items(), key=lambda x: abs(x[1]), reverse=True))
-        
-        # Display top correlations as cards
-        st.markdown("#### 🏆 Top Correlated Features")
-        
-        cols = st.columns(3)
-        for idx, (feature, corr) in enumerate(list(sorted_corr.items())[:6]):
-            col_idx = idx % 3
+    st.markdown("##### 📊 Daily Data")
+    daily_files = st.file_uploader("Daily series (CSV)", type=['csv'], accept_multiple_files=True, key='daily')
+    if daily_files:
+        state['raw_daily'] = []
+        for file in daily_files:
+            df = load_daily_data(file)
+            if df is not None:
+                state['raw_daily'].append(df)
+        if state['raw_daily']:
+            total_cols = sum(len(df.columns) - 1 for df in state['raw_daily'])
+            st.success(f"✅ {len(state['raw_daily'])} files, {total_cols} series")
+
+with col3:
+    st.markdown("##### 🔍 Google Trends")
+    trends_files = st.file_uploader("Trends (CSV)", type=['csv'], accept_multiple_files=True, key='trends')
+    if trends_files:
+        state['google_trends'] = load_google_trends(trends_files)
+        if state['google_trends'] is not None:
+            n_series = len(state['google_trends'].columns) - 1
+            st.success(f"✅ {n_series} trends")
+
+# Preview target
+if state['y_monthly'] is not None:
+    st.markdown("---")
+    st.markdown("##### 📈 Target Preview")
+    fig = plot_target_series(state['y_monthly'])
+    st.plotly_chart(fig, use_container_width=True)
+    
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Observations", len(state['y_monthly']))
+    col2.metric("Start", state['y_monthly'].index.min().strftime('%Y-%m'))
+    col3.metric("End", state['y_monthly'].index.max().strftime('%Y-%m'))
+    col4.metric("Mean", f"{state['y_monthly'].mean():.2f}")
+
+# Build panel
+st.markdown("---")
+st.markdown("### 🔨 Step 2: Build Panel")
+
+if not state['raw_daily'] and state['google_trends'] is None:
+    st.info("📌 Upload data first")
+else:
+    if st.button("🚀 Build Panel", type="primary", use_container_width=True):
+        with st.spinner("Building..."):
+            panel = build_panel(
+                state['raw_daily'],
+                state['google_trends'],
+                agg_method,
+                use_business_days,
+                min_days
+            )
             
-            abs_corr = abs(corr)
-            if abs_corr >= 0.7:
-                corr_class = "corr-value-high"
-                strength = "Strong"
-                icon = "🔥"
-            elif abs_corr >= 0.4:
-                corr_class = "corr-value-med"
-                strength = "Moderate"
-                icon = "⚡"
+            if panel.empty:
+                st.error("❌ Failed")
             else:
-                corr_class = "corr-value-low"
-                strength = "Weak"
-                icon = "💫"
-            
-            with cols[col_idx]:
-                st.markdown(f"""
-                <div class="feature-card">
-                    <div style="display: flex; justify-content: space-between; align-items: start;">
-                        <span style="font-size: 28px;">{icon}</span>
-                        <span class="{corr_class}">{corr:.3f}</span>
-                    </div>
-                    <div style="margin-top: 10px;">
-                        <div style="font-weight: 600; color: white; font-size: 14px;">
-                            {feature[:25]}{'...' if len(feature) > 25 else ''}
-                        </div>
-                        <div style="color: #9CA3AF; font-size: 12px; margin-top: 5px;">
-                            {strength} {'positive' if corr > 0 else 'negative'} correlation
-                        </div>
-                    </div>
-                </div>
-                """, unsafe_allow_html=True)
-        
-        # Correlation heatmap
-        st.markdown("#### 🗺️ Correlation Matrix Heatmap")
-        
-        # Create correlation matrix
-        selected_cols = [target] + st.session_state.selected_features[:20]  # Limit to 20 for readability
-        corr_matrix = df[selected_cols].corr()
-        
-        # Create heatmap
-        fig = px.imshow(
-            corr_matrix,
-            labels=dict(color="Correlation"),
-            x=corr_matrix.columns,
-            y=corr_matrix.columns,
-            color_continuous_scale="RdBu_r",
-            zmin=-1,
-            zmax=1,
-            aspect="auto"
-        )
-        
-        fig.update_layout(
-            template="plotly_dark",
-            paper_bgcolor='rgba(0,0,0,0)',
-            plot_bgcolor='rgba(0,0,0,0)',
-            height=500
-        )
-        
-        st.plotly_chart(fig, use_container_width=True)
-    
-    elif not uploaded_file:
-        st.info("👈 Please upload a dataset to begin correlation analysis")
-    elif not target:
-        st.warning("👈 Please select a target variable")
-    else:
-        st.warning("👈 Please select at least one feature to analyze")
+                if drop_constant:
+                    panel = remove_constant_columns(panel)
+                if drop_correlated:
+                    panel = remove_correlated_duplicates(panel, corr_threshold)
+                
+                if state['y_monthly'] is not None:
+                    panel = panel.loc[
+                        (panel.index >= state['y_monthly'].index.min()) &
+                        (panel.index <= state['y_monthly'].index.max())
+                    ]
+                
+                state['panel_monthly'] = panel
+                state['panel_quarterly'] = create_quarterly_panel(panel, agg_method)
+                
+                st.success(f"✅ Panel: {panel.shape[0]} months × {panel.shape[1]} features")
 
-# Advanced Analysis Section
-if uploaded_file and target and st.session_state.selected_features:
+# Results
+if state['panel_monthly'] is not None:
     st.markdown("---")
-    st.markdown("### 🔍 Advanced Correlation Analysis")
+    st.markdown("### 📊 Step 3: Analysis")
     
-    tabs = st.tabs(["⏱️ Lag Analysis", "📊 Partial Correlation", "📈 Rolling Correlation", "🎯 Feature Importance"])
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("📅 Months", state['panel_monthly'].shape[0])
+    col2.metric("📊 Features", state['panel_monthly'].shape[1])
+    coverage = state['panel_monthly'].notna().mean().mean()
+    col3.metric("✅ Coverage", f"{coverage:.1%}")
+    if state['panel_quarterly'] is not None:
+        col4.metric("📅 Quarters", state['panel_quarterly'].shape[0])
     
-    with tabs[0]:
-        # Lag correlation analysis
-        st.markdown("#### Time-Lagged Correlations")
+    tab1, tab2, tab3, tab4 = st.tabs(["📋 Preview", "🔍 Coverage", "📈 Correlations", "💾 Export"])
+    
+    with tab1:
+        st.subheader("Monthly Panel")
+        st.dataframe(state['panel_monthly'].tail(24), use_container_width=True, height=400)
+        if state['panel_quarterly'] is not None:
+            st.subheader("Quarterly Panel")
+            st.dataframe(state['panel_quarterly'].tail(8), use_container_width=True, height=300)
+    
+    with tab2:
+        coverage_df = pd.DataFrame({
+            'Feature': state['panel_monthly'].columns,
+            'Coverage': state['panel_monthly'].notna().mean().values,
+            'Missing': state['panel_monthly'].isna().sum().values
+        }).sort_values('Coverage', ascending=False)
+        st.dataframe(coverage_df, use_container_width=True)
         
-        col1, col2 = st.columns([1, 2])
+        heatmap = plot_coverage_heatmap(state['panel_monthly'])
+        st.plotly_chart(heatmap, use_container_width=True)
+    
+    with tab3:
+        if state['y_monthly'] is not None:
+            corr_fig = plot_correlation_with_target(state['panel_monthly'], state['y_monthly'])
+            if corr_fig:
+                st.plotly_chart(corr_fig, use_container_width=True)
+            else:
+                st.info("No overlap")
+        else:
+            st.info("Upload target first")
+    
+    with tab4:
+        config = {
+            'aggregation_method': agg_method,
+            'business_days_only': use_business_days,
+            'min_days_per_month': min_days,
+            'drop_constant': drop_constant,
+            'drop_correlated': drop_correlated,
+            'correlation_threshold': corr_threshold,
+            'created_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        }
         
+        with st.expander("⚙️ Config"):
+            st.json(config)
+        
+        col1, col2 = st.columns(2)
         with col1:
-            max_lag = st.slider("Maximum lag (periods)", 1, 24, 12)
-            selected_feature = st.selectbox(
-                "Select feature for lag analysis",
-                st.session_state.selected_features
-            )
-        
-        with col2:
-            if selected_feature:
-                # Calculate lag correlations
-                lag_correlations = []
-                for lag in range(0, max_lag + 1):
-                    if lag == 0:
-                        corr = df[target].corr(df[selected_feature])
-                    else:
-                        corr = df[target].corr(df[selected_feature].shift(lag))
-                    lag_correlations.append({'Lag': lag, 'Correlation': corr})
-                
-                lag_df = pd.DataFrame(lag_correlations)
-                
-                # Plot lag correlations
-                fig = px.line(
-                    lag_df,
-                    x='Lag',
-                    y='Correlation',
-                    markers=True,
-                    title=f'Lag Correlation: {selected_feature} → {target}'
-                )
-                
-                fig.add_hline(y=0, line_dash="dash", line_color="gray")
-                fig.add_hline(y=0.5, line_dash="dot", line_color="green", opacity=0.5)
-                fig.add_hline(y=-0.5, line_dash="dot", line_color="red", opacity=0.5)
-                
-                fig.update_layout(
-                    template="plotly_dark",
-                    paper_bgcolor='rgba(0,0,0,0)',
-                    plot_bgcolor='rgba(0,0,0,0)',
-                    height=400
-                )
-                
-                st.plotly_chart(fig, use_container_width=True)
-                
-                # Best lag indicator
-                best_lag = lag_df.loc[lag_df['Correlation'].abs().idxmax()]
-                st.markdown(f"""
-                <div class="analysis-card">
-                    <h4 style="color: #6366F1; margin: 0;">🎯 Optimal Lag Detection</h4>
-                    <p style="margin-top: 10px;">
-                        Best correlation found at <span class="lag-indicator">Lag {int(best_lag['Lag'])}</span>
-                        with correlation coefficient of <strong>{best_lag['Correlation']:.3f}</strong>
-                    </p>
-                    <p style="color: #9CA3AF; font-size: 14px; margin-top: 10px;">
-                        This suggests that {selected_feature} has the strongest predictive power for {target} 
-                        when lagged by {int(best_lag['Lag'])} period(s).
-                    </p>
-                </div>
-                """, unsafe_allow_html=True)
-    
-    with tabs[1]:
-        # Partial correlation
-        st.markdown("#### Partial Correlation Analysis")
-        
-        st.info("Partial correlation measures the relationship between two variables while controlling for other variables.")
-        
-        if len(st.session_state.selected_features) >= 2:
-            feature_x = st.selectbox("Feature X", st.session_state.selected_features, key='partial_x')
-            feature_y = st.selectbox("Feature Y", [f for f in st.session_state.selected_features if f != feature_x], key='partial_y')
-            control_vars = st.multiselect(
-                "Control variables",
-                [f for f in st.session_state.selected_features if f not in [feature_x, feature_y]]
-            )
-            
-            if st.button("Calculate Partial Correlation"):
-                # Simple correlation
-                simple_corr = df[feature_x].corr(df[feature_y])
-                
-                # Partial correlation (simplified calculation)
-                if control_vars:
-                    # This is a simplified version - in production, use proper partial correlation
-                    from sklearn.linear_model import LinearRegression
-                    
-                    # Residualize X
-                    X_model = LinearRegression()
-                    X_model.fit(df[control_vars], df[feature_x])
-                    X_residuals = df[feature_x] - X_model.predict(df[control_vars])
-                    
-                    # Residualize Y
-                    Y_model = LinearRegression()
-                    Y_model.fit(df[control_vars], df[feature_y])
-                    Y_residuals = df[feature_y] - Y_model.predict(df[control_vars])
-                    
-                    # Partial correlation
-                    partial_corr = pd.Series(X_residuals).corr(pd.Series(Y_residuals))
-                    
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        st.metric("Simple Correlation", f"{simple_corr:.3f}")
-                    with col2:
-                        st.metric("Partial Correlation", f"{partial_corr:.3f}")
-                    
-                    st.markdown(f"""
-                    <div class="analysis-card">
-                        <h4 style="color: #10B981;">📊 Interpretation</h4>
-                        <p>After controlling for {', '.join(control_vars)}:</p>
-                        <ul>
-                            <li>The correlation changed by {abs(partial_corr - simple_corr):.3f}</li>
-                            <li>This {'strengthened' if abs(partial_corr) > abs(simple_corr) else 'weakened'} the relationship</li>
-                        </ul>
-                    </div>
-                    """, unsafe_allow_html=True)
-                else:
-                    st.warning("Please select at least one control variable")
-    
-    with tabs[2]:
-        # Rolling correlation
-        st.markdown("#### Rolling Correlation Analysis")
-        
-        window_size = st.slider("Window size", 10, 100, 30)
-        selected_feature_roll = st.selectbox(
-            "Select feature",
-            st.session_state.selected_features,
-            key='rolling_feature'
-        )
-        
-        if selected_feature_roll:
-            # Calculate rolling correlation
-            rolling_corr = df[target].rolling(window=window_size).corr(df[selected_feature_roll])
-            
-            # Create figure
-            fig = go.Figure()
-            
-            # Add rolling correlation line
-            fig.add_trace(go.Scatter(
-                x=df.index,
-                y=rolling_corr,
-                mode='lines',
-                name='Rolling Correlation',
-                line=dict(color='#6366F1', width=2)
-            ))
-            
-            # Add stability bands
-            mean_corr = rolling_corr.mean()
-            std_corr = rolling_corr.std()
-            
-            fig.add_hline(y=mean_corr, line_dash="dash", line_color="white", opacity=0.5)
-            fig.add_hrect(
-                y0=mean_corr - std_corr,
-                y1=mean_corr + std_corr,
-                fillcolor="rgba(99, 102, 241, 0.1)",
-                line_width=0
-            )
-            
-            fig.update_layout(
-                template="plotly_dark",
-                paper_bgcolor='rgba(0,0,0,0)',
-                plot_bgcolor='rgba(0,0,0,0)',
-                height=400,
-                title=f"Rolling Correlation (window={window_size}): {selected_feature_roll} vs {target}",
-                yaxis_title="Correlation",
-                xaxis_title="Index"
-            )
-            
-            st.plotly_chart(fig, use_container_width=True)
-            
-            # Stability analysis
-            stability = 1 - (std_corr / (abs(mean_corr) + 0.001))
-            st.markdown(f"""
-            <div class="analysis-card">
-                <h4 style="color: #F59E0B;">📈 Stability Analysis</h4>
-                <div style="display: flex; gap: 20px; margin-top: 15px;">
-                    <div>
-                        <span style="color: #9CA3AF;">Mean Correlation:</span>
-                        <span style="font-weight: 600; color: white;"> {mean_corr:.3f}</span>
-                    </div>
-                    <div>
-                        <span style="color: #9CA3AF;">Std Deviation:</span>
-                        <span style="font-weight: 600; color: white;"> {std_corr:.3f}</span>
-                    </div>
-                    <div>
-                        <span style="color: #9CA3AF;">Stability Score:</span>
-                        <span style="font-weight: 600; color: {'#10B981' if stability > 0.7 else '#F59E0B'};"> {stability:.1%}</span>
-                    </div>
-                </div>
-            </div>
-            """, unsafe_allow_html=True)
-    
-    with tabs[3]:
-        # Feature importance
-        st.markdown("#### Feature Importance Ranking")
-        
-        # Calculate multiple importance metrics
-        importance_data = []
-        for feature in st.session_state.selected_features:
-            # Correlation
-            corr = abs(df[target].corr(df[feature]))
-            
-            # Mutual information (simplified)
-            from sklearn.feature_selection import mutual_info_regression
-            mi = mutual_info_regression(
-                df[[feature]].fillna(0),
-                df[target].fillna(0),
-                random_state=42
-            )[0]
-            
-            # Variance
-            variance = df[feature].var()
-            
-            importance_data.append({
-                'Feature': feature,
-                'Correlation': corr,
-                'Mutual Info': mi,
-                'Variance': variance,
-                'Combined Score': (corr * 0.5 + mi * 0.3 + min(variance, 1) * 0.2)
-            })
-        
-        importance_df = pd.DataFrame(importance_data)
-        importance_df = importance_df.sort_values('Combined Score', ascending=False)
-        
-        # Display as bar chart
-        fig = px.bar(
-            importance_df.head(15),
-            x='Combined Score',
-            y='Feature',
-            orientation='h',
-            color='Combined Score',
-            color_continuous_scale='Viridis',
-            title='Feature Importance Ranking'
-        )
-        
-        fig.update_layout(
-            template="plotly_dark",
-            paper_bgcolor='rgba(0,0,0,0)',
-            plot_bgcolor='rgba(0,0,0,0)',
-            height=500,
-            showlegend=False
-        )
-        
-        st.plotly_chart(fig, use_container_width=True)
-        
-        # Top features summary
-        st.markdown("#### 🏆 Top 5 Most Important Features")
-        
-        for idx, row in importance_df.head(5).iterrows():
-            st.markdown(f"""
-            <div style="
-                background: linear-gradient(90deg, rgba(99, 102, 241, 0.2), transparent);
-                padding: 10px;
-                margin: 5px 0;
-                border-radius: 10px;
-                border-left: 3px solid #6366F1;
-            ">
-                <strong>{row['Feature']}</strong>
-                <div style="display: flex; gap: 20px; margin-top: 5px; font-size: 12px; color: #9CA3AF;">
-                    <span>Corr: {row['Correlation']:.3f}</span>
-                    <span>MI: {row['Mutual Info']:.3f}</span>
-                    <span>Score: {row['Combined Score']:.3f}</span>
-                </div>
-            </div>
-            """, unsafe_allow_html=True)
-
-# Export results
-if st.session_state.correlation_data is not None:
-    st.markdown("---")
-    col1, col2, col3 = st.columns(3)
-    
-    with col1:
-        if st.button("📊 Export Correlation Matrix"):
-            corr_matrix = df[st.session_state.selected_features].corr()
-            csv = corr_matrix.to_csv()
-            st.download_button(
-                label="Download CSV",
-                data=csv,
-                file_name="correlation_matrix.csv",
-                mime="text/csv"
-            )
-    
-    with col2:
-        if st.button("📈 Generate Report"):
-            st.info("Report generation feature coming soon!")
-    
-    with col3:
-        if st.button("🔄 Reset Analysis"):
-            st.session_state.selected_features = []
-            st.session_state.correlation_data = None
-            st.rerun()
+            if export_format == 'CSV':
+                csv = state['panel_monthly'].to_csv().encode('utf-8')
+                st.download_button("📥 Monthly CSV", csv, "monthly.csv", "text/csv", use_container_width=True)
+                if state['panel_quarterly'] is not None:
+                    csv_q = state['panel_quarterly'].to_csv().encode('utf-8')
+                    st.download_button("📥 Quarterly CSV", csv_q, "quarterly.csv", "text/csv", use_container_width=True)
+            else:
+                excel = export_to_excel(state['panel_monthly'], state['panel_quarterly'], state['y_monthly'], config)
+                st.download_button("📥 Excel", excel, "panel.xlsx", use_container_width=True)
