@@ -1,36 +1,988 @@
 """
-🧱 Data Aggregation Pro v3.0 (ADVANCED)
-================================
-Professional multi-source data intake & panel builder for unemployment nowcasting.
+📊 Data Aggregation Pro MAX v4.0
+===================================
+Professional multi-format data intake & panel builder for Italian unemployment nowcasting.
+Optimized for ISTAT, Eurostat, and custom data sources.
 
 Features:
-- Multi-target support (total, male, female, youth unemployment, etc.)
-- Direct monthly indicators (no aggregation needed)
-- Quarterly data with interpolation/forward-fill
-- Daily data aggregation
-- Google Trends integration
-- Smart merging and alignment
+✅ Excel Support (.xlsx, .xls, .xlsm, .xlsb) + CSV
+✅ AI-Powered Auto-Detection (columns, frequency, data type)
+✅ ISTAT Italia Optimization (regions, categories, formats)
+✅ Smart Preprocessing (outliers, missing data, seasonality)
+✅ Multi-target & Multi-frequency (daily, weekly, monthly, quarterly)
+✅ Interactive UI with drag-and-drop mapping
+✅ Professional visualizations
 
-Author: AI Assistant
+Author: AI Assistant for ISTAT Nowcasting Lab
 Date: October 2025
-Version: 3.0 - Multi-target and quarterly data support
+Version: 4.0.0 - Complete Rewrite
 """
 
 import streamlit as st
 import pandas as pd
 import numpy as np
-import plotly.express as px
 import plotly.graph_objects as go
+import plotly.express as px
 from plotly.subplots import make_subplots
+
 from datetime import datetime, timedelta
 from pathlib import Path
-import json
 from io import BytesIO
-from typing import Optional, List, Dict, Tuple
+import json
+import re
 import traceback
+from typing import Optional, List, Dict, Tuple, Any, Union
+from dataclasses import dataclass, field
+import warnings
+warnings.filterwarnings('ignore')
+
+# Excel libraries
+try:
+    import openpyxl
+    HAS_OPENPYXL = True
+except:
+    HAS_OPENPYXL = False
+
+try:
+    import xlrd
+    HAS_XLRD = True
+except:
+    HAS_XLRD = False
+
+# Optional advanced features
+try:
+    from scipy import stats
+    HAS_SCIPY = True
+except:
+    HAS_SCIPY = False
+
+try:
+    from sklearn.impute import KNNImputer, SimpleImputer
+    from sklearn.preprocessing import StandardScaler
+    HAS_SKLEARN = True
+except:
+    HAS_SKLEARN = False
+
 
 # =============================================================================
-# STATE MANAGEMENT
+# 🎯 CONFIGURATION & CONSTANTS
+# =============================================================================
+
+@dataclass
+class DataConfig:
+    """Configuration for data processing"""
+    # File settings
+    max_file_size_mb: int = 200
+    supported_formats: List[str] = field(default_factory=lambda: [
+        '.csv', '.xlsx', '.xls', '.xlsm', '.xlsb', '.ods'
+    ])
+    encoding_attempts: List[str] = field(default_factory=lambda: [
+        'utf-8', 'latin-1', 'cp1252', 'iso-8859-1', 'utf-16'
+    ])
+    
+    # Data validation
+    min_observations: int = 12
+    max_missing_pct: float = 0.5
+    min_coverage: float = 0.3
+    
+    # Processing
+    outlier_std_threshold: float = 3.5
+    correlation_threshold: float = 0.95
+    constant_threshold: float = 1e-12
+
+
+# Italian regions (20 regioni)
+ITALIAN_REGIONS = {
+    'piemonte': 'Piemonte',
+    'valle_aosta': "Valle d'Aosta",
+    'lombardia': 'Lombardia',
+    'trentino': 'Trentino-Alto Adige',
+    'veneto': 'Veneto',
+    'friuli': 'Friuli-Venezia Giulia',
+    'liguria': 'Liguria',
+    'emilia': 'Emilia-Romagna',
+    'toscana': 'Toscana',
+    'umbria': 'Umbria',
+    'marche': 'Marche',
+    'lazio': 'Lazio',
+    'abruzzo': 'Abruzzo',
+    'molise': 'Molise',
+    'campania': 'Campania',
+    'puglia': 'Puglia',
+    'basilicata': 'Basilicata',
+    'calabria': 'Calabria',
+    'sicilia': 'Sicilia',
+    'sardegna': 'Sardegna'
+}
+
+# Unemployment categories with multilingual support
+UNEMPLOYMENT_KEYWORDS = {
+    'total': ['total', 'totale', 'unemployment', 'disoccupazione', 'tasso'],
+    'male': ['male', 'uomini', 'maschi', 'men', 'masculino'],
+    'female': ['female', 'donne', 'femmine', 'women', 'femenino'],
+    'youth': ['youth', 'giovani', 'young', '15-24', '<25'],
+    'adult': ['adult', 'adulti', '25+', '25-64'],
+    'long_term': ['long', 'lungo', 'structural', 'strutturale', '>12'],
+    'educated': ['education', 'istruzione', 'tertiary', 'terziaria', 'laurea'],
+    'rate': ['rate', 'tasso', 'percentage', 'percentuale', '%']
+}
+
+# Date patterns
+DATE_PATTERNS = {
+    'italian': r'(\d{1,2})[/-](\d{1,2})[/-](\d{4})',  # 31/12/2023
+    'iso': r'(\d{4})[/-](\d{1,2})[/-](\d{1,2})',      # 2023-12-31
+    'year_month': r'(\d{4})[/-](\d{1,2})',            # 2023-12
+    'quarter': r'(\d{4})[Qq]([1-4])',                 # 2023Q4
+    'month_year': r'(\w+)\s+(\d{4})',                 # December 2023
+}
+
+# Known ISTAT/Eurostat column names
+ISTAT_COLUMNS = {
+    'date': ['time', 'periodo', 'periodo_riferimento', 'data', 'anno', 'mese', 'trimestre'],
+    'value': ['valore', 'value', 'obs_value', 'dato'],
+    'geo': ['geo', 'territorio', 'regione', 'area'],
+    'category': ['categoria', 'tipologia', 'tipo', 'classification']
+}
+
+
+# =============================================================================
+# 🛠️ CORE UTILITY FUNCTIONS
+# =============================================================================
+
+class ColorLogger:
+    """Beautiful console logging for Streamlit"""
+    
+    @staticmethod
+    def info(msg: str):
+        st.markdown(f"ℹ️ {msg}")
+    
+    @staticmethod
+    def success(msg: str):
+        st.success(f"✅ {msg}")
+    
+    @staticmethod
+    def warning(msg: str):
+        st.warning(f"⚠️ {msg}")
+    
+    @staticmethod
+    def error(msg: str):
+        st.error(f"❌ {msg}")
+    
+    @staticmethod
+    def debug(msg: str):
+        with st.expander("🐛 Debug Info", expanded=False):
+            st.code(msg)
+
+
+def slugify(text: str) -> str:
+    """Convert text to clean identifier"""
+    text = str(text).lower().strip()
+    
+    # Italian character replacements
+    replacements = {
+        'à': 'a', 'è': 'e', 'é': 'e', 'ì': 'i', 'ò': 'o', 'ù': 'u',
+        'â': 'a', 'ê': 'e', 'î': 'i', 'ô': 'o', 'û': 'u',
+        'ä': 'a', 'ë': 'e', 'ï': 'i', 'ö': 'o', 'ü': 'u',
+        'ñ': 'n', 'ç': 'c'
+    }
+    
+    for old, new in replacements.items():
+        text = text.replace(old, new)
+    
+    # Clean special characters
+    text = re.sub(r'[^\w\s-]', '_', text)
+    text = re.sub(r'[-\s]+', '_', text)
+    text = re.sub(r'_+', '_', text)
+    
+    return text.strip('_')
+
+
+def calculate_file_hash(file_content: bytes) -> str:
+    """Calculate file hash for caching"""
+    import hashlib
+    return hashlib.md5(file_content).hexdigest()
+
+
+def format_bytes(size: int) -> str:
+    """Format bytes to human readable"""
+    for unit in ['B', 'KB', 'MB', 'GB']:
+        if size < 1024.0:
+            return f"{size:.2f} {unit}"
+        size /= 1024.0
+    return f"{size:.2f} TB"
+
+
+def detect_decimal_separator(series: pd.Series) -> str:
+    """Detect if comma or dot is decimal separator"""
+    sample = series.dropna().astype(str).head(100)
+    
+    comma_count = sum(',' in x and '.' not in x for x in sample)
+    dot_count = sum('.' in x and ',' not in x for x in sample)
+    
+    if comma_count > dot_count:
+        return ','
+    return '.'
+
+
+def italian_to_numeric(value: Any) -> float:
+    """Convert Italian number format to float"""
+    if pd.isna(value):
+        return np.nan
+    
+    value = str(value).strip()
+    
+    # Remove currency symbols
+    value = value.replace('€', '').replace('EUR', '').strip()
+    
+    # Italian format: 1.234.567,89 -> 1234567.89
+    if ',' in value and '.' in value:
+        value = value.replace('.', '').replace(',', '.')
+    elif ',' in value:
+        value = value.replace(',', '.')
+    
+    try:
+        return float(value)
+    except:
+        return np.nan
+
+
+# =============================================================================
+# 📊 EXCEL PROCESSING ENGINE
+# =============================================================================
+
+class ExcelProcessor:
+    """Advanced Excel file processor"""
+    
+    def __init__(self, config: DataConfig):
+        self.config = config
+        self.logger = ColorLogger()
+    
+    def read_excel_file(self, file) -> Dict[str, pd.DataFrame]:
+        """
+        Read Excel file and return all sheets
+        
+        Returns:
+            Dict of {sheet_name: DataFrame}
+        """
+        file_name = file.name if hasattr(file, 'name') else 'uploaded_file'
+        file_ext = Path(file_name).suffix.lower()
+        
+        self.logger.info(f"Reading Excel file: **{file_name}** ({file_ext})")
+        
+        # Check size
+        if hasattr(file, 'size'):
+            size_mb = file.size / (1024 * 1024)
+            if size_mb > self.config.max_file_size_mb:
+                self.logger.error(
+                    f"File too large: {size_mb:.1f}MB (max: {self.config.max_file_size_mb}MB)"
+                )
+                return {}
+        
+        sheets = {}
+        
+        try:
+            # Reset file pointer
+            file.seek(0)
+            
+            # Try different engines
+            engines = []
+            if file_ext in ['.xlsx', '.xlsm']:
+                engines = ['openpyxl', 'xlrd', None]
+            elif file_ext == '.xls':
+                engines = ['xlrd', None]
+            elif file_ext == '.xlsb':
+                engines = ['pyxlsb', None]
+            else:
+                engines = [None]
+            
+            last_error = None
+            
+            for engine in engines:
+                try:
+                    file.seek(0)
+                    
+                    # Get all sheet names
+                    excel_file = pd.ExcelFile(file, engine=engine)
+                    sheet_names = excel_file.sheet_names
+                    
+                    self.logger.success(
+                        f"Found {len(sheet_names)} sheets: {', '.join(sheet_names)}"
+                    )
+                    
+                    # Read all sheets
+                    for sheet_name in sheet_names:
+                        try:
+                            df = pd.read_excel(
+                                excel_file,
+                                sheet_name=sheet_name,
+                                header=None  # We'll detect header ourselves
+                            )
+                            
+                            if not df.empty:
+                                sheets[sheet_name] = df
+                                self.logger.info(
+                                    f"  📄 {sheet_name}: {df.shape[0]} × {df.shape[1]}"
+                                )
+                        
+                        except Exception as e:
+                            self.logger.warning(f"  ⚠️ Could not read sheet '{sheet_name}': {str(e)}")
+                            continue
+                    
+                    if sheets:
+                        break
+                
+                except Exception as e:
+                    last_error = e
+                    continue
+            
+            if not sheets:
+                if last_error:
+                    raise last_error
+                else:
+                    raise ValueError("No sheets could be read")
+        
+        except Exception as e:
+            self.logger.error(f"Error reading Excel: {type(e).__name__}")
+            self.logger.error(str(e))
+            
+            with st.expander("🐛 Full Error Traceback", expanded=False):
+                st.code(traceback.format_exc())
+            
+            return {}
+        
+        return sheets
+    
+    def detect_header_row(self, df: pd.DataFrame) -> int:
+        """
+        Detect which row contains the header
+        
+        Returns:
+            Row index (0-based)
+        """
+        if df.empty:
+            return 0
+        
+        max_rows_to_check = min(10, len(df))
+        
+        best_row = 0
+        best_score = 0
+        
+        for i in range(max_rows_to_check):
+            row = df.iloc[i]
+            
+            score = 0
+            
+            # Count non-null values
+            score += row.notna().sum()
+            
+            # Check for text (good for headers)
+            text_count = sum(isinstance(x, str) for x in row)
+            score += text_count * 2
+            
+            # Check for known keywords
+            row_str = ' '.join(str(x).lower() for x in row if pd.notna(x))
+            
+            for keywords in [ISTAT_COLUMNS['date'], UNEMPLOYMENT_KEYWORDS['total']]:
+                if any(kw in row_str for kw in keywords):
+                    score += 5
+            
+            # Penalize if mostly numbers (probably data, not header)
+            numeric_count = sum(isinstance(x, (int, float)) for x in row)
+            if numeric_count > len(row) * 0.7:
+                score -= 10
+            
+            if score > best_score:
+                best_score = score
+                best_row = i
+        
+        return best_row
+    
+    def process_sheet(self, df: pd.DataFrame, sheet_name: str) -> pd.DataFrame:
+        """
+        Process a single sheet
+        
+        Steps:
+        1. Detect and set header
+        2. Remove empty rows/columns
+        3. Clean column names
+        4. Basic type inference
+        """
+        self.logger.info(f"Processing sheet: **{sheet_name}**")
+        
+        # Step 1: Detect header
+        header_row = self.detect_header_row(df)
+        
+        if header_row > 0:
+            self.logger.info(f"  🔍 Header detected at row {header_row + 1}")
+            df = df.iloc[header_row:].reset_index(drop=True)
+        
+        # Set first row as header
+        df.columns = df.iloc[0]
+        df = df.iloc[1:].reset_index(drop=True)
+        
+        # Step 2: Remove empty rows/columns
+        df = df.dropna(how='all', axis=0)
+        df = df.dropna(how='all', axis=1)
+        
+        # Step 3: Clean column names
+        df.columns = [
+            slugify(str(col)) if pd.notna(col) else f'col_{i}'
+            for i, col in enumerate(df.columns)
+        ]
+        
+        # Remove duplicate column names
+        cols = df.columns.tolist()
+        seen = {}
+        for i, col in enumerate(cols):
+            if col in seen:
+                seen[col] += 1
+                cols[i] = f"{col}_{seen[col]}"
+            else:
+                seen[col] = 0
+        df.columns = cols
+        
+        self.logger.success(f"  ✅ Processed: {len(df)} rows × {len(df.columns)} columns")
+        
+        return df
+
+
+# =============================================================================
+# 🤖 AI-POWERED AUTO-DETECTION
+# =============================================================================
+
+class DataDetector:
+    """Intelligent data type and structure detector"""
+    
+    def __init__(self):
+        self.logger = ColorLogger()
+    
+    def detect_date_column(self, df: pd.DataFrame) -> Optional[str]:
+        """
+        Detect date column with high confidence
+        
+        Returns:
+            Column name or None
+        """
+        candidates = []
+        
+        for col in df.columns:
+            score = 0
+            col_lower = str(col).lower()
+            
+            # Check column name
+            date_keywords = ['date', 'data', 'time', 'periodo', 'anno', 'mese', 
+                           'year', 'month', 'quarter', 'trimestre', 'settimana']
+            
+            if any(kw in col_lower for kw in date_keywords):
+                score += 10
+            
+            # Check if ISTAT known column
+            if any(kw == col_lower for kw in ISTAT_COLUMNS['date']):
+                score += 20
+            
+            # Check data type
+            if pd.api.types.is_datetime64_any_dtype(df[col]):
+                score += 30
+            
+            # Try to parse as date
+            try:
+                sample = df[col].dropna().head(20)
+                parsed = pd.to_datetime(sample, errors='coerce')
+                parse_rate = parsed.notna().mean()
+                
+                if parse_rate > 0.8:
+                    score += int(parse_rate * 20)
+            except:
+                pass
+            
+            # Check for date patterns in text
+            try:
+                sample_str = df[col].dropna().astype(str).head(20)
+                pattern_matches = sum(
+                    bool(re.search(pattern, s))
+                    for s in sample_str
+                    for pattern in DATE_PATTERNS.values()
+                )
+                
+                if pattern_matches > 10:
+                    score += 15
+            except:
+                pass
+            
+            if score > 0:
+                candidates.append((col, score))
+        
+        if not candidates:
+            return None
+        
+        # Return highest scoring
+        candidates.sort(key=lambda x: x[1], reverse=True)
+        best_col, best_score = candidates[0]
+        
+        if best_score >= 20:
+            self.logger.success(f"Date column detected: **{best_col}** (confidence: {best_score})")
+            return best_col
+        
+        self.logger.warning(f"Uncertain date column: {best_col} (confidence: {best_score})")
+        return best_col
+    
+    def detect_unemployment_columns(self, df: pd.DataFrame) -> Dict[str, str]:
+        """
+        Detect unemployment-related columns
+        
+        Returns:
+            Dict of {category: column_name}
+        """
+        unemployment_cols = {}
+        
+        for col in df.columns:
+            col_lower = str(col).lower()
+            
+            # Check each category
+            for category, keywords in UNEMPLOYMENT_KEYWORDS.items():
+                if any(kw in col_lower for kw in keywords):
+                    
+                    # Also check if column contains numeric data
+                    try:
+                        numeric_rate = pd.to_numeric(df[col], errors='coerce').notna().mean()
+                        
+                        if numeric_rate > 0.5:
+                            unemployment_cols[category] = col
+                            self.logger.info(f"  📊 {category}: **{col}**")
+                    except:
+                        pass
+        
+        if unemployment_cols:
+            self.logger.success(f"Detected {len(unemployment_cols)} unemployment categories")
+        
+        return unemployment_cols
+    
+    def detect_regional_data(self, df: pd.DataFrame) -> Optional[str]:
+        """
+        Detect if data contains Italian regional breakdown
+        
+        Returns:
+            Region column name or None
+        """
+        for col in df.columns:
+            col_lower = str(col).lower()
+            
+            # Check column name
+            if any(kw in col_lower for kw in ['geo', 'region', 'territorio', 'area']):
+                
+                # Check if contains Italian regions
+                try:
+                    values = df[col].dropna().astype(str).str.lower()
+                    region_matches = sum(
+                        any(region in v for region in ITALIAN_REGIONS.keys())
+                        for v in values.head(50)
+                    )
+                    
+                    if region_matches > 5:
+                        self.logger.success(f"Regional data detected: **{col}**")
+                        return col
+                except:
+                    pass
+        
+        return None
+    
+    def detect_frequency(self, dates: pd.Series) -> str:
+        """
+        Detect time series frequency
+        
+        Returns:
+            'daily', 'weekly', 'monthly', 'quarterly', 'annual', or 'unknown'
+        """
+        if len(dates) < 2:
+            return 'unknown'
+        
+        dates = pd.to_datetime(dates, errors='coerce').dropna().sort_values()
+        
+        if len(dates) < 2:
+            return 'unknown'
+        
+        # Calculate differences
+        diffs = dates.diff().dt.days.dropna()
+        
+        if len(diffs) == 0:
+            return 'unknown'
+        
+        median_diff = diffs.median()
+        mode_diff = diffs.mode()[0] if len(diffs.mode()) > 0 else median_diff
+        
+        # Classify
+        if mode_diff <= 1:
+            freq = 'daily'
+        elif 5 <= mode_diff <= 9:
+            freq = 'weekly'
+        elif 28 <= mode_diff <= 31:
+            freq = 'monthly'
+        elif 85 <= mode_diff <= 95:
+            freq = 'quarterly'
+        elif 360 <= mode_diff <= 370:
+            freq = 'annual'
+        else:
+            freq = 'unknown'
+        
+        self.logger.info(f"Frequency detected: **{freq}** (median: {median_diff:.0f} days)")
+        
+        return freq
+    
+    def detect_istat_format(self, df: pd.DataFrame) -> Dict[str, Any]:
+        """
+        Detect if this is ISTAT formatted data
+        
+        Returns:
+            Dict with format info
+        """
+        format_info = {
+            'is_istat': False,
+            'format_type': 'unknown',
+            'columns_found': {}
+        }
+        
+        # Check for ISTAT column patterns
+        for col_type, keywords in ISTAT_COLUMNS.items():
+            for col in df.columns:
+                if str(col).lower() in keywords:
+                    format_info['columns_found'][col_type] = col
+        
+        # If found 3+ ISTAT columns, likely ISTAT format
+        if len(format_info['columns_found']) >= 3:
+            format_info['is_istat'] = True
+            format_info['format_type'] = 'istat_standard'
+            
+            self.logger.success("✅ ISTAT format detected!")
+            self.logger.info(f"  Found columns: {format_info['columns_found']}")
+        
+        return format_info
+
+
+# =============================================================================
+# 🔄 DATA TRANSFORMATION ENGINE
+# =============================================================================
+
+class DataTransformer:
+    """Transform and clean data"""
+    
+    def __init__(self, config: DataConfig):
+        self.config = config
+        self.logger = ColorLogger()
+    
+    def parse_dates(self, series: pd.Series, freq_hint: str = None) -> pd.Series:
+        """
+        Intelligent date parsing
+        
+        Args:
+            series: Date column
+            freq_hint: 'monthly', 'quarterly', etc.
+        """
+        self.logger.info("Parsing dates...")
+        
+        # Try standard pandas parsing first
+        try:
+            parsed = pd.to_datetime(series, errors='coerce')
+            
+            if parsed.notna().mean() > 0.8:
+                parsed = parsed.dt.tz_localize(None).dt.normalize()
+                self.logger.success(f"  ✅ {parsed.notna().sum()}/{len(parsed)} dates parsed")
+                return parsed
+        except:
+            pass
+        
+        # Try custom patterns
+        parsed = pd.Series(index=series.index, dtype='datetime64[ns]')
+        
+        for pattern_name, pattern in DATE_PATTERNS.items():
+            for i, value in series.items():
+                if pd.notna(parsed[i]):
+                    continue
+                
+                try:
+                    match = re.search(pattern, str(value))
+                    
+                    if match:
+                        if pattern_name == 'italian':
+                            day, month, year = match.groups()
+                            parsed[i] = pd.Timestamp(f"{year}-{month}-{day}")
+                        
+                        elif pattern_name == 'iso':
+                            year, month, day = match.groups()
+                            parsed[i] = pd.Timestamp(f"{year}-{month}-{day}")
+                        
+                        elif pattern_name == 'year_month':
+                            year, month = match.groups()
+                            parsed[i] = pd.Timestamp(f"{year}-{month}-01")
+                        
+                        elif pattern_name == 'quarter':
+                            year, quarter = match.groups()
+                            month = int(quarter) * 3
+                            parsed[i] = pd.Timestamp(f"{year}-{month:02d}-01")
+                
+                except:
+                    continue
+        
+        parsed = parsed.dt.tz_localize(None).dt.normalize()
+        
+        # Align to end of month/quarter if needed
+        if freq_hint == 'monthly':
+            parsed = parsed + pd.offsets.MonthEnd(0)
+        elif freq_hint == 'quarterly':
+            parsed = parsed + pd.offsets.QuarterEnd(0)
+        
+        success_rate = parsed.notna().mean()
+        self.logger.info(f"  📅 Parse rate: {success_rate:.1%}")
+        
+        return parsed
+    
+    def convert_to_numeric(self, series: pd.Series, handle_italian: bool = True) -> pd.Series:
+        """
+        Convert to numeric, handling Italian formats
+        """
+        if handle_italian:
+            converted = series.apply(italian_to_numeric)
+        else:
+            converted = pd.to_numeric(series, errors='coerce')
+        
+        return converted
+    
+    def remove_outliers(self, series: pd.Series, method: str = 'mad') -> pd.Series:
+        """
+        Remove or cap outliers
+        
+        Args:
+            method: 'mad' (Median Absolute Deviation) or 'iqr'
+        """
+        if not HAS_SCIPY:
+            return series
+        
+        values = series.dropna()
+        
+        if len(values) < 10:
+            return series
+        
+        if method == 'mad':
+            median = values.median()
+            mad = np.median(np.abs(values - median))
+            
+            if mad == 0:
+                return series
+            
+            z_scores = 0.6745 * (values - median) / mad
+            outliers = np.abs(z_scores) > self.config.outlier_std_threshold
+        
+        else:  # IQR
+            q1 = values.quantile(0.25)
+            q3 = values.quantile(0.75)
+            iqr = q3 - q1
+            
+            lower = q1 - 1.5 * iqr
+            upper = q3 + 1.5 * iqr
+            
+            outliers = (values < lower) | (values > upper)
+        
+        outlier_count = outliers.sum()
+        
+        if outlier_count > 0:
+            self.logger.info(f"  🔍 {outlier_count} outliers detected")
+            
+            # Replace outliers with NaN
+            cleaned = series.copy()
+            cleaned.loc[outliers[outliers].index] = np.nan
+            
+            return cleaned
+        
+        return series
+    
+    def impute_missing(self, df: pd.DataFrame, method: str = 'interpolate') -> pd.DataFrame:
+        """
+        Impute missing values
+        
+        Args:
+            method: 'interpolate', 'ffill', 'knn'
+        """
+        missing_pct = df.isna().sum().sum() / df.size
+        
+        if missing_pct == 0:
+            return df
+        
+        self.logger.info(f"Imputing missing values ({missing_pct:.1%})...")
+        
+        if method == 'interpolate':
+            df = df.interpolate(method='linear', limit_direction='both')
+        
+        elif method == 'ffill':
+            df = df.fillna(method='ffill').fillna(method='bfill')
+        
+        elif method == 'knn' and HAS_SKLEARN:
+            imputer = KNNImputer(n_neighbors=5)
+            df_imputed = imputer.fit_transform(df.select_dtypes(include=[np.number]))
+            df.loc[:, df.select_dtypes(include=[np.number]).columns] = df_imputed
+        
+        self.logger.success(f"  ✅ Imputed")
+        
+        return df
+
+
+# =============================================================================
+# 📊 VISUALIZATION ENGINE
+# =============================================================================
+
+class DataVisualizer:
+    """Create professional visualizations"""
+    
+    @staticmethod
+    def plot_time_series(df: pd.DataFrame, date_col: str, value_cols: List[str], 
+                        title: str = "Time Series") -> go.Figure:
+        """Plot multiple time series"""
+        
+        fig = go.Figure()
+        
+        colors = px.colors.qualitative.Set2
+        
+        for i, col in enumerate(value_cols):
+            fig.add_trace(go.Scatter(
+                x=df[date_col],
+                y=df[col],
+                mode='lines+markers',
+                name=col,
+                line=dict(width=2, color=colors[i % len(colors)]),
+                marker=dict(size=4),
+                hovertemplate=f'<b>{col}</b><br>%{{x}}<br>%{{y:.2f}}<extra></extra>'
+            ))
+        
+        fig.update_layout(
+            title=title,
+            xaxis_title='Date',
+            yaxis_title='Value',
+            template='plotly_white',
+            height=500,
+            hovermode='x unified',
+            legend=dict(
+                orientation='v',
+                yanchor='top',
+                y=1,
+                xanchor='left',
+                x=1.02
+            )
+        )
+        
+        return fig
+    
+    @staticmethod
+    def plot_coverage_heatmap(df: pd.DataFrame, max_cols: int = 50) -> go.Figure:
+        """Plot data coverage heatmap"""
+        
+        # Limit columns
+        if len(df.columns) > max_cols:
+            df = df.iloc[:, :max_cols]
+        
+        presence = df.notna().astype(int).T
+        
+        fig = px.imshow(
+            presence,
+            aspect='auto',
+            color_continuous_scale=['#EF4444', '#10B981'],
+            labels={'color': 'Present'},
+            title=f'Data Coverage ({len(df)} rows × {len(df.columns)} columns)'
+        )
+        
+        fig.update_layout(
+            height=max(400, len(df.columns) * 15),
+            template='plotly_white',
+            xaxis_title='Row Index',
+            yaxis_title='Column'
+        )
+        
+        return fig
+    
+    @staticmethod
+    def plot_regional_map(df: pd.DataFrame, region_col: str, value_col: str) -> go.Figure:
+        """Plot Italian regional data on map"""
+        
+        # This would need geojson data for Italian regions
+        # Placeholder implementation
+        
+        fig = go.Figure(data=go.Bar(
+            x=df[region_col],
+            y=df[value_col],
+            marker=dict(
+                color=df[value_col],
+                colorscale='RdYlGn_r',
+                showscale=True
+            )
+        ))
+        
+        fig.update_layout(
+            title='Regional Unemployment',
+            xaxis_title='Region',
+            yaxis_title='Unemployment Rate (%)',
+            template='plotly_white',
+            height=500
+        )
+        
+        return fig
+    
+    @staticmethod
+    def plot_data_quality(df: pd.DataFrame) -> go.Figure:
+        """Plot data quality metrics"""
+        
+        metrics = {
+            'Column': [],
+            'Coverage': [],
+            'Missing': [],
+            'Unique': []
+        }
+        
+        for col in df.columns:
+            metrics['Column'].append(col)
+            metrics['Coverage'].append(df[col].notna().mean())
+            metrics['Missing'].append(df[col].isna().sum())
+            
+            try:
+                metrics['Unique'].append(df[col].nunique())
+            except:
+                metrics['Unique'].append(0)
+        
+        metrics_df = pd.DataFrame(metrics)
+        
+        fig = make_subplots(
+            rows=1, cols=2,
+            subplot_titles=('Coverage %', 'Missing Count'),
+            specs=[[{"type": "bar"}, {"type": "bar"}]]
+        )
+        
+        fig.add_trace(
+            go.Bar(
+                x=metrics_df['Column'],
+                y=metrics_df['Coverage'] * 100,
+                name='Coverage',
+                marker_color='#10B981'
+            ),
+            row=1, col=1
+        )
+        
+        fig.add_trace(
+            go.Bar(
+                x=metrics_df['Column'],
+                y=metrics_df['Missing'],
+                name='Missing',
+                marker_color='#EF4444'
+            ),
+            row=1, col=2
+        )
+        
+        fig.update_layout(
+            height=400,
+            template='plotly_white',
+            showlegend=False
+        )
+        
+        return fig
+
+
+# =============================================================================
+# 🎯 STATE MANAGEMENT (Compatible with existing code)
 # =============================================================================
 
 try:
@@ -38,22 +990,22 @@ try:
 except Exception:
     class _State:
         def __init__(self):
-            # Targets (can have multiple)
-            self.y_monthly: Optional[pd.Series] = None  # Primary target
-            self.targets_monthly: Optional[pd.DataFrame] = None  # All targets
+            # Targets
+            self.y_monthly: Optional[pd.Series] = None
+            self.targets_monthly: Optional[pd.DataFrame] = None
             
             # Panels
             self.panel_monthly: Optional[pd.DataFrame] = None
             self.panel_quarterly: Optional[pd.DataFrame] = None
             
-            # Raw data sources
+            # Raw sources
             self.raw_daily: List[pd.DataFrame] = []
-            self.raw_monthly: List[pd.DataFrame] = []  # Direct monthly data
-            self.raw_quarterly: List[pd.DataFrame] = []  # Quarterly data
+            self.raw_monthly: List[pd.DataFrame] = []
+            self.raw_quarterly: List[pd.DataFrame] = []
             self.google_trends: Optional[pd.DataFrame] = None
             
-            # Original backup
-            self._panel_monthly_orig: Optional[pd.DataFrame] = None
+            # Metadata
+            self.data_metadata: Dict[str, Any] = {}
     
     class AppState:
         @staticmethod
@@ -68,1443 +1020,450 @@ except Exception:
 
 state = AppState.init()
 
-# =============================================================================
-# CONFIGURATION
-# =============================================================================
-
-# Validation thresholds
-MIN_OBSERVATIONS = 12
-RECOMMENDED_OBSERVATIONS = 24
-MAX_FILE_SIZE_MB = 100
-
-# Quarterly interpolation methods
-QUARTERLY_METHODS = {
-    'forward_fill': 'Forward Fill (repeat quarterly value for 3 months)',
-    'linear': 'Linear Interpolation (smooth transition)',
-    'cubic': 'Cubic Spline (smooth curve)',
-}
-
-# Common unemployment categories
-UNEMPLOYMENT_CATEGORIES = {
-    'total': 'Total Unemployment Rate',
-    'male': 'Male Unemployment Rate',
-    'female': 'Female Unemployment Rate',
-    'youth': 'Youth Unemployment (15-24)',
-    'adult': 'Adult Unemployment (25+)',
-    'long_term': 'Long-term Unemployment (>12 months)',
-    'educated': 'Unemployment - Tertiary Education',
-}
 
 # =============================================================================
-# HELPER FUNCTIONS
+# 🎨 MAIN UI - PROFESSIONAL DATA UPLOAD
 # =============================================================================
 
-def to_datetime_safe(series: pd.Series) -> pd.Series:
-    """Convert to datetime and normalize"""
-    return pd.to_datetime(series, errors='coerce').dt.tz_localize(None).dt.normalize()
-
-
-def end_of_month(series: pd.Series) -> pd.Series:
-    """Align dates to end of month"""
-    dt = to_datetime_safe(series)
-    return (dt + pd.offsets.MonthEnd(0)).dt.normalize()
-
-
-def end_of_quarter(series: pd.Series) -> pd.Series:
-    """Align dates to end of quarter"""
-    dt = to_datetime_safe(series)
-    return (dt + pd.offsets.QuarterEnd(0)).dt.normalize()
-
-
-def slugify(name: str) -> str:
-    """Convert name to clean identifier"""
-    return (str(name).strip().lower()
-            .replace(' ', '_')
-            .replace('/', '_')
-            .replace('(', '')
-            .replace(')', '')
-            .replace('-', '_')
-            .replace('%', 'pct')
-            .replace(':', '_')
-            .replace(',', '_')
-            .replace('__', '_')
-            .strip('_'))
-
-
-def detect_date_column(df: pd.DataFrame) -> str:
-    """Smart detection of date column"""
-    common_names = ['date', 'Date', 'DATE', 'ds', 'time', 'Time', 
-                    'period', 'Period', 'Week', 'Month', 'Day', 'Quarter',
-                    'timestamp', 'Timestamp', 'year_month', 'year_quarter']
+def main():
+    """Main application"""
     
-    for name in common_names:
-        if name in df.columns:
-            return name
-    
-    # Check for datetime types
-    for col in df.columns:
-        if pd.api.types.is_datetime64_any_dtype(df[col]):
-            return col
-    
-    # Try first column
-    try:
-        first_col = df.columns[0]
-        pd.to_datetime(df[first_col].dropna().iloc[0])
-        return first_col
-    except:
-        pass
-    
-    return df.columns[0]
-
-
-def detect_frequency(dates: pd.DatetimeIndex) -> str:
-    """
-    Detect frequency of time series
-    
-    Returns: 'daily', 'weekly', 'monthly', 'quarterly', 'annual', or 'unknown'
-    """
-    if len(dates) < 2:
-        return 'unknown'
-    
-    # Calculate differences
-    diffs = dates.to_series().diff().dt.days.dropna()
-    median_diff = diffs.median()
-    
-    if median_diff <= 1:
-        return 'daily'
-    elif 5 <= median_diff <= 9:
-        return 'weekly'
-    elif 28 <= median_diff <= 31:
-        return 'monthly'
-    elif 85 <= median_diff <= 95:
-        return 'quarterly'
-    elif 360 <= median_diff <= 370:
-        return 'annual'
-    else:
-        return 'unknown'
-
-
-def show_dataframe_info(df: pd.DataFrame, title: str = "Data Info"):
-    """Display DataFrame info in expander"""
-    with st.expander(f"🔍 {title}", expanded=False):
-        col1, col2, col3 = st.columns(3)
-        
-        with col1:
-            st.metric("Rows", f"{len(df):,}")
-        with col2:
-            st.metric("Columns", len(df.columns))
-        with col3:
-            memory_mb = df.memory_usage(deep=True).sum() / 1024**2
-            st.metric("Memory", f"{memory_mb:.2f} MB")
-        
-        st.write("**Columns:**", list(df.columns))
-        st.dataframe(df.head(), use_container_width=True)
-
-# =============================================================================
-# DATA LOADING - MULTI-TARGET
-# =============================================================================
-
-def load_multi_target(file) -> Optional[pd.DataFrame]:
-    """
-    Load multiple unemployment targets from CSV
-    
-    Expected format:
-    - First column: date
-    - Other columns: different unemployment rates (total, male, female, youth, etc.)
-    
-    Returns:
-        DataFrame with date index and multiple target columns
-    """
-    file_name = file.name if hasattr(file, 'name') else 'uploaded file'
-    
-    st.write("---")
-    st.markdown("### 🎯 Loading Multi-Target Data")
-    
-    try:
-        # Check file size
-        if hasattr(file, 'size'):
-            size_mb = file.size / 1024**2
-            if size_mb > MAX_FILE_SIZE_MB:
-                st.error(f"❌ File too large: {size_mb:.1f}MB (max: {MAX_FILE_SIZE_MB}MB)")
-                return None
-        
-        # Try multiple encodings
-        df = None
-        for encoding in ['utf-8', 'latin-1', 'cp1252', 'iso-8859-1']:
-            try:
-                file.seek(0)
-                df = pd.read_csv(file, encoding=encoding)
-                if encoding != 'utf-8':
-                    st.info(f"ℹ️ Loaded with {encoding} encoding")
-                break
-            except UnicodeDecodeError:
-                continue
-        
-        if df is None or df.empty:
-            st.error("❌ Could not read file")
-            return None
-        
-        show_dataframe_info(df, f"Original: {file_name}")
-        
-        # Detect date column
-        date_col = detect_date_column(df)
-        value_cols = [c for c in df.columns if c != date_col]
-        
-        if not value_cols:
-            st.error(f"❌ No value columns found (date column: '{date_col}')")
-            return None
-        
-        st.success(f"✅ Detected: date='{date_col}', {len(value_cols)} target columns")
-        
-        # Process
-        df = df[[date_col] + value_cols].copy()
-        df = df.rename(columns={date_col: 'date'})
-        
-        # Convert date
-        st.write("**🔄 Processing dates...**")
-        df['date'] = end_of_month(df['date'])
-        
-        nat_count = df['date'].isna().sum()
-        if nat_count > 0:
-            st.error(f"❌ {nat_count} invalid dates")
-            return None
-        
-        # Convert all value columns to numeric
-        st.write("**🔄 Processing values...**")
-        
-        original_cols = value_cols.copy()
-        valid_cols = []
-        
-        for col in value_cols:
-            df[col] = pd.to_numeric(df[col], errors='coerce')
-            
-            valid_count = df[col].notna().sum()
-            total_count = len(df)
-            
-            if valid_count > 0:
-                valid_cols.append(col)
-                st.write(f"   ✅ `{col}`: {valid_count}/{total_count} valid values")
-            else:
-                st.warning(f"   ⚠️ `{col}`: No valid values (skipped)")
-        
-        if not valid_cols:
-            st.error("❌ No valid target columns")
-            return None
-        
-        # Keep only valid columns
-        df = df[['date'] + valid_cols]
-        
-        # Check duplicates
-        dup_count = df.duplicated(subset=['date']).sum()
-        if dup_count > 0:
-            st.warning(f"⚠️ {dup_count} duplicate dates (keeping last)")
-            df = df.drop_duplicates(subset=['date'], keep='last')
-        
-        # Set index
-        df = df.set_index('date').sort_index()
-        
-        # Statistics
-        st.write("---")
-        st.write("### ✅ Multi-Target Summary")
-        
-        col1, col2, col3, col4 = st.columns(4)
-        
-        with col1:
-            st.metric("📊 Observations", len(df))
-        with col2:
-            st.metric("🎯 Targets", len(df.columns))
-        with col3:
-            st.metric("📅 Start", df.index.min().strftime('%Y-%m'))
-        with col4:
-            st.metric("📅 End", df.index.max().strftime('%Y-%m'))
-        
-        # Show statistics for each target
-        st.write("**Target Statistics:**")
-        
-        stats_df = df.describe().T
-        stats_df['coverage'] = df.notna().mean()
-        
-        st.dataframe(
-            stats_df.style.format({
-                'mean': '{:.2f}',
-                'std': '{:.2f}',
-                'min': '{:.2f}',
-                'max': '{:.2f}',
-                'coverage': '{:.1%}'
-            }),
-            use_container_width=True
-        )
-        
-        # Validation
-        if len(df) < MIN_OBSERVATIONS:
-            st.error(f"❌ Too few observations: {len(df)} (minimum: {MIN_OBSERVATIONS})")
-            return None
-        
-        if len(df) < RECOMMENDED_OBSERVATIONS:
-            st.warning(f"⚠️ Few observations: {len(df)} (recommended: ≥{RECOMMENDED_OBSERVATIONS})")
-        
-        st.success(f"✅ **{len(df.columns)} targets loaded successfully!**")
-        
-        return df
-    
-    except Exception as e:
-        st.error(f"❌ Error loading targets: {type(e).__name__}")
-        st.error(str(e))
-        
-        with st.expander("🐛 Full Traceback", expanded=False):
-            st.code(traceback.format_exc())
-        
-        return None
-
-# =============================================================================
-# DATA LOADING - MONTHLY INDICATORS
-# =============================================================================
-
-def load_monthly_data(file) -> Optional[pd.DataFrame]:
-    """
-    Load direct monthly indicators (no aggregation needed)
-    
-    Examples:
-    - Industrial production
-    - Retail sales
-    - Consumer confidence
-    - PMI indices
-    - Inflation rates
-    
-    Returns:
-        DataFrame with date column and indicators
-    """
-    file_name = file.name if hasattr(file, 'name') else 'uploaded file'
-    
-    try:
-        df = pd.read_csv(file)
-        
-        if df.empty:
-            st.warning(f"⚠️ {file_name}: Empty file")
-            return None
-        
-        # Detect date
-        date_col = detect_date_column(df)
-        df = df.rename(columns={date_col: 'date'})
-        
-        # Convert date
-        df['date'] = end_of_month(df['date'])
-        df = df.dropna(subset=['date'])
-        
-        if df.empty:
-            st.warning(f"⚠️ {file_name}: No valid dates")
-            return None
-        
-        # Get numeric columns
-        numeric_cols = []
-        for col in df.columns:
-            if col == 'date':
-                continue
-            
-            df[col] = pd.to_numeric(df[col], errors='coerce')
-            
-            if df[col].notna().sum() > 0:
-                numeric_cols.append(col)
-        
-        if not numeric_cols:
-            st.warning(f"⚠️ {file_name}: No valid numeric columns")
-            return None
-        
-        # Keep only date and numeric
-        df = df[['date'] + numeric_cols].sort_values('date')
-        
-        # Rename with prefix
-        file_prefix = slugify(Path(file_name).stem)
-        rename_map = {col: f"monthly_{file_prefix}__{slugify(col)}" for col in numeric_cols}
-        df = df.rename(columns=rename_map)
-        
-        st.success(f"✅ {file_name}: {len(df)} months, {len(numeric_cols)} indicators")
-        
-        return df
-    
-    except Exception as e:
-        st.error(f"❌ Error loading {file_name}: {str(e)}")
-        return None
-
-# =============================================================================
-# DATA LOADING - QUARTERLY
-# =============================================================================
-
-def load_quarterly_data(file) -> Optional[pd.DataFrame]:
-    """
-    Load quarterly data (will be interpolated to monthly)
-    
-    Examples:
-    - GDP and components
-    - Quarterly labor force survey
-    - Government fiscal data
-    
-    Returns:
-        DataFrame with quarter-end dates
-    """
-    file_name = file.name if hasattr(file, 'name') else 'uploaded file'
-    
-    try:
-        df = pd.read_csv(file)
-        
-        if df.empty:
-            st.warning(f"⚠️ {file_name}: Empty file")
-            return None
-        
-        # Detect date
-        date_col = detect_date_column(df)
-        df = df.rename(columns={date_col: 'date'})
-        
-        # Try to detect if already quarterly
-        df['date'] = to_datetime_safe(df['date'])
-        
-        # Check frequency
-        freq = detect_frequency(df['date'].dropna())
-        
-        if freq == 'monthly':
-            st.warning(f"⚠️ {file_name}: Data appears to be monthly, not quarterly")
-            st.info("💡 Consider uploading to 'Monthly Indicators' section instead")
-        
-        # Convert to quarter-end
-        df['date'] = end_of_quarter(df['date'])
-        df = df.dropna(subset=['date'])
-        
-        if df.empty:
-            st.warning(f"⚠️ {file_name}: No valid dates")
-            return None
-        
-        # Get numeric columns
-        numeric_cols = []
-        for col in df.columns:
-            if col == 'date':
-                continue
-            
-            df[col] = pd.to_numeric(df[col], errors='coerce')
-            
-            if df[col].notna().sum() > 0:
-                numeric_cols.append(col)
-        
-        if not numeric_cols:
-            st.warning(f"⚠️ {file_name}: No valid numeric columns")
-            return None
-        
-        # Keep only date and numeric
-        df = df[['date'] + numeric_cols].sort_values('date')
-        
-        # Rename with prefix
-        file_prefix = slugify(Path(file_name).stem)
-        rename_map = {col: f"quarterly_{file_prefix}__{slugify(col)}" for col in numeric_cols}
-        df = df.rename(columns=rename_map)
-        
-        st.success(f"✅ {file_name}: {len(df)} quarters, {len(numeric_cols)} indicators")
-        st.info(f"ℹ️ Frequency detected: {freq}")
-        
-        return df
-    
-    except Exception as e:
-        st.error(f"❌ Error loading {file_name}: {str(e)}")
-        return None
-
-# =============================================================================
-# DAILY & TRENDS (same as before)
-# =============================================================================
-
-def load_daily_data(file) -> Optional[pd.DataFrame]:
-    """Load daily data (will be aggregated to monthly)"""
-    file_name = file.name if hasattr(file, 'name') else 'uploaded file'
-    
-    try:
-        df = pd.read_csv(file)
-        
-        if df.empty:
-            return None
-        
-        date_col = detect_date_column(df)
-        df = df.rename(columns={date_col: 'date'})
-        df['date'] = to_datetime_safe(df['date'])
-        df = df.dropna(subset=['date'])
-        
-        if df.empty:
-            return None
-        
-        numeric_cols = []
-        for col in df.columns:
-            if col == 'date':
-                continue
-            df[col] = pd.to_numeric(df[col], errors='coerce')
-            if df[col].notna().sum() > 0:
-                numeric_cols.append(col)
-        
-        if not numeric_cols:
-            return None
-        
-        df = df[['date'] + numeric_cols].sort_values('date')
-        
-        file_prefix = slugify(Path(file_name).stem)
-        rename_map = {col: f"daily_{file_prefix}__{slugify(col)}" for col in numeric_cols}
-        df = df.rename(columns=rename_map)
-        
-        st.success(f"✅ {file_name}: {len(df)} days, {len(numeric_cols)} series")
-        
-        return df
-    
-    except Exception as e:
-        st.error(f"❌ {file_name}: {str(e)}")
-        return None
-
-
-def load_google_trends(files: List) -> Optional[pd.DataFrame]:
-    """Load Google Trends"""
-    if not files:
-        return None
-    
-    frames = []
-    
-    for file in files:
-        file_name = file.name if hasattr(file, 'name') else 'file'
-        
-        try:
-            df = pd.read_csv(file)
-            
-            date_col = None
-            for col_name in ['Week', 'Month', 'Date', 'date']:
-                if col_name in df.columns:
-                    date_col = col_name
-                    break
-            
-            if date_col is None:
-                date_col = detect_date_column(df)
-            
-            series_cols = [c for c in df.columns if c != date_col]
-            
-            if not series_cols:
-                continue
-            
-            df = df[[date_col] + series_cols].copy()
-            df = df.rename(columns={date_col: 'date'})
-            df['date'] = to_datetime_safe(df['date'])
-            df = df.dropna(subset=['date'])
-            
-            if df.empty:
-                continue
-            
-            new_cols = [f"trends__{slugify(col)}" for col in series_cols]
-            df.columns = ['date'] + new_cols
-            
-            for col in new_cols:
-                df[col] = pd.to_numeric(df[col], errors='coerce')
-            
-            frames.append(df)
-            st.success(f"✅ {file_name}: {len(series_cols)} trends")
-        
-        except Exception as e:
-            st.warning(f"⚠️ {file_name}: {str(e)}")
-            continue
-    
-    if not frames:
-        return None
-    
-    result = frames[0]
-    for df in frames[1:]:
-        result = pd.merge(result, df, on='date', how='outer')
-    
-    result = result.sort_values('date').reset_index(drop=True)
-    
-    st.info(f"ℹ️ Merged {len(frames)} trend files")
-    
-    return result
-
-# =============================================================================
-# AGGREGATION & INTERPOLATION
-# =============================================================================
-
-def aggregate_to_monthly(
-    df: pd.DataFrame,
-    method: str = 'mean',
-    business_days_only: bool = False,
-    min_days: int = 10
-) -> pd.DataFrame:
-    """Aggregate daily to monthly"""
-    if df is None or df.empty:
-        return pd.DataFrame()
-    
-    df = df.copy()
-    df['date'] = to_datetime_safe(df['date'])
-    
-    if business_days_only:
-        before = len(df)
-        df = df[df['date'].dt.dayofweek < 5]
-        st.info(f"ℹ️ Business days: {len(df)}/{before}")
-    
-    df = df.set_index('date')
-    
-    counts = df.resample('M').count()
-    
-    if method == 'sum':
-        monthly = df.resample('M').sum(min_count=1)
-    elif method == 'last':
-        monthly = df.resample('M').last()
-    else:
-        monthly = df.resample('M').mean()
-    
-    for col in monthly.columns:
-        monthly.loc[counts[col] < min_days, col] = np.nan
-    
-    monthly = monthly.reset_index()
-    monthly['date'] = end_of_month(monthly['date'])
-    
-    return monthly
-
-
-def interpolate_quarterly_to_monthly(
-    df: pd.DataFrame,
-    method: str = 'forward_fill'
-) -> pd.DataFrame:
-    """
-    Convert quarterly data to monthly frequency
-    
-    Args:
-        df: DataFrame with quarter-end dates as index
-        method: 'forward_fill', 'linear', or 'cubic'
-    
-    Returns:
-        Monthly DataFrame
-    """
-    if df is None or df.empty:
-        return pd.DataFrame()
-    
-    st.write(f"📅 Interpolating quarterly → monthly (method: {method})...")
-    
-    # Ensure date index
-    if 'date' in df.columns:
-        df = df.set_index('date')
-    
-    # Create monthly range
-    monthly_range = pd.date_range(
-        start=df.index.min(),
-        end=df.index.max(),
-        freq='M'
-    )
-    
-    # Reindex to monthly
-    df_monthly = df.reindex(monthly_range)
-    
-    if method == 'forward_fill':
-        # Repeat quarterly value for 3 months
-        df_monthly = df_monthly.fillna(method='ffill')
-    
-    elif method == 'linear':
-        # Linear interpolation
-        df_monthly = df_monthly.interpolate(method='linear')
-    
-    elif method == 'cubic':
-        # Cubic spline
-        df_monthly = df_monthly.interpolate(method='cubic')
-    
-    df_monthly = df_monthly.reset_index()
-    df_monthly.columns = ['date'] + list(df.columns)
-    df_monthly['date'] = end_of_month(df_monthly['date'])
-    
-    st.success(f"✅ Interpolated to {len(df_monthly)} months")
-    
-    return df_monthly
-
-# =============================================================================
-# PANEL BUILDING
-# =============================================================================
-
-def build_comprehensive_panel(
-    targets_df: Optional[pd.DataFrame],
-    daily_frames: List[pd.DataFrame],
-    monthly_frames: List[pd.DataFrame],
-    quarterly_frames: List[pd.DataFrame],
-    trends_df: Optional[pd.DataFrame],
-    daily_method: str,
-    business_days: bool,
-    min_days: int,
-    quarterly_method: str
-) -> pd.DataFrame:
-    """
-    Build comprehensive panel from all sources
-    
-    Returns:
-        Unified monthly panel with all features
-    """
-    st.write("---")
-    st.markdown("### 🔨 Building Comprehensive Panel")
-    
-    panel = None
-    
-    # 1. Start with targets if available
-    if targets_df is not None and not targets_df.empty:
-        st.write("🎯 **Step 1:** Adding target variables...")
-        panel = targets_df.reset_index()
-        panel.columns = ['date'] + list(targets_df.columns)
-        st.success(f"   ✅ {len(targets_df.columns)} targets, {len(panel)} months")
-    
-    # 2. Add direct monthly data
-    if monthly_frames:
-        st.write(f"📊 **Step 2:** Adding {len(monthly_frames)} monthly indicator files...")
-        
-        for i, df in enumerate(monthly_frames, 1):
-            if df is None or df.empty:
-                continue
-            
-            if panel is None:
-                panel = df
-            else:
-                panel = pd.merge(panel, df, on='date', how='outer')
-            
-            st.write(f"   ✅ File {i}: {len(df.columns)-1} indicators added")
-    
-    # 3. Aggregate daily data
-    if daily_frames:
-        st.write(f"📈 **Step 3:** Aggregating {len(daily_frames)} daily files...")
-        
-        for i, df in enumerate(daily_frames, 1):
-            if df is None or df.empty:
-                continue
-            
-            monthly = aggregate_to_monthly(df, daily_method, business_days, min_days)
-            
-            if panel is None:
-                panel = monthly
-            else:
-                panel = pd.merge(panel, monthly, on='date', how='outer')
-            
-            st.write(f"   ✅ File {i}: {len(monthly.columns)-1} series aggregated")
-    
-    # 4. Interpolate quarterly data
-    if quarterly_frames:
-        st.write(f"📅 **Step 4:** Interpolating {len(quarterly_frames)} quarterly files...")
-        
-        for i, df in enumerate(quarterly_frames, 1):
-            if df is None or df.empty:
-                continue
-            
-            monthly = interpolate_quarterly_to_monthly(df, quarterly_method)
-            
-            if panel is None:
-                panel = monthly
-            else:
-                panel = pd.merge(panel, monthly, on='date', how='outer')
-            
-            st.write(f"   ✅ File {i}: {len(monthly.columns)-1} quarterly indicators")
-    
-    # 5. Add Google Trends
-    if trends_df is not None and not trends_df.empty:
-        st.write("🔍 **Step 5:** Adding Google Trends...")
-        
-        gt_monthly = trends_df.set_index('date').resample('M').mean().reset_index()
-        gt_monthly['date'] = end_of_month(gt_monthly['date'])
-        
-        if panel is None:
-            panel = gt_monthly
-        else:
-            panel = pd.merge(panel, gt_monthly, on='date', how='outer')
-        
-        st.success(f"   ✅ {len(gt_monthly.columns)-1} trend series")
-    
-    if panel is None or panel.empty:
-        st.error("❌ No data to build panel")
-        return pd.DataFrame()
-    
-    # Finalize
-    st.write("🔧 **Step 6:** Finalizing panel...")
-    
-    panel = panel.sort_values('date').set_index('date')
-    
-    # Ensure numeric
-    for col in panel.columns:
-        panel[col] = pd.to_numeric(panel[col], errors='coerce')
-    
-    st.success(f"✅ **Panel ready:** {len(panel)} months × {len(panel.columns)} features")
-    
-    return panel
-
-# =============================================================================
-# CLEANING (same as before)
-# =============================================================================
-
-def remove_constant_columns(df: pd.DataFrame, tolerance: float = 1e-12) -> pd.DataFrame:
-    """Remove constant columns"""
-    if df is None or df.empty:
-        return df
-    
-    keep_cols = []
-    removed_cols = []
-    
-    for col in df.columns:
-        values = df[col].dropna().values
-        
-        if len(values) == 0:
-            removed_cols.append(col)
-            continue
-        
-        if np.ptp(values) > tolerance:
-            keep_cols.append(col)
-        else:
-            removed_cols.append(col)
-    
-    if removed_cols:
-        st.info(f"🧹 Removed {len(removed_cols)} constant columns")
-    
-    return df[keep_cols] if keep_cols else pd.DataFrame()
-
-
-def remove_correlated_duplicates(df: pd.DataFrame, threshold: float = 0.95) -> pd.DataFrame:
-    """Remove correlated columns"""
-    if df is None or df.empty or len(df.columns) < 2:
-        return df
-    
-    corr_matrix = df.corr().abs()
-    upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
-    
-    to_drop = [col for col in upper.columns if any(upper[col] > threshold)]
-    
-    if to_drop:
-        st.info(f"🧹 Removed {len(to_drop)} correlated columns (>{threshold:.0%})")
-    
-    return df.drop(columns=to_drop, errors='ignore')
-
-# =============================================================================
-# VISUALIZATIONS
-# =============================================================================
-
-def plot_multi_targets(targets_df: pd.DataFrame):
-    """Plot all targets on one chart"""
-    fig = go.Figure()
-    
-    for col in targets_df.columns:
-        fig.add_trace(go.Scatter(
-            x=targets_df.index,
-            y=targets_df[col],
-            mode='lines+markers',
-            name=col,
-            marker=dict(size=4)
-        ))
-    
-    fig.update_layout(
-        title='All Unemployment Targets',
-        xaxis_title='Date',
-        yaxis_title='Unemployment Rate (%)',
-        template='plotly_white',
-        height=500,
-        hovermode='x unified',
-        legend=dict(
-            orientation='v',
-            yanchor='top',
-            y=1,
-            xanchor='left',
-            x=1.02
-        )
-    )
-    
-    return fig
-
-
-def plot_data_coverage(panel: pd.DataFrame, n_months: int = 60):
-    """Coverage heatmap"""
-    presence = panel.notna().astype(int).tail(n_months)
-    
-    fig = px.imshow(
-        presence.T,
-        aspect='auto',
-        color_continuous_scale=['#EF4444', '#10B981'],
-        labels={'color': 'Present'},
-        title=f'Data Coverage (Last {n_months} Months)'
-    )
-    
-    fig.update_layout(
-        height=600,
-        template='plotly_white',
-        xaxis_title='Date',
-        yaxis_title='Feature'
-    )
-    
-    return fig
-
-
-def plot_source_breakdown(panel: pd.DataFrame):
-    """Bar chart showing feature count by source"""
-    
-    sources = {
-        'Targets': 0,
-        'Daily (aggregated)': 0,
-        'Monthly': 0,
-        'Quarterly (interpolated)': 0,
-        'Trends': 0
-    }
-    
-    for col in panel.columns:
-        if 'daily_' in col:
-            sources['Daily (aggregated)'] += 1
-        elif 'monthly_' in col:
-            sources['Monthly'] += 1
-        elif 'quarterly_' in col:
-            sources['Quarterly (interpolated)'] += 1
-        elif 'trends__' in col:
-            sources['Trends'] += 1
-        else:
-            sources['Targets'] += 1
-    
-    fig = go.Figure(data=[
-        go.Bar(
-            x=list(sources.keys()),
-            y=list(sources.values()),
-            marker=dict(
-                color=['#3B82F6', '#10B981', '#F59E0B', '#8B5CF6', '#EC4899']
-            ),
-            text=list(sources.values()),
-            textposition='outside'
-        )
-    ])
-    
-    fig.update_layout(
-        title='Features by Data Source',
-        xaxis_title='Source Type',
-        yaxis_title='Number of Features',
-        template='plotly_white',
-        height=400,
-        showlegend=False
-    )
-    
-    return fig
-
-# =============================================================================
-# EXPORT
-# =============================================================================
-
-def export_to_excel(
-    panel_monthly: pd.DataFrame,
-    targets_df: Optional[pd.DataFrame],
-    config: dict
-) -> bytes:
-    """Export to Excel"""
-    output = BytesIO()
-    
-    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-        if panel_monthly is not None and not panel_monthly.empty:
-            panel_monthly.reset_index().to_excel(writer, sheet_name='Monthly_Panel', index=False)
-        
-        if targets_df is not None and not targets_df.empty:
-            targets_df.reset_index().to_excel(writer, sheet_name='Targets', index=False)
-        
-        config_df = pd.DataFrame([config])
-        config_df.to_excel(writer, sheet_name='Configuration', index=False)
-    
-    return output.getvalue()
-
-# =============================================================================
-# MAIN UI - NO st.set_page_config
-# =============================================================================
-
-st.markdown("""
-<style>
-    .main-title {
-        font-size: 3rem;
-        font-weight: 700;
-        text-align: center;
-        background: linear-gradient(120deg, #1e3a8a, #3b82f6);
-        -webkit-background-clip: text;
-        -webkit-text-fill-color: transparent;
-        margin-bottom: 0.5rem;
-    }
-    .subtitle {
-        text-align: center;
-        color: #6b7280;
-        font-size: 1.1rem;
-        margin-bottom: 2rem;
-    }
-    .step-header {
-        background: linear-gradient(90deg, #3b82f6, #8b5cf6);
-        color: white;
-        padding: 1rem 1.5rem;
-        border-radius: 10px;
-        margin: 2rem 0 1rem 0;
-        font-size: 1.3rem;
-        font-weight: 600;
-    }
-    .data-source-box {
-        background: white;
-        border: 2px solid #E5E7EB;
-        border-radius: 10px;
-        padding: 1.5rem;
-        margin: 1rem 0;
-    }
-</style>
-""", unsafe_allow_html=True)
-
-# Header
-st.markdown('<h1 class="main-title">🧱 Advanced Data Aggregation</h1>', unsafe_allow_html=True)
-st.markdown('<p class="subtitle">Multi-source, multi-frequency panel builder for unemployment nowcasting</p>', unsafe_allow_html=True)
-
-# Info box
-st.info("""
-**📊 Supported Data Sources:**
-- 🎯 **Multi-Target**: Multiple unemployment rates (total, male, female, youth, etc.)
-- 📊 **Monthly Indicators**: Industrial production, retail sales, PMI, etc.
-- 📈 **Daily Data**: Stock prices, VIX, financial indicators → aggregated to monthly
-- 📅 **Quarterly Data**: GDP, labor force survey → interpolated to monthly
-- 🔍 **Google Trends**: Weekly/monthly search trends
-""")
-
-# Sidebar
-with st.sidebar:
-    st.header("⚙️ Aggregation Settings")
-    
-    st.subheader("📈 Daily → Monthly")
-    daily_agg_method = st.selectbox(
-        "Method:",
-        options=['mean', 'sum', 'last'],
-        index=0
-    )
-    
-    use_business_days = st.checkbox("Business days only", value=False)
-    min_days = st.slider("Min days/month", 1, 28, 10)
-    
-    st.markdown("---")
-    st.subheader("📅 Quarterly → Monthly")
-    
-    quarterly_method = st.selectbox(
-        "Interpolation:",
-        options=list(QUARTERLY_METHODS.keys()),
-        format_func=lambda x: x.replace('_', ' ').title(),
-        index=0
-    )
-    
-    with st.expander("ℹ️ Interpolation Methods", expanded=False):
-        for key, desc in QUARTERLY_METHODS.items():
-            st.write(f"**{key.replace('_', ' ').title()}:** {desc}")
-    
-    st.markdown("---")
-    st.subheader("🧹 Cleaning")
-    
-    drop_constant = st.checkbox("Remove constant", value=True)
-    drop_correlated = st.checkbox("Remove correlated", value=False)
-    
-    if drop_correlated:
-        corr_threshold = st.slider("Correlation threshold", 0.80, 0.99, 0.95, 0.01, format="%.2f")
-    else:
-        corr_threshold = 0.95
-    
-    st.markdown("---")
-    
-    if st.button("🗑️ Clear All", use_container_width=True):
-        state.y_monthly = None
-        state.targets_monthly = None
-        state.panel_monthly = None
-        state.panel_quarterly = None
-        state.raw_daily = []
-        state.raw_monthly = []
-        state.raw_quarterly = []
-        state.google_trends = None
-        st.success("✅ Cleared!")
-        st.rerun()
-
-# =============================================================================
-# STEP 1: UPLOAD - MULTI-SOURCE
-# =============================================================================
-
-st.markdown('<div class="step-header">📤 Step 1: Upload Multi-Source Data</div>', unsafe_allow_html=True)
-
-# Create tabs for different data sources
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
-    "🎯 Targets",
-    "📊 Monthly",
-    "📈 Daily",
-    "📅 Quarterly",
-    "🔍 Trends"
-])
-
-# TAB 1: TARGETS
-with tab1:
+    # Custom CSS
     st.markdown("""
-    ### 🎯 Multiple Unemployment Targets
+    <style>
+        .main-title {
+            font-size: 3.5rem;
+            font-weight: 800;
+            text-align: center;
+            background: linear-gradient(120deg, #1e3a8a, #3b82f6, #06b6d4);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            margin-bottom: 0.5rem;
+        }
+        .subtitle {
+            text-align: center;
+            color: #6b7280;
+            font-size: 1.2rem;
+            margin-bottom: 2rem;
+        }
+        .feature-box {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 1.5rem;
+            border-radius: 12px;
+            margin: 1rem 0;
+        }
+        .step-header {
+            background: linear-gradient(90deg, #1e40af, #3b82f6);
+            color: white;
+            padding: 1rem 1.5rem;
+            border-radius: 10px;
+            margin: 2rem 0 1rem 0;
+            font-size: 1.5rem;
+            font-weight: 600;
+        }
+    </style>
+    """, unsafe_allow_html=True)
     
-    Upload a CSV file with **multiple unemployment rates**:
-    - Total unemployment
-    - Male/Female unemployment
-    - Youth/Adult unemployment
-    - Long-term unemployment
-    - By education level
-    - By region
+    # Header
+    st.markdown('<h1 class="main-title">📊 Data Aggregation Pro MAX v4.0</h1>', unsafe_allow_html=True)
+    st.markdown('<p class="subtitle">🇮🇹 Advanced Excel & Multi-format Data Processing for Italian Unemployment Nowcasting</p>', unsafe_allow_html=True)
     
-    **Format:** First column = date, other columns = different unemployment rates
-    """)
-    
-    target_file = st.file_uploader(
-        "Upload Multi-Target CSV",
-        type=['csv'],
-        key='multi_target',
-        help="CSV with date + multiple unemployment columns"
-    )
-    
-    if target_file:
-        with st.spinner("🔄 Loading targets..."):
-            targets_df = load_multi_target(target_file)
-            
-            if targets_df is not None:
-                state.targets_monthly = targets_df
-                
-                # Auto-select primary target
-                if 'total' in [c.lower() for c in targets_df.columns]:
-                    primary_col = [c for c in targets_df.columns if 'total' in c.lower()][0]
-                else:
-                    primary_col = targets_df.columns[0]
-                
-                state.y_monthly = targets_df[primary_col]
-                
-                st.success(f"✅ Primary target set to: **{primary_col}**")
-                
-                # Plot all targets
-                fig = plot_multi_targets(targets_df)
-                st.plotly_chart(fig, use_container_width=True)
-
-# TAB 2: MONTHLY
-with tab2:
-    st.markdown("""
-    ### 📊 Direct Monthly Indicators
-    
-    Upload monthly data that **doesn't need aggregation**:
-    - Industrial production index
-    - Retail sales
-    - Consumer confidence index
-    - PMI (Manufacturing/Services)
-    - CPI / Inflation rates
-    - Building permits
-    - New orders
-    
-    **Format:** CSV with date column + indicator columns
-    """)
-    
-    monthly_files = st.file_uploader(
-        "Upload Monthly Indicator CSV(s)",
-        type=['csv'],
-        accept_multiple_files=True,
-        key='monthly_indicators'
-    )
-    
-    if monthly_files:
-        with st.spinner("🔄 Loading monthly indicators..."):
-            state.raw_monthly = []
-            
-            for file in monthly_files:
-                df = load_monthly_data(file)
-                if df is not None:
-                    state.raw_monthly.append(df)
-            
-            if state.raw_monthly:
-                total_indicators = sum(len(df.columns)-1 for df in state.raw_monthly)
-                st.success(f"✅ Loaded {len(state.raw_monthly)} files, {total_indicators} indicators")
-
-# TAB 3: DAILY
-with tab3:
-    st.markdown("""
-    ### 📈 Daily Financial Data
-    
-    Upload daily data (will be **aggregated to monthly**):
-    - Stock indices (S&P500, FTSE, DAX, FTSE MIB)
-    - VIX (Volatility index)
-    - Exchange rates
-    - Commodity prices
-    - Bond yields
-    - Banking sector indices
-    
-    **Format:** CSV with date + numeric columns
-    """)
-    
-    daily_files = st.file_uploader(
-        "Upload Daily CSV(s)",
-        type=['csv'],
-        accept_multiple_files=True,
-        key='daily_data'
-    )
-    
-    if daily_files:
-        with st.spinner("🔄 Loading daily files..."):
-            state.raw_daily = []
-            
-            for file in daily_files:
-                df = load_daily_data(file)
-                if df is not None:
-                    state.raw_daily.append(df)
-            
-            if state.raw_daily:
-                total_series = sum(len(df.columns)-1 for df in state.raw_daily)
-                st.success(f"✅ Loaded {len(state.raw_daily)} files, {total_series} series")
-
-# TAB 4: QUARTERLY
-with tab4:
-    st.markdown("""
-    ### 📅 Quarterly Economic Data
-    
-    Upload quarterly data (will be **interpolated to monthly**):
-    - GDP and components
-    - Government spending
-    - Investment
-    - Trade balance
-    - Quarterly labor force survey details
-    - Productivity measures
-    
-    **Format:** CSV with quarter dates + indicator columns
-    
-    ℹ️ *Interpolation method can be selected in sidebar*
-    """)
-    
-    quarterly_files = st.file_uploader(
-        "Upload Quarterly CSV(s)",
-        type=['csv'],
-        accept_multiple_files=True,
-        key='quarterly_data'
-    )
-    
-    if quarterly_files:
-        with st.spinner("🔄 Loading quarterly files..."):
-            state.raw_quarterly = []
-            
-            for file in quarterly_files:
-                df = load_quarterly_data(file)
-                if df is not None:
-                    state.raw_quarterly.append(df)
-            
-            if state.raw_quarterly:
-                total_indicators = sum(len(df.columns)-1 for df in state.raw_quarterly)
-                st.success(f"✅ Loaded {len(state.raw_quarterly)} files, {total_indicators} indicators")
-
-# TAB 5: TRENDS
-with tab5:
-    st.markdown("""
-    ### 🔍 Google Trends
-    
-    Upload Google Trends data:
-    - Search volume for unemployment-related terms
-    - Industry-specific searches
-    - Regional job search trends
-    
-    **Format:** Google Trends CSV export (weekly or monthly)
-    """)
-    
-    trends_files = st.file_uploader(
-        "Upload Google Trends CSV(s)",
-        type=['csv'],
-        accept_multiple_files=True,
-        key='trends'
-    )
-    
-    if trends_files:
-        with st.spinner("🔄 Loading trends..."):
-            state.google_trends = load_google_trends(trends_files)
-
-# =============================================================================
-# STEP 2: BUILD PANEL
-# =============================================================================
-
-st.markdown('<div class="step-header">🔨 Step 2: Build Comprehensive Panel</div>', unsafe_allow_html=True)
-
-# Show what's loaded
-has_data = (
-    state.targets_monthly is not None or
-    state.raw_monthly or
-    state.raw_daily or
-    state.raw_quarterly or
-    state.google_trends is not None
-)
-
-if not has_data:
-    st.info("📌 Upload data in at least one category above to build panel")
-else:
-    # Summary of loaded data
-    st.markdown("### 📋 Data Summary")
-    
-    col1, col2, col3, col4, col5 = st.columns(5)
+    # Feature highlights
+    col1, col2, col3, col4 = st.columns(4)
     
     with col1:
-        target_count = len(state.targets_monthly.columns) if state.targets_monthly is not None else 0
-        st.metric("🎯 Targets", target_count)
+        st.markdown("""
+        <div class="feature-box">
+            <h3>📁 Excel Support</h3>
+            <p>.xlsx, .xls, .xlsm, .xlsb<br/>Multi-sheet processing</p>
+        </div>
+        """, unsafe_allow_html=True)
     
     with col2:
-        monthly_count = len(state.raw_monthly)
-        st.metric("📊 Monthly Files", monthly_count)
+        st.markdown("""
+        <div class="feature-box">
+            <h3>🤖 Auto-Detection</h3>
+            <p>Smart column recognition<br/>ISTAT format support</p>
+        </div>
+        """, unsafe_allow_html=True)
     
     with col3:
-        daily_count = len(state.raw_daily)
-        st.metric("📈 Daily Files", daily_count)
+        st.markdown("""
+        <div class="feature-box">
+            <h3>🇮🇹 Italian Optimized</h3>
+            <p>20 regions support<br/>Italian number formats</p>
+        </div>
+        """, unsafe_allow_html=True)
     
     with col4:
-        quarterly_count = len(state.raw_quarterly)
-        st.metric("📅 Quarterly Files", quarterly_count)
+        st.markdown("""
+        <div class="feature-box">
+            <h3>🔧 Smart Processing</h3>
+            <p>Outlier detection<br/>Missing data imputation</p>
+        </div>
+        """, unsafe_allow_html=True)
     
-    with col5:
-        trends_count = len(state.google_trends.columns)-1 if state.google_trends is not None else 0
-        st.metric("🔍 Trend Series", trends_count)
+    # Initialize components
+    config = DataConfig()
+    logger = ColorLogger()
+    excel_processor = ExcelProcessor(config)
+    detector = DataDetector()
+    transformer = DataTransformer(config)
+    visualizer = DataVisualizer()
     
-    st.markdown("---")
-    
-    # Build button
-    col1, col2, col3 = st.columns([1, 2, 1])
-    
-    with col2:
-        build_button = st.button(
-            "🚀 Build Comprehensive Panel",
-            use_container_width=True,
-            type="primary"
-        )
-    
-    if build_button:
-        progress = st.progress(0)
+    # Sidebar settings
+    with st.sidebar:
+        st.header("⚙️ Processing Settings")
         
-        with st.container():
-            # Build panel
-            panel = build_comprehensive_panel(
-                state.targets_monthly,
-                state.raw_daily,
-                state.raw_monthly,
-                state.raw_quarterly,
-                state.google_trends,
-                daily_agg_method,
-                use_business_days,
-                min_days,
-                quarterly_method
+        st.subheader("🔍 Detection")
+        auto_detect = st.checkbox("Auto-detect columns", value=True)
+        handle_italian = st.checkbox("Italian number formats", value=True)
+        
+        st.subheader("🧹 Cleaning")
+        remove_outliers = st.checkbox("Remove outliers", value=False)
+        impute_missing = st.checkbox("Impute missing", value=False)
+        
+        if impute_missing:
+            impute_method = st.selectbox(
+                "Method:",
+                ['interpolate', 'ffill', 'knn' if HAS_SKLEARN else 'interpolate']
             )
+        
+        st.subheader("📊 Output")
+        align_to_month_end = st.checkbox("Align to month-end", value=True)
+        
+        st.markdown("---")
+        
+        if st.button("🗑️ Clear All Data", use_container_width=True):
+            for attr in ['y_monthly', 'targets_monthly', 'panel_monthly', 
+                        'raw_daily', 'raw_monthly', 'raw_quarterly', 'google_trends']:
+                if hasattr(state, attr):
+                    if isinstance(getattr(state, attr), list):
+                        setattr(state, attr, [])
+                    else:
+                        setattr(state, attr, None)
+            st.success("✅ Cleared!")
+            st.rerun()
+    
+    # Main upload area
+    st.markdown('<div class="step-header">📤 Step 1: Upload Data Files</div>', unsafe_allow_html=True)
+    
+    st.info("""
+    **📋 Supported Formats:**
+    - 📊 **Excel**: .xlsx, .xls, .xlsm, .xlsb (multi-sheet support)
+    - 📄 **CSV**: .csv (all encodings)
+    - 🌐 **ISTAT/Eurostat**: Auto-detected formats
+    
+    **🎯 What We'll Detect:**
+    - Date columns (multiple formats)
+    - Unemployment categories (total, male, female, youth, etc.)
+    - Italian regions (20 regioni)
+    - Time frequency (daily, monthly, quarterly)
+    """)
+    
+    # File uploader
+    uploaded_files = st.file_uploader(
+        "📁 Upload your data files",
+        type=['csv', 'xlsx', 'xls', 'xlsm', 'xlsb'],
+        accept_multiple_files=True,
+        help="You can upload multiple files at once"
+    )
+    
+    if uploaded_files:
+        st.markdown("---")
+        st.markdown("### 🔄 Processing Files")
+        
+        all_dataframes = []
+        
+        for file in uploaded_files:
+            file_name = file.name
+            file_ext = Path(file_name).suffix.lower()
             
-            progress.progress(0.5)
-            
-            if panel.empty:
-                st.error("❌ Panel is empty")
-                st.stop()
-            
-            # Clean
-            st.write("🧹 **Cleaning panel...**")
-            
-            if drop_constant:
-                panel = remove_constant_columns(panel)
-            
-            if drop_correlated:
-                panel = remove_correlated_duplicates(panel, corr_threshold)
-            
-            progress.progress(0.8)
-            
-            # Align with primary target if exists
-            if state.y_monthly is not None:
-                st.write("🎯 **Aligning with primary target...**")
-                panel = panel.loc[
-                    (panel.index >= state.y_monthly.index.min()) &
-                    (panel.index <= state.y_monthly.index.max())
-                ]
-            
-            state.panel_monthly = panel
-            
-            progress.progress(1.0)
-            progress.empty()
-            
-            # Summary
+            with st.expander(f"📄 {file_name}", expanded=True):
+                
+                try:
+                    # Process based on file type
+                    if file_ext == '.csv':
+                        # CSV processing
+                        logger.info(f"Reading CSV: **{file_name}**")
+                        
+                        # Try multiple encodings
+                        df = None
+                        for encoding in config.encoding_attempts:
+                            try:
+                                file.seek(0)
+                                df = pd.read_csv(file, encoding=encoding)
+                                if encoding != 'utf-8':
+                                    logger.info(f"  Using {encoding} encoding")
+                                break
+                            except:
+                                continue
+                        
+                        if df is None:
+                            logger.error("Could not read CSV with any encoding")
+                            continue
+                    
+                    else:
+                        # Excel processing
+                        sheets = excel_processor.read_excel_file(file)
+                        
+                        if not sheets:
+                            logger.error("No sheets could be read")
+                            continue
+                        
+                        # Let user select sheet
+                        if len(sheets) > 1:
+                            selected_sheet = st.selectbox(
+                                "Select sheet:",
+                                options=list(sheets.keys()),
+                                key=f"sheet_{file_name}"
+                            )
+                        else:
+                            selected_sheet = list(sheets.keys())[0]
+                        
+                        df = sheets[selected_sheet]
+                        
+                        # Process sheet
+                        df = excel_processor.process_sheet(df, selected_sheet)
+                    
+                    if df.empty:
+                        logger.warning("Empty dataframe")
+                        continue
+                    
+                    # Auto-detection
+                    if auto_detect:
+                        st.markdown("#### 🔍 Auto-Detection Results")
+                        
+                        # Detect date column
+                        date_col = detector.detect_date_column(df)
+                        
+                        if date_col:
+                            st.success(f"📅 Date column: **{date_col}**")
+                            
+                            # Parse dates
+                            df[date_col] = transformer.parse_dates(df[date_col])
+                            
+                            # Detect frequency
+                            freq = detector.detect_frequency(df[date_col])
+                            st.info(f"⏱️ Frequency: **{freq}**")
+                        
+                        # Detect unemployment columns
+                        unemp_cols = detector.detect_unemployment_columns(df)
+                        
+                        if unemp_cols:
+                            st.success(f"📊 Found {len(unemp_cols)} unemployment indicators")
+                        
+                        # Detect regional data
+                        region_col = detector.detect_regional_data(df)
+                        
+                        # Detect ISTAT format
+                        istat_info = detector.detect_istat_format(df)
+                        
+                        if istat_info['is_istat']:
+                            st.success("✅ ISTAT format confirmed!")
+                    
+                    # Convert numeric columns
+                    st.markdown("#### 🔢 Converting to Numeric")
+                    
+                    numeric_cols = []
+                    for col in df.columns:
+                        if col == date_col:
+                            continue
+                        
+                        df[col] = transformer.convert_to_numeric(df[col], handle_italian)
+                        
+                        valid_pct = df[col].notna().mean()
+                        if valid_pct > 0.5:
+                            numeric_cols.append(col)
+                            st.write(f"  ✅ {col}: {valid_pct:.1%} valid")
+                    
+                    # Cleaning
+                    if remove_outliers:
+                        st.markdown("#### 🧹 Removing Outliers")
+                        for col in numeric_cols:
+                            df[col] = transformer.remove_outliers(df[col])
+                    
+                    if impute_missing and numeric_cols:
+                        st.markdown("#### 🔧 Imputing Missing Values")
+                        df[numeric_cols] = transformer.impute_missing(df[numeric_cols], impute_method)
+                    
+                    # Show preview
+                    st.markdown("#### 👀 Data Preview")
+                    st.dataframe(df.head(10), use_container_width=True)
+                    
+                    # Show statistics
+                    col1, col2, col3, col4 = st.columns(4)
+                    
+                    with col1:
+                        st.metric("Rows", len(df))
+                    with col2:
+                        st.metric("Columns", len(df.columns))
+                    with col3:
+                        coverage = df.notna().mean().mean()
+                        st.metric("Coverage", f"{coverage:.1%}")
+                    with col4:
+                        memory = df.memory_usage(deep=True).sum() / 1024**2
+                        st.metric("Size", f"{memory:.1f} MB")
+                    
+                    # Visualize
+                    if date_col and numeric_cols:
+                        st.markdown("#### 📊 Visualization")
+                        
+                        # Select columns to plot
+                        cols_to_plot = st.multiselect(
+                            "Select columns to plot:",
+                            options=numeric_cols,
+                            default=numeric_cols[:min(5, len(numeric_cols))],
+                            key=f"plot_{file_name}"
+                        )
+                        
+                        if cols_to_plot:
+                            fig = visualizer.plot_time_series(
+                                df.dropna(subset=[date_col]),
+                                date_col,
+                                cols_to_plot,
+                                title=f"{file_name} - Time Series"
+                            )
+                            st.plotly_chart(fig, use_container_width=True)
+                    
+                    # Add to collection
+                    all_dataframes.append({
+                        'name': file_name,
+                        'data': df,
+                        'date_col': date_col,
+                        'numeric_cols': numeric_cols,
+                        'frequency': freq if auto_detect and date_col else 'unknown'
+                    })
+                    
+                    logger.success(f"✅ {file_name} processed successfully!")
+                
+                except Exception as e:
+                    logger.error(f"Error processing {file_name}")
+                    logger.error(str(e))
+                    
+                    with st.expander("🐛 Error Details", expanded=False):
+                        st.code(traceback.format_exc())
+        
+        # Build panel
+        if all_dataframes:
             st.markdown("---")
-            st.markdown("### ✅ Panel Build Complete!")
+            st.markdown('<div class="step-header">🔨 Step 2: Build Unified Panel</div>', unsafe_allow_html=True)
             
-            col1, col2, col3 = st.columns(3)
-            
-            with col1:
-                st.metric("📅 Months", len(panel))
-                st.metric("📊 Features", len(panel.columns))
-            
-            with col2:
-                coverage = panel.notna().mean().mean()
-                st.metric("✅ Coverage", f"{coverage:.1%}")
+            if st.button("🚀 Build Panel", type="primary", use_container_width=True):
                 
-                nulls = panel.isna().sum().sum()
-                st.metric("❌ Missing", f"{nulls:,}")
-            
-            with col3:
-                if state.targets_monthly is not None:
-                    target_features = len([c for c in panel.columns if c in state.targets_monthly.columns])
-                    st.metric("🎯 Target Features", target_features)
-                
-                memory = panel.memory_usage(deep=True).sum() / 1024**2
-                st.metric("💾 Memory", f"{memory:.1f} MB")
-            
-            # Source breakdown
-            fig_breakdown = plot_source_breakdown(panel)
-            st.plotly_chart(fig_breakdown, use_container_width=True)
-            
-            st.success("🎉 **Panel ready!** Go to **Feature Engineering** or **Backtesting**")
+                with st.spinner("Building panel..."):
+                    
+                    # Start with first dataframe
+                    panel = all_dataframes[0]['data'].copy()
+                    panel_date_col = all_dataframes[0]['date_col']
+                    
+                    # Merge others
+                    for i, df_info in enumerate(all_dataframes[1:], 1):
+                        df = df_info['data']
+                        date_col = df_info['date_col']
+                        
+                        if date_col:
+                            # Rename columns to avoid conflicts
+                            rename_map = {
+                                col: f"{df_info['name']}_{col}"
+                                for col in df.columns
+                                if col != date_col
+                            }
+                            df = df.rename(columns=rename_map)
+                            
+                            # Merge
+                            panel = pd.merge(
+                                panel,
+                                df,
+                                left_on=panel_date_col,
+                                right_on=date_col,
+                                how='outer'
+                            )
+                    
+                    # Clean
+                    panel = panel.sort_values(panel_date_col)
+                    panel = panel.set_index(panel_date_col)
+                    
+                    # Save to state
+                    state.panel_monthly = panel
+                    
+                    logger.success("✅ Panel built successfully!")
+                    
+                    # Show summary
+                    st.markdown("### 📊 Panel Summary")
+                    
+                    col1, col2, col3 = st.columns(3)
+                    
+                    with col1:
+                        st.metric("Rows", len(panel))
+                    with col2:
+                        st.metric("Columns", len(panel.columns))
+                    with col3:
+                        coverage = panel.notna().mean().mean()
+                        st.metric("Coverage", f"{coverage:.1%}")
+                    
+                    # Visualizations
+                    tab1, tab2, tab3 = st.tabs(["📋 Data", "🔍 Coverage", "📊 Quality"])
+                    
+                    with tab1:
+                        st.dataframe(panel.head(20), use_container_width=True, height=400)
+                    
+                    with tab2:
+                        fig = visualizer.plot_coverage_heatmap(panel)
+                        st.plotly_chart(fig, use_container_width=True)
+                    
+                    with tab3:
+                        fig = visualizer.plot_data_quality(panel)
+                        st.plotly_chart(fig, use_container_width=True)
+                    
+                    # Export
+                    st.markdown("### 💾 Export Panel")
+                    
+                    col1, col2 = st.columns(2)
+                    
+                    with col1:
+                        csv = panel.to_csv().encode('utf-8')
+                        st.download_button(
+                            "📥 Download CSV",
+                            csv,
+                            "panel_monthly.csv",
+                            "text/csv",
+                            use_container_width=True
+                        )
+                    
+                    with col2:
+                        # Excel export
+                        output = BytesIO()
+                        with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+                            panel.to_excel(writer, sheet_name='Panel')
+                        excel_data = output.getvalue()
+                        
+                        st.download_button(
+                            "📥 Download Excel",
+                            excel_data,
+                            "panel_monthly.xlsx",
+                            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            use_container_width=True
+                        )
+    
+    else:
+        st.info("👆 Upload files to get started")
+    
+    # Footer
+    st.markdown("---")
+    st.markdown("""
+    <div style='text-align: center; color: #6b7280; padding: 2rem;'>
+        <p><strong>📊 Data Aggregation Pro MAX v4.0</strong></p>
+        <p>🇮🇹 Optimized for Italian Unemployment Nowcasting | 🎯 ISTAT & Eurostat Compatible</p>
+        <p>💻 Built with Streamlit | 🚀 Production Ready | 📦 GitHub Compatible</p>
+    </div>
+    """, unsafe_allow_html=True)
+
 
 # =============================================================================
-# STEP 3: ANALYSIS
+# 🚀 RUN
 # =============================================================================
 
-if state.panel_monthly is not None and not state.panel_monthly.empty:
-    st.markdown('<div class="step-header">📊 Step 3: Panel Analysis</div>', unsafe_allow_html=True)
-    
-    tab1, tab2, tab3 = st.tabs(["📋 Data", "🔍 Coverage", "💾 Export"])
-    
-    with tab1:
-        st.subheader("Panel Preview (Last 24 Months)")
-        st.dataframe(
-            state.panel_monthly.tail(24).style.format("{:.4f}"),
-            use_container_width=True,
-            height=500
-        )
-    
-    with tab2:
-        st.subheader("Data Coverage Analysis")
-        
-        # Coverage table
-        coverage_df = pd.DataFrame({
-            'Feature': state.panel_monthly.columns,
-            'Coverage': state.panel_monthly.notna().mean(),
-            'Missing': state.panel_monthly.isna().sum()
-        }).sort_values('Coverage', ascending=False)
-        
-        st.dataframe(
-            coverage_df.style.format({'Coverage': '{:.1%}'}),
-            use_container_width=True,
-            height=400
-        )
-        
-        # Heatmap
-        fig_coverage = plot_data_coverage(state.panel_monthly, 60)
-        st.plotly_chart(fig_coverage, use_container_width=True)
-    
-    with tab3:
-        st.subheader("💾 Export Panel")
-        
-        config = {
-            'daily_method': daily_agg_method,
-            'quarterly_method': quarterly_method,
-            'business_days': use_business_days,
-            'min_days': min_days,
-            'drop_constant': drop_constant,
-            'drop_correlated': drop_correlated,
-            'corr_threshold': corr_threshold,
-            'created': datetime.now().isoformat(),
-            'shape': f"{state.panel_monthly.shape[0]} × {state.panel_monthly.shape[1]}"
-        }
-        
-        with st.expander("⚙️ Configuration"):
-            st.json(config)
-        
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            csv = state.panel_monthly.to_csv().encode('utf-8')
-            st.download_button(
-                "📥 CSV",
-                csv,
-                "panel.csv",
-                use_container_width=True
-            )
-        
-        with col2:
-            excel = export_to_excel(state.panel_monthly, state.targets_monthly, config)
-            st.download_button(
-                "📥 Excel (All Sheets)",
-                excel,
-                "panel.xlsx",
-                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True
-            )
-
-# Footer
-st.markdown("---")
-st.caption("💻 Built with Streamlit Pro v3.0 | 🎯 Advanced Multi-Source Nowcasting")
+if __name__ == "__main__":
+    main()
