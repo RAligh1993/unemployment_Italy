@@ -615,7 +615,7 @@ if state.bt_results and len(state.bt_results) > 0:
 # =============================================================================
 
 if state.panel_monthly is not None and not state.panel_monthly.empty:
-    st.markdown('<div class="section-header">🔗 Feature Correlations</div>', unsafe_handle_html=True)
+    st.markdown('<div class="section-header">🔗 Feature Correlations</div>', unsafe_allow_html=True)
     
     col1, col2 = st.columns([1, 3])
     
