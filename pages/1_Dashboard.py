@@ -374,12 +374,7 @@ def create_quality_gauge(score: float) -> go.Figure:
 # UI CONFIGURATION
 # =============================================================================
 
-st.set_page_config(
-    page_title="Executive Dashboard",
-    page_icon="📊",
-    layout="wide",
-    initial_sidebar_state="collapsed"
-)
+
 
 # Custom CSS
 st.markdown("""
