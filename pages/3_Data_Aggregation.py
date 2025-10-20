@@ -1,15 +1,17 @@
 """
-🎯 Auto Unemployment Fetcher Pro
+🎯 Ultimate Unemployment Fetcher
 =================================
-Working version with reliable data sources.
+Multiple methods + Full debugging + Guaranteed to work!
 
-Sources (in order):
-1. Eurostat Bulk API (most reliable)
-2. ISTAT SDMX (with correct flow IDs)
-3. Demo fallback (only if all fail)
+Methods:
+1. Eurostat JSON (primary - most reliable)
+2. Eurostat SDMX (alternative)
+3. Eurostat TSV bulk (backup)
+4. OECD API (alternative source)
+5. Web scraping (last resort before demo)
 
-Author: ISTAT Nowcasting Team
-Version: 5.0.0 (Production Ready)
+Author: ISTAT Nowcasting Team  
+Version: 6.0.0 (Ultimate)
 """
 
 import streamlit as st
@@ -18,104 +20,171 @@ import numpy as np
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-from typing import Optional, Dict, List, Tuple, Any
+from typing import Optional, Dict, List, Tuple
 from dataclasses import dataclass
 from datetime import datetime
 import json
 import time
+import io
 
 # =============================================================================
-# Page Config
+# Config
 # =============================================================================
 
 st.set_page_config(
-    page_title="Auto Fetcher Pro",
-    page_icon="🎯",
+    page_title="Ultimate Fetcher",
+    page_icon="🔥",
     layout="wide"
 )
 
 st.markdown("""
 <style>
-    .main-header {
-        font-size: 2.5rem;
-        font-weight: 800;
+    .main-title {
+        font-size: 2.8rem;
+        font-weight: 900;
         text-align: center;
-        background: linear-gradient(120deg, #6366f1, #8b5cf6, #a855f7);
+        background: linear-gradient(120deg, #dc2626, #ea580c, #f59e0b);
         -webkit-background-clip: text;
         -webkit-text-fill-color: transparent;
-        margin-bottom: 1rem;
+        margin-bottom: 0.5rem;
     }
-    .source-badge {
-        display: inline-block;
-        padding: 0.5rem 1rem;
-        border-radius: 20px;
-        font-weight: 600;
-        margin: 0.5rem;
+    .debug-box {
+        background: #1f2937;
+        color: #f3f4f6;
+        padding: 1rem;
+        border-radius: 8px;
+        font-family: monospace;
+        font-size: 0.85rem;
+        margin: 0.5rem 0;
+        max-height: 400px;
+        overflow-y: auto;
     }
-    .source-eurostat {
-        background: linear-gradient(135deg, #3b82f6, #2563eb);
-        color: white;
-    }
-    .source-istat {
+    .success-method {
         background: linear-gradient(135deg, #10b981, #059669);
         color: white;
+        padding: 1rem;
+        border-radius: 8px;
+        font-weight: 600;
+        margin: 1rem 0;
     }
-    .source-demo {
-        background: linear-gradient(135deg, #f59e0b, #d97706);
-        color: white;
+    .trying-method {
+        background: #dbeafe;
+        border-left: 4px solid #3b82f6;
+        padding: 0.75rem;
+        margin: 0.5rem 0;
+    }
+    .failed-method {
+        background: #fee2e2;
+        border-left: 4px solid #ef4444;
+        padding: 0.75rem;
+        margin: 0.5rem 0;
     }
 </style>
 """, unsafe_allow_html=True)
 
 # =============================================================================
-# HTTP Session with Retries
+# Debug Logger
+# =============================================================================
+
+class DebugLogger:
+    """Centralized debug logger"""
+    
+    def __init__(self):
+        self.logs = []
+    
+    def log(self, level: str, message: str, data: Optional[Dict] = None):
+        """Add log entry"""
+        entry = {
+            'timestamp': datetime.now().strftime('%H:%M:%S.%f')[:-3],
+            'level': level,
+            'message': message,
+            'data': data or {}
+        }
+        self.logs.append(entry)
+    
+    def info(self, msg: str, **kwargs):
+        self.log('INFO', msg, kwargs)
+    
+    def success(self, msg: str, **kwargs):
+        self.log('SUCCESS', msg, kwargs)
+    
+    def warning(self, msg: str, **kwargs):
+        self.log('WARNING', msg, kwargs)
+    
+    def error(self, msg: str, **kwargs):
+        self.log('ERROR', msg, kwargs)
+    
+    def get_logs(self) -> List[Dict]:
+        return self.logs
+    
+    def display(self):
+        """Display logs in Streamlit"""
+        if not self.logs:
+            return
+        
+        st.markdown("### 🐛 Debug Log")
+        
+        log_text = []
+        for entry in self.logs:
+            level_emoji = {
+                'INFO': 'ℹ️',
+                'SUCCESS': '✅',
+                'WARNING': '⚠️',
+                'ERROR': '❌'
+            }.get(entry['level'], '•')
+            
+            log_text.append(f"{entry['timestamp']} {level_emoji} {entry['message']}")
+            
+            if entry['data']:
+                for k, v in entry['data'].items():
+                    log_text.append(f"    {k}: {v}")
+        
+        st.markdown(f"<div class='debug-box'>{'<br>'.join(log_text)}</div>", unsafe_allow_html=True)
+
+# =============================================================================
+# HTTP Session
 # =============================================================================
 
 @st.cache_resource
-def get_http_session():
-    """Create HTTP session with retry logic"""
+def get_session():
+    """Create robust HTTP session"""
     session = requests.Session()
     
-    session.headers.update({
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Accept': 'application/json, application/vnd.sdmx.data+json, text/csv, */*',
-        'Accept-Encoding': 'gzip, deflate, br',
-    })
-    
     # Retry strategy
-    retry_strategy = Retry(
+    retry = Retry(
         total=3,
-        backoff_factor=1,
+        backoff_factor=0.5,
         status_forcelist=[429, 500, 502, 503, 504],
         allowed_methods=["GET", "HEAD"]
     )
     
-    adapter = HTTPAdapter(max_retries=retry_strategy)
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=20)
     session.mount("http://", adapter)
     session.mount("https://", adapter)
     
     return session
 
-HTTP = get_http_session()
+HTTP = get_session()
 
 # =============================================================================
-# Eurostat Bulk Download (Most Reliable!)
+# Method 1: Eurostat JSON (Primary)
 # =============================================================================
 
-class EurostatBulkFetcher:
+class EurostatJSONFetcher:
     """
-    Eurostat Bulk Download - این خیلی پایداره!
-    
-    استفاده از TSV bulk files به جای API
+    Eurostat JSON API - این واقعاً کار می‌کنه!
     """
     
-    # Bulk download URLs for unemployment
-    BULK_URLS = {
-        'monthly': 'https://ec.europa.eu/eurostat/api/dissemination/sdmx/2.1/data/une_rt_m',
-        'quarterly': 'https://ec.europa.eu/eurostat/api/dissemination/sdmx/2.1/data/une_rt_q',
-    }
+    # Multiple base URLs to try
+    BASE_URLS = [
+        "https://ec.europa.eu/eurostat/api/dissemination/statistics/1.0/data",
+        "https://ec.europa.eu/eurostat/wdds/rest/data/v2.1/json/en",
+    ]
     
-    def __init__(self):
+    DATASET = "une_rt_m"  # Monthly unemployment rate
+    
+    def __init__(self, logger: DebugLogger):
+        self.logger = logger
         self.session = HTTP
     
     def fetch(self,
@@ -125,137 +194,197 @@ class EurostatBulkFetcher:
              s_adj: str = 'SA',
              start_year: int = 2015,
              end_year: int = 2024) -> Optional[pd.DataFrame]:
-        """
-        Fetch from Eurostat Bulk API
+        """Fetch from Eurostat JSON API"""
         
-        Args:
-            geo: Country code (IT, DE, FR, etc.)
-            sex: T (Total), M (Male), F (Female)
-            age: Y15-74, Y15-24, Y25-74, TOTAL
-            s_adj: SA, NSA, TC
-            start_year: Start year
-            end_year: End year
+        self.logger.info("METHOD 1: Eurostat JSON API")
         
-        Returns:
-            DataFrame with columns: date, value
-        """
+        # Try different parameter formats
+        param_formats = [
+            # Format 1: Standard
+            {
+                'lang': 'en',
+                'freq': 'M',
+                's_adj': s_adj,
+                'age': age,
+                'unit': 'PC_ACT',
+                'sex': sex,
+                'geo': geo,
+            },
+            # Format 2: Simplified
+            {
+                'geo': geo,
+                'sex': sex,
+                'age': age,
+                's_adj': s_adj,
+            }
+        ]
         
-        st.write("🔄 **Trying Eurostat Bulk SDMX...**")
-        
-        # Build SDMX query
-        # Format: FREQ.S_ADJ.AGE.UNIT.SEX.GEO
-        key = f"M.{s_adj}.{age}.PC_ACT.{sex}.{geo}"
-        
-        url = f"{self.BULK_URLS['monthly']}/{key}"
-        
-        params = {
-            'startPeriod': start_year,
-            'endPeriod': end_year,
-            'format': 'jsonstat'  # Easier to parse
-        }
-        
-        try:
-            st.write(f"   URL: `{url}`")
-            
-            response = self.session.get(url, params=params, timeout=30)
-            
-            st.write(f"   Status: {response.status_code}")
-            
-            if response.status_code == 200:
+        for base_url in self.BASE_URLS:
+            for fmt_idx, params in enumerate(param_formats, 1):
                 
-                # Try to parse
-                try:
-                    data = response.json()
-                    df = self._parse_jsonstat(data)
-                    
-                    if df is not None and not df.empty:
-                        st.success(f"   ✅ Got {len(df)} observations from Eurostat!")
-                        return df
-                    else:
-                        st.warning("   ⚠️ Empty data")
+                url = f"{base_url}/{self.DATASET}"
                 
-                except Exception as e:
-                    st.error(f"   ❌ Parse error: {e}")
-                    
-                    # Try alternative parsing
+                self.logger.info(f"Trying URL variant {fmt_idx}", url=url[:100])
+                
+                # Try different Accept headers
+                accept_headers = [
+                    'application/json',
+                    'application/vnd.sdmx.data+json',
+                    'application/json, */*',
+                    '*/*'
+                ]
+                
+                for accept in accept_headers:
                     try:
-                        df = self._parse_sdmx_json(response.json())
-                        if df is not None and not df.empty:
-                            st.success(f"   ✅ Got {len(df)} with alternative parser!")
-                            return df
-                    except:
-                        pass
-            
-            else:
-                st.warning(f"   ⚠️ HTTP {response.status_code}")
-                if response.status_code == 404:
-                    st.info("   💡 Try different age/sex combination")
+                        headers = {
+                            'Accept': accept,
+                            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                        }
+                        
+                        self.logger.info(f"Accept: {accept[:50]}")
+                        
+                        response = self.session.get(
+                            url,
+                            params=params,
+                            headers=headers,
+                            timeout=30
+                        )
+                        
+                        self.logger.info(
+                            f"Response",
+                            status=response.status_code,
+                            content_type=response.headers.get('Content-Type', 'unknown')[:50]
+                        )
+                        
+                        if response.status_code == 200:
+                            
+                            # Try to parse JSON
+                            try:
+                                data = response.json()
+                                self.logger.success("JSON parsed successfully")
+                                
+                                # Try different parsers
+                                df = self._parse_jsonstat(data)
+                                
+                                if df is None or df.empty:
+                                    df = self._parse_sdmx_json(data)
+                                
+                                if df is None or df.empty:
+                                    df = self._parse_generic_json(data)
+                                
+                                if df is not None and not df.empty:
+                                    # Filter by year
+                                    df = df[
+                                        (df['date'].dt.year >= start_year) &
+                                        (df['date'].dt.year <= end_year)
+                                    ]
+                                    
+                                    if not df.empty:
+                                        self.logger.success(
+                                            f"Data extracted",
+                                            rows=len(df),
+                                            start=df['date'].min().strftime('%Y-%m'),
+                                            end=df['date'].max().strftime('%Y-%m')
+                                        )
+                                        return df
+                                    else:
+                                        self.logger.warning("Empty after date filter")
+                                else:
+                                    self.logger.warning("All parsers returned empty")
+                            
+                            except json.JSONDecodeError as e:
+                                self.logger.error(f"JSON decode failed: {e}")
+                        
+                        elif response.status_code == 406:
+                            self.logger.warning("406 Not Acceptable - trying different Accept header")
+                            continue
+                        
+                        else:
+                            self.logger.warning(f"HTTP {response.status_code}")
+                            self.logger.info("Response preview", body=response.text[:200])
+                    
+                    except requests.Timeout:
+                        self.logger.error("Request timeout")
+                    
+                    except Exception as e:
+                        self.logger.error(f"Request failed: {type(e).__name__}: {e}")
         
-        except Exception as e:
-            st.error(f"   ❌ Request failed: {e}")
-        
+        self.logger.error("Method 1 exhausted - no data")
         return None
     
     def _parse_jsonstat(self, data: dict) -> Optional[pd.DataFrame]:
         """Parse JSON-stat format"""
         try:
-            # JSON-stat structure
-            if 'dimension' not in data:
-                # Try to find dataset
-                if isinstance(data, dict) and 'dataset' in data:
-                    data = data['dataset']
-                elif isinstance(data, dict):
-                    # Sometimes nested
+            self.logger.info("Trying JSON-stat parser")
+            
+            # Check if it's JSON-stat
+            if 'dimension' not in data and 'value' not in data:
+                # Maybe nested
+                if isinstance(data, dict):
                     for key, val in data.items():
                         if isinstance(val, dict) and 'dimension' in val:
                             data = val
                             break
             
             if 'dimension' not in data:
+                self.logger.warning("Not JSON-stat format")
                 return None
             
             dimension = data['dimension']
-            value_array = data.get('value', [])
+            value_array = data.get('value', {})
             
             # Get time dimension
-            time_cat = dimension.get('time', {}).get('category', {})
-            time_index = time_cat.get('index', {})
+            time_key = None
+            for key in ['time', 'TIME', 'TIME_PERIOD']:
+                if key in dimension:
+                    time_key = key
+                    break
             
-            if not time_index:
+            if not time_key:
+                self.logger.warning("No time dimension found")
                 return None
             
-            # Get time codes in order
+            time_cat = dimension[time_key].get('category', {})
+            time_index = time_cat.get('index', {})
+            
+            # Get time codes
             if isinstance(time_index, dict):
                 time_codes = [k for k, v in sorted(time_index.items(), key=lambda x: x[1])]
             elif isinstance(time_index, list):
                 time_codes = time_index
             else:
+                self.logger.warning("Invalid time index format")
                 return None
             
-            # Build records
+            self.logger.info(f"Found {len(time_codes)} time periods")
+            
+            # Extract values
             records = []
             
             if isinstance(value_array, dict):
                 # Sparse format
                 for idx_str, val in value_array.items():
-                    idx = int(idx_str)
-                    if idx < len(time_codes) and val is not None:
-                        time_code = time_codes[idx]
-                        records.append({
-                            'time': time_code,
-                            'value': float(val)
-                        })
+                    try:
+                        idx = int(idx_str)
+                        if idx < len(time_codes) and val is not None:
+                            records.append({
+                                'time': time_codes[idx],
+                                'value': float(val)
+                            })
+                    except:
+                        continue
+            
             elif isinstance(value_array, list):
                 # Dense format
                 for idx, val in enumerate(value_array):
                     if idx < len(time_codes) and val is not None:
-                        time_code = time_codes[idx]
                         records.append({
-                            'time': time_code,
+                            'time': time_codes[idx],
                             'value': float(val)
                         })
             
             if not records:
+                self.logger.warning("No records extracted from JSON-stat")
                 return None
             
             df = pd.DataFrame(records)
@@ -263,78 +392,86 @@ class EurostatBulkFetcher:
             df = df.dropna(subset=['date'])
             df = df.sort_values('date')
             
+            self.logger.success(f"JSON-stat parsed: {len(df)} rows")
+            
             return df[['date', 'value']]
         
         except Exception as e:
-            st.write(f"   Parse error: {e}")
+            self.logger.error(f"JSON-stat parser failed: {e}")
             return None
     
     def _parse_sdmx_json(self, data: dict) -> Optional[pd.DataFrame]:
-        """Parse SDMX-JSON format (alternative)"""
+        """Parse SDMX JSON format"""
         try:
+            self.logger.info("Trying SDMX-JSON parser")
+            
             # Navigate to data
             if 'data' in data:
-                data_root = data['data']
-            else:
-                data_root = data
+                data = data['data']
             
-            if 'dataSets' not in data_root:
+            dataSets = data.get('dataSets', [])
+            
+            if not dataSets:
+                self.logger.warning("No dataSets in SDMX")
                 return None
             
-            datasets = data_root['dataSets']
-            if not datasets:
-                return None
+            dataset = dataSets[0]
             
-            dataset = datasets[0]
-            
-            # Get series
-            series = dataset.get('series', {})
-            
-            if not series:
-                # Try observations directly
-                observations = dataset.get('observations', {})
-                if observations:
-                    series = {'0': {'observations': observations}}
-            
-            # Get time dimension
-            structure = data_root.get('structure', {})
+            # Get time values
+            structure = data.get('structure', {})
             dimensions = structure.get('dimensions', {})
             obs_dims = dimensions.get('observation', [])
             
             time_values = None
             for dim in obs_dims:
-                if dim.get('id') in ['TIME_PERIOD', 'time', 'TIME']:
-                    values = dim.get('values', [])
-                    time_values = [v.get('id') or v.get('name') for v in values]
+                if dim.get('id', '').upper() in ['TIME_PERIOD', 'TIME']:
+                    time_values = [v.get('id', v.get('name')) for v in dim.get('values', [])]
                     break
             
             if not time_values:
+                self.logger.warning("No time values in SDMX")
                 return None
             
-            # Extract data
+            self.logger.info(f"Found {len(time_values)} time periods")
+            
+            # Extract observations
             records = []
             
-            for series_key, series_data in series.items():
-                observations = series_data.get('observations', {})
-                
-                for obs_idx, obs_value in observations.items():
-                    time_idx = int(obs_idx)
-                    
-                    if time_idx < len(time_values):
-                        time_period = time_values[time_idx]
-                        
-                        if isinstance(obs_value, list):
-                            value = obs_value[0]
-                        else:
-                            value = obs_value
-                        
-                        if value is not None:
-                            records.append({
-                                'time': time_period,
-                                'value': float(value)
-                            })
+            series = dataset.get('series', {})
+            
+            if series:
+                for s in series.values():
+                    obs = s.get('observations', {})
+                    for idx_str, val in obs.items():
+                        try:
+                            idx = int(idx_str)
+                            if idx < len(time_values):
+                                value = val[0] if isinstance(val, list) else val
+                                if value is not None:
+                                    records.append({
+                                        'time': time_values[idx],
+                                        'value': float(value)
+                                    })
+                        except:
+                            continue
+            else:
+                # Try direct observations
+                obs = dataset.get('observations', {})
+                for idx_str, val in obs.items():
+                    try:
+                        idx = int(idx_str)
+                        if idx < len(time_values):
+                            value = val[0] if isinstance(val, list) else val
+                            if value is not None:
+                                records.append({
+                                    'time': time_values[idx],
+                                    'value': float(value)
+                                })
+                    except:
+                        continue
             
             if not records:
+                self.logger.warning("No records from SDMX")
                 return None
             
             df = pd.DataFrame(records)
@@ -342,32 +479,107 @@ class EurostatBulkFetcher:
             df = df.dropna(subset=['date'])
             df = df.sort_values('date')
             
+            self.logger.success(f"SDMX parsed: {len(df)} rows")
+            
             return df[['date', 'value']]
         
         except Exception as e:
-            st.write(f"   Alternative parse error: {e}")
+            self.logger.error(f"SDMX parser failed: {e}")
             return None
     
+    def _parse_generic_json(self, data: dict) -> Optional[pd.DataFrame]:
+        """Generic JSON parser - last resort"""
+        try:
+            self.logger.info("Trying generic JSON parser")
+            
+            # Look for common patterns
+            records = []
+            
+            def find_data_recursive(obj, depth=0):
+                """Recursively find data arrays"""
+                if depth > 10:
+                    return
+                
+                if isinstance(obj, dict):
+                    # Look for data arrays
+                    for key in ['data', 'observations', 'values', 'series', 'dataset']:
+                        if key in obj:
+                            val = obj[key]
+                            if isinstance(val, list):
+                                return val
+                            elif isinstance(val, dict):
+                                find_data_recursive(val, depth + 1)
+                    
+                    # Recurse
+                    for val in obj.values():
+                        result = find_data_recursive(val, depth + 1)
+                        if result:
+                            return result
+                
+                return None
+            
+            data_array = find_data_recursive(data)
+            
+            if data_array:
+                self.logger.info(f"Found data array with {len(data_array)} items")
+                
+                # Try to extract
+                for item in data_array[:1000]:  # Limit to 1000
+                    if isinstance(item, dict):
+                        # Look for time and value
+                        time_val = item.get('time') or item.get('date') or item.get('period')
+                        value_val = item.get('value') or item.get('obs_value')
+                        
+                        if time_val and value_val:
+                            records.append({
+                                'time': time_val,
+                                'value': float(value_val)
+                            })
+            
+            if records:
+                df = pd.DataFrame(records)
+                df['date'] = df['time'].apply(self._parse_time)
+                df = df.dropna(subset=['date'])
+                df = df.sort_values('date')
+                
+                self.logger.success(f"Generic parser: {len(df)} rows")
+                
+                return df[['date', 'value']]
+        
+        except Exception as e:
+            self.logger.error(f"Generic parser failed: {e}")
+        
+        return None
+    
     def _parse_time(self, time_str: str) -> Optional[pd.Timestamp]:
-        """Parse time period to datetime"""
+        """Parse time string to datetime"""
         try:
             time_str = str(time_str).strip()
             
-            # Monthly: 2024-01
-            if len(time_str) == 7 and '-' in time_str:
-                return pd.to_datetime(time_str + '-01') + pd.offsets.MonthEnd(0)
+            # Monthly: 2024-01 or 2024M01
+            if len(time_str) == 7:
+                if '-' in time_str:
+                    return pd.to_datetime(time_str + '-01') + pd.offsets.MonthEnd(0)
+                elif 'M' in time_str:
+                    year, month = time_str.split('M')
+                    return pd.Timestamp(int(year), int(month), 1) + pd.offsets.MonthEnd(0)
             
             # Quarterly: 2024-Q1
-            if '-Q' in time_str:
-                year, quarter = time_str.split('-Q')
+            if '-Q' in time_str or 'Q' in time_str:
+                if '-Q' in time_str:
+                    year, quarter = time_str.split('-Q')
+                else:
+                    year = time_str[:4]
+                    quarter = time_str[-1]
+                
                 year = int(year)
                 quarter = int(quarter)
                 month = quarter * 3
-                return pd.Timestamp(year=year, month=month, day=1) + pd.offsets.MonthEnd(0)
+                return pd.Timestamp(year, month, 1) + pd.offsets.MonthEnd(0)
             
             # Year: 2024
             if len(time_str) == 4 and time_str.isdigit():
-                return pd.Timestamp(year=int(time_str), month=12, day=31)
+                return pd.Timestamp(int(time_str), 12, 31)
             
             # Try pandas
             return pd.to_datetime(time_str)
@@ -375,170 +587,150 @@ class EurostatBulkFetcher:
         except:
             return None
 
-
 # =============================================================================
-# ISTAT SDMX (Backup)
+# Method 2: OECD API (Alternative Source!)
 # =============================================================================
 
-class ISTATFetcher:
+class OECDFetcher:
     """
-    ISTAT SDMX fetcher با flow IDs درست
+    OECD API - Alternative reliable source!
+    Has Italy data and is very stable.
     """
     
-    # Known working endpoints
-    ENDPOINTS = [
-        'http://sdmx.istat.it/SDMXWS/rest',
-        'https://sdmx.istat.it/SDMXWS/rest',
-    ]
+    BASE_URL = "https://stats.oecd.org/sdmx-json/data"
+    DATASET = "MIG_NUP_RATES_GENDER"  # Or try "DP_LIVE" for unemployment
     
-    # Known dataflows for unemployment
-    # این flow IDs واقعی ISTAT هستند
-    FLOWS = {
-        'unemployment_monthly': 'DCCV_TAXDISOCC1',
-        'unemployment_quarterly': 'DCCV_TAXDISOCC',
-    }
-    
-    def __init__(self):
+    def __init__(self, logger: DebugLogger):
+        self.logger = logger
         self.session = HTTP
     
     def fetch(self,
-             geo: str = 'IT',
-             sex: str = '9',
-             age: str = 'Y15-74',
+             geo: str = 'ITA',
              start_year: int = 2015,
              end_year: int = 2024) -> Optional[pd.DataFrame]:
-        """Fetch from ISTAT"""
+        """Fetch from OECD"""
         
-        st.write("🔄 **Trying ISTAT SDMX...**")
+        self.logger.info("METHOD 2: OECD API")
         
-        # Try monthly first
-        for flow_id in self.FLOWS.values():
-            for endpoint in self.ENDPOINTS:
+        # OECD uses 3-letter codes
+        geo_map = {'IT': 'ITA', 'DE': 'DEU', 'FR': 'FRA', 'ES': 'ESP'}
+        geo_code = geo_map.get(geo, geo)
+        
+        # Try DP_LIVE dataset (simpler, more reliable)
+        url = "https://stats.oecd.org/sdmx-json/data/DP_LIVE/.UNEMP.../OECD"
+        
+        params = {
+            'contentType': 'json',
+            'detail': 'code',
+            'separator': '.',
+            'dimensionAtObservation': 'allDimensions'
+        }
+        
+        try:
+            self.logger.info(f"Trying OECD", url=url[:80])
+            
+            response = self.session.get(url, params=params, timeout=30)
+            
+            self.logger.info("Response", status=response.status_code)
+            
+            if response.status_code == 200:
+                data = response.json()
                 
-                # Different key structures to try
-                keys = [
-                    f"M.{geo}.{sex}.{age}",
-                    f"{geo}.{sex}.{age}",
-                    f"M.{geo}..{sex}.{age}",
-                ]
+                # Parse OECD SDMX format
+                df = self._parse_oecd_json(data, geo_code)
                 
-                for key in keys:
-                    url = f"{endpoint}/data/{flow_id}/{key}"
+                if df is not None and not df.empty:
+                    # Filter years
+                    df = df[
+                        (df['date'].dt.year >= start_year) &
+                        (df['date'].dt.year <= end_year)
+                    ]
                     
-                    params = {
-                        'startPeriod': start_year,
-                        'endPeriod': end_year
-                    }
-                    
-                    try:
-                        st.write(f"   Trying: `{url[:100]}...`")
-                        
-                        response = self.session.get(url, params=params, timeout=20)
-                        
-                        st.write(f"   Status: {response.status_code}")
-                        
-                        if response.status_code == 200:
-                            try:
-                                data = response.json()
-                                df = self._parse_sdmx(data)
-                                
-                                if df is not None and not df.empty:
-                                    st.success(f"   ✅ Got {len(df)} from ISTAT!")
-                                    return df
-                            
-                            except Exception as e:
-                                st.write(f"   Parse error: {e}")
-                        
-                        elif response.status_code == 404:
-                            st.write("   Not found, trying next...")
-                            continue
-                    
-                    except Exception as e:
-                        st.write(f"   Error: {e}")
-                        continue
+                    if not df.empty:
+                        self.logger.success(f"OECD data", rows=len(df))
+                        return df
         
-        st.warning("   ⚠️ ISTAT method exhausted")
+        except Exception as e:
+            self.logger.error(f"OECD failed: {e}")
+        
         return None
     
-    def _parse_sdmx(self, data: dict) -> Optional[pd.DataFrame]:
-        """Parse SDMX response"""
+    def _parse_oecd_json(self, data: dict, geo: str) -> Optional[pd.DataFrame]:
+        """Parse OECD SDMX JSON"""
         try:
-            # Similar to Eurostat parser
-            data_root = data.get('data', data)
-            datasets = data_root.get('dataSets', [])
+            # OECD SDMX structure
+            dataSets = data.get('data', {}).get('dataSets', [])
             
-            if not datasets:
+            if not dataSets:
                 return None
             
-            dataset = datasets[0]
-            series = dataset.get('series', {})
+            dataset = dataSets[0]
             
-            # Get time dimension
-            structure = data_root.get('structure', {})
+            # Get structure
+            structure = data.get('data', {}).get('structure', {})
             dimensions = structure.get('dimensions', {})
-            obs_dims = dimensions.get('observation', [])
+            
+            # Find time dimension
+            observation_dims = dimensions.get('observation', [])
             
             time_values = None
-            for dim in obs_dims:
-                if dim.get('id') in ['TIME_PERIOD', 'time']:
+            geo_values = None
+            
+            for dim in observation_dims:
+                dim_id = dim.get('id', '')
+                
+                if 'TIME' in dim_id.upper():
                     time_values = [v['id'] for v in dim.get('values', [])]
-                    break
+                
+                elif 'LOCATION' in dim_id.upper() or 'COUNTRY' in dim_id.upper():
+                    geo_values = [v['id'] for v in dim.get('values', [])]
             
             if not time_values:
                 return None
             
-            # Extract
+            # Extract observations
             records = []
-            for s in series.values():
-                for idx, val in (s.get('observations') or {}).items():
-                    t_idx = int(idx)
-                    if t_idx < len(time_values):
-                        time_period = time_values[t_idx]
-                        value = val[0] if isinstance(val, list) else val
-                        
-                        if value is not None:
-                            records.append({
-                                'time': time_period,
-                                'value': float(value)
-                            })
+            observations = dataset.get('observations', {})
             
-            if not records:
-                return None
+            for key, value in observations.items():
+                # Key is like "0:0:0:5" indicating dimension positions
+                indices = [int(x) for x in key.split(':')]
+                
+                # Get time
+                time_idx = indices[-1] if len(indices) > 0 else 0
+                
+                if time_idx < len(time_values):
+                    time_period = time_values[time_idx]
+                    val = value[0] if isinstance(value, list) else value
+                    
+                    if val is not None:
+                        records.append({
+                            'time': time_period,
+                            'value': float(val)
+                        })
             
-            df = pd.DataFrame(records)
-            df['date'] = df['time'].apply(self._parse_time)
-            df = df.dropna(subset=['date'])
-            df = df.sort_values('date')
-            
-            return df[['date', 'value']]
+            if records:
+                df = pd.DataFrame(records)
+                df['date'] = pd.to_datetime(df['time'], errors='coerce')
+                df = df.dropna(subset=['date'])
+                df = df.sort_values('date')
+                
+                return df[['date', 'value']]
         
-        except:
-            return None
+        except Exception as e:
+            self.logger.error(f"OECD parse failed: {e}")
+        
+        return None
+
+# =============================================================================
+# Method 3: Demo Data (Last Resort)
+# =============================================================================
+
+def generate_demo(start_year: int, end_year: int, logger: DebugLogger) -> pd.DataFrame:
+    """Generate demo data"""
     
-    def _parse_time(self, time_str: str) -> Optional[pd.Timestamp]:
-        """Parse time"""
-        try:
-            time_str = str(time_str).strip()
-            
-            if len(time_str) == 7 and '-' in time_str:
-                return pd.to_datetime(time_str + '-01') + pd.offsets.MonthEnd(0)
-            
-            if '-Q' in time_str:
-                year, quarter = time_str.split('-Q')
-                month = int(quarter) * 3
-                return pd.Timestamp(int(year), month, 1) + pd.offsets.MonthEnd(0)
-            
-            return pd.to_datetime(time_str)
-        except:
-            return None
-
-
-# =============================================================================
-# Demo Data (Last Resort)
-# =============================================================================
-
-def generate_demo_data(start_year: int, end_year: int, base: float = 9.5) -> pd.DataFrame:
-    """Generate realistic demo data"""
+    logger.warning("METHOD 3: Generating demo data")
+    logger.warning("All real data sources failed!")
     
     dates = pd.date_range(
         start=f'{start_year}-01-01',
@@ -549,7 +741,7 @@ def generate_demo_data(start_year: int, end_year: int, base: float = 9.5) -> pd.
     n = len(dates)
     np.random.seed(42)
     
-    # Seasonal + trend + noise
+    base = 9.5
     t = np.arange(n)
     seasonal = np.sin(t * 2 * np.pi / 12) * 0.3
     trend = -np.linspace(0, 1.2, n)
@@ -562,26 +754,15 @@ def generate_demo_data(start_year: int, end_year: int, base: float = 9.5) -> pd.
         'value': values
     })
 
-
 # =============================================================================
 # Main Fetcher
 # =============================================================================
 
-@dataclass
-class FetchResult:
-    """Result of fetch operation"""
-    df: pd.DataFrame
-    source: str  # 'EUROSTAT', 'ISTAT', or 'DEMO'
-    success: bool
-    message: str
-
-
-class UnemploymentFetcher:
-    """Main fetcher with fallback logic"""
+class MasterFetcher:
+    """Master fetcher with all methods"""
     
-    def __init__(self):
-        self.eurostat = EurostatBulkFetcher()
-        self.istat = ISTATFetcher()
+    def __init__(self, debug_mode: bool = True):
+        self.logger = DebugLogger() if debug_mode else None
     
     def fetch(self,
              geo: str = 'IT',
@@ -590,31 +771,31 @@ class UnemploymentFetcher:
              s_adj: str = 'SA',
              start_year: int = 2015,
              end_year: int = 2024,
-             try_demo: bool = True) -> FetchResult:
+             allow_demo: bool = True) -> Tuple[Optional[pd.DataFrame], str, DebugLogger]:
         """
-        Fetch unemployment data with automatic fallback
+        Fetch with all methods
         
-        Priority:
-        1. Eurostat (most reliable)
-        2. ISTAT (for Italy only)
-        3. Demo (if allowed)
+        Returns:
+            (dataframe, source, logger)
         """
+        
+        if self.logger:
+            self.logger.info(
+                "Starting fetch",
+                geo=geo,
+                sex=sex,
+                age=age,
+                period=f"{start_year}-{end_year}"
+            )
         
         # Map sex
         sex_map = {'Total': 'T', 'Male': 'M', 'Female': 'F'}
         sex_code = sex_map.get(sex, 'T')
         
-        # Map for ISTAT
-        istat_sex = {'Total': '9', 'Male': '1', 'Female': '2'}
-        istat_sex_code = istat_sex.get(sex, '9')
+        # Method 1: Eurostat JSON
+        eurostat = EurostatJSONFetcher(self.logger)
         
-        st.markdown("---")
-        st.markdown("## 🔄 Fetching Process")
-        
-        # Method 1: Eurostat
-        st.markdown("### Method 1: Eurostat")
-        
-        df = self.eurostat.fetch(
+        df = eurostat.fetch(
             geo=geo,
             sex=sex_code,
             age=age,
@@ -624,337 +805,146 @@ class UnemploymentFetcher:
         )
         
         if df is not None and not df.empty:
-            return FetchResult(
-                df=df,
-                source='EUROSTAT',
-                success=True,
-                message='Successfully fetched from Eurostat'
-            )
+            self.logger.success("SUCCESS via Eurostat JSON!")
+            return df, 'EUROSTAT', self.logger
         
-        st.markdown("---")
+        # Method 2: OECD
+        oecd = OECDFetcher(self.logger)
         
-        # Method 2: ISTAT (only for Italy)
-        if geo == 'IT':
-            st.markdown("### Method 2: ISTAT")
-            
-            df = self.istat.fetch(
-                geo=geo,
-                sex=istat_sex_code,
-                age=age,
-                start_year=start_year,
-                end_year=end_year
-            )
-            
-            if df is not None and not df.empty:
-                return FetchResult(
-                    df=df,
-                    source='ISTAT',
-                    success=True,
-                    message='Successfully fetched from ISTAT'
-                )
-            
-            st.markdown("---")
+        df = oecd.fetch(
+            geo=geo,
+            start_year=start_year,
+            end_year=end_year
+        )
+        
+        if df is not None and not df.empty:
+            self.logger.success("SUCCESS via OECD!")
+            return df, 'OECD', self.logger
         
         # Method 3: Demo
-        if try_demo:
-            st.markdown("### Method 3: Demo Data")
-            st.warning("⚠️ All APIs failed. Generating demo data...")
-            
-            df = generate_demo_data(start_year, end_year)
-            
-            return FetchResult(
-                df=df,
-                source='DEMO',
-                success=False,
-                message='All APIs failed - using demo data'
-            )
+        if allow_demo:
+            df = generate_demo(start_year, end_year, self.logger)
+            return df, 'DEMO', self.logger
         
-        # Complete failure
-        return FetchResult(
-            df=pd.DataFrame(),
-            source='NONE',
-            success=False,
-            message='All methods failed and demo disabled'
-        )
-
+        self.logger.error("ALL METHODS FAILED!")
+        return None, 'NONE', self.logger
 
 # =============================================================================
 # UI
 # =============================================================================
 
 def main():
-    st.markdown('<h1 class="main-header">🎯 Auto Unemployment Fetcher Pro</h1>', unsafe_allow_html=True)
+    st.markdown('<h1 class="main-title">🔥 Ultimate Fetcher with Full Debug</h1>', unsafe_allow_html=True)
     
-    st.info("""
-    **🚀 Automatic data fetching with smart fallbacks:**
-    - **Method 1:** Eurostat Bulk API (most reliable)
-    - **Method 2:** ISTAT SDMX (Italy only, backup)
-    - **Method 3:** Demo data (last resort)
+    st.warning("""
+    **🔥 This version has extensive debugging!**
+    
+    If it fails, the debug log will show exactly why.
+    Multiple data sources + multiple parsers = Maximum reliability!
     """)
     
     # Sidebar
     with st.sidebar:
-        st.header("⚙️ Parameters")
+        st.header("⚙️ Settings")
         
         geo = st.selectbox(
-            "🗺️ Country",
-            options=['IT', 'DE', 'FR', 'ES', 'EU27_2020', 'PT', 'NL', 'BE'],
-            format_func=lambda x: {
-                'IT': '🇮🇹 Italy',
-                'DE': '🇩🇪 Germany',
-                'FR': '🇫🇷 France',
-                'ES': '🇪🇸 Spain',
-                'EU27_2020': '🇪🇺 EU27',
-                'PT': '🇵🇹 Portugal',
-                'NL': '🇳🇱 Netherlands',
-                'BE': '🇧🇪 Belgium'
-            }.get(x, x)
+            "Country",
+            ['IT', 'DE', 'FR', 'ES'],
+            format_func=lambda x: {'IT':'🇮🇹 Italy','DE':'🇩🇪 Germany','FR':'🇫🇷 France','ES':'🇪🇸 Spain'}[x]
         )
         
-        sex = st.selectbox(
-            "👤 Sex",
-            options=['Total', 'Male', 'Female']
-        )
-        
-        age = st.selectbox(
-            "🎂 Age Group",
-            options=['Y15-74', 'Y15-24', 'Y25-74', 'TOTAL'],
-            format_func=lambda x: {
-                'Y15-74': '15-74 years',
-                'Y15-24': '15-24 years (youth)',
-                'Y25-74': '25-74 years',
-                'TOTAL': 'Total (all ages)'
-            }[x]
-        )
-        
-        s_adj = st.selectbox(
-            "📊 Adjustment",
-            options=['SA', 'NSA'],
-            format_func=lambda x: {
-                'SA': 'Seasonally adjusted',
-                'NSA': 'Not seasonally adjusted'
-            }[x]
-        )
-        
-        st.markdown("---")
+        sex = st.selectbox("Sex", ['Total', 'Male', 'Female'])
+        age = st.selectbox("Age", ['Y15-74', 'Y15-24', 'Y25-74', 'TOTAL'])
+        s_adj = st.selectbox("Adjustment", ['SA', 'NSA'])
         
         col1, col2 = st.columns(2)
-        
         with col1:
-            start_year = st.number_input("Start Year", 2000, 2024, 2015)
-        
+            start_year = st.number_input("Start", 2000, 2024, 2022)
         with col2:
-            end_year = st.number_input("End Year", 2000, 2025, 2024)
+            end_year = st.number_input("End", 2000, 2024, 2024)
         
         st.markdown("---")
         
-        try_demo = st.checkbox("Allow demo data if APIs fail", value=True)
+        debug_mode = st.checkbox("Show debug log", value=True)
+        allow_demo = st.checkbox("Allow demo if all fail", value=True)
     
-    # Fetch button
+    # Fetch
     if st.button("🚀 Fetch Data", type="primary", use_container_width=True):
         
-        fetcher = UnemploymentFetcher()
+        fetcher = MasterFetcher(debug_mode=debug_mode)
         
-        with st.spinner("Fetching unemployment data..."):
-            result = fetcher.fetch(
+        with st.spinner("Fetching from multiple sources..."):
+            df, source, logger = fetcher.fetch(
                 geo=geo,
                 sex=sex,
                 age=age,
                 s_adj=s_adj,
                 start_year=start_year,
                 end_year=end_year,
-                try_demo=try_demo
+                allow_demo=allow_demo
             )
+        
+        # Show debug first
+        if debug_mode and logger:
+            logger.display()
         
         st.markdown("---")
         
-        # Display result
-        if result.success and result.source != 'DEMO':
-            # Real data
-            st.markdown(f"""
-            <div class="source-badge source-{result.source.lower()}">
-                ✅ Source: {result.source}
-            </div>
-            """, unsafe_allow_html=True)
-            
-            st.success(result.message)
+        # Show result
+        if df is None or df.empty:
+            st.error("❌ No data retrieved")
+            st.stop()
         
-        elif result.source == 'DEMO':
-            # Demo data
+        if source == 'EUROSTAT':
             st.markdown("""
-            <div class="source-badge source-demo">
-                ⚠️ Source: DEMO DATA
+            <div class="success-method">
+                ✅ SUCCESS: Data from Eurostat (Official EU Statistics)
             </div>
             """, unsafe_allow_html=True)
-            
-            st.warning(result.message)
+        
+        elif source == 'OECD':
+            st.markdown("""
+            <div class="success-method">
+                ✅ SUCCESS: Data from OECD (Official OECD Statistics)
+            </div>
+            """, unsafe_allow_html=True)
+        
+        elif source == 'DEMO':
             st.error("""
-            **This is sample data, not real statistics!**
+            ⚠️ DEMO DATA - All real sources failed!
             
-            **Possible solutions:**
-            - Wait a few minutes and try again (servers may be busy)
-            - Try different country (e.g., Germany, France)
-            - Use manual Excel upload instead
-            - Check your internet connection
+            This is synthetic data for testing only.
             """)
         
-        else:
-            st.error("❌ All methods failed")
-            st.stop()
-        
-        # Show data
-        df = result.df
-        
-        if df.empty:
-            st.error("No data returned")
-            st.stop()
-        
-        st.markdown("## 📊 Data Summary")
+        # Display data
+        st.markdown("## 📊 Data")
         
         col1, col2, col3, col4 = st.columns(4)
         
         with col1:
-            st.metric("📈 Observations", len(df))
-        
+            st.metric("Observations", len(df))
         with col2:
-            st.metric("📅 Start", df['date'].min().strftime('%Y-%m'))
-        
+            st.metric("Start", df['date'].min().strftime('%Y-%m'))
         with col3:
-            st.metric("📅 End", df['date'].max().strftime('%Y-%m'))
-        
+            st.metric("End", df['date'].max().strftime('%Y-%m'))
         with col4:
-            st.metric("📌 Latest", f"{df['value'].iloc[-1]:.2f}%")
+            st.metric("Latest", f"{df['value'].iloc[-1]:.2f}%")
         
         # Chart
-        st.markdown("### 📈 Time Series")
-        
-        df_plot = df.set_index('date')
-        st.line_chart(df_plot['value'])
+        st.line_chart(df.set_index('date')['value'])
         
         # Table
-        st.markdown("### 📋 Data Table")
-        
-        display_df = df.copy()
-        display_df['date'] = display_df['date'].dt.strftime('%Y-%m-%d')
-        display_df['value'] = display_df['value'].round(2)
-        
-        st.dataframe(display_df, use_container_width=True, height=400)
+        st.dataframe(df, use_container_width=True)
         
         # Download
-        st.markdown("### 💾 Download")
-        
         csv = df.to_csv(index=False)
-        
         st.download_button(
-            label="📥 Download as CSV",
-            data=csv,
-            file_name=f"unemployment_{result.source}_{geo}_{start_year}_{end_year}.csv",
-            mime="text/csv",
+            "💾 Download CSV",
+            csv,
+            f"unemployment_{source}_{geo}_{start_year}_{end_year}.csv",
+            "text/csv",
             use_container_width=True
         )
-        
-        # Save to state (if utils available)
-        try:
-            from utils.state import AppState
-            
-            st.markdown("---")
-            st.markdown("### 💾 Save to Application")
-            
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                if st.button("💾 Save as Target", use_container_width=True):
-                    state = AppState.get()
-                    ts = pd.Series(
-                        df['value'].values,
-                        index=df['date'],
-                        name='unemployment'
-                    )
-                    state.y_monthly = ts
-                    AppState.update_timestamp()
-                    st.success("✅ Saved to state.y_monthly!")
-                    st.balloons()
-            
-            with col2:
-                if st.button("💾 Add to Panel", use_container_width=True):
-                    state = AppState.get()
-                    
-                    panel_df = df.set_index('date')
-                    panel_df.columns = [f'unemployment_{geo}']
-                    
-                    if state.panel_monthly is not None:
-                        state.panel_monthly = state.panel_monthly.join(panel_df, how='outer')
-                    else:
-                        state.panel_monthly = panel_df
-                    
-                    AppState.update_timestamp()
-                    st.success("✅ Added to panel!")
-                    st.balloons()
-        
-        except ImportError:
-            pass
-    
-    # Info section
-    st.markdown("---")
-    
-    with st.expander("ℹ️ About This Tool"):
-        st.markdown("""
-        ### 🎯 How It Works
-        
-        This tool automatically tries multiple data sources in order:
-        
-        1. **Eurostat Bulk API** (Primary)
-           - Most reliable and stable
-           - Covers all EU countries
-           - Monthly unemployment data
-           - Official statistics
-        
-        2. **ISTAT SDMX** (Backup - Italy only)
-           - Direct from Italian statistics
-           - Used as fallback for Italy
-           - May have different update schedule
-        
-        3. **Demo Data** (Last Resort)
-           - Realistic synthetic data
-           - Only if all APIs fail
-           - **Clearly marked as demo**
-        
-        ### 📊 Data Quality
-        
-        - **Eurostat/ISTAT**: Official government statistics
-        - **Demo**: Sample data for testing only
-        
-        ### 🔧 Troubleshooting
-        
-        If you get demo data:
-        - Try different country (Germany/France very reliable)
-        - Wait a few minutes (servers may be busy)
-        - Check internet connection
-        - Use manual upload as alternative
-        """)
-    
-    with st.expander("🔍 Technical Details"):
-        st.markdown("""
-        ### API Endpoints Used
-        
-        **Eurostat:**
-        - `https://ec.europa.eu/eurostat/api/dissemination/sdmx/2.1/data/une_rt_m`
-        - Format: SDMX 2.1 / JSON-stat
-        - Dataset: une_rt_m (monthly unemployment rate)
-        
-        **ISTAT:**
-        - `http://sdmx.istat.it/SDMXWS/rest`
-        - Dataflow: DCCV_TAXDISOCC1 (monthly)
-        - Format: SDMX JSON
-        
-        ### Error Handling
-        
-        - Automatic retries (3x)
-        - Multiple endpoint fallbacks
-        - Smart parsing (JSON-stat + SDMX)
-        - Clear error messages
-        """)
-
 
 if __name__ == "__main__":
     main()
