@@ -605,25 +605,3 @@ with col2:
 
 with col3:
     st.caption("💻 Built with Streamlit + Utils")
-```
-
----
-
-## 🚀 **نحوه استفاده:**
-
-### 1️⃣ ساختار نهایی:
-```
-unemployment_Italy/
-├── utils/
-│   ├── __init__.py              ✅
-│   ├── state.py                 ✅
-│   ├── istat_handler.py         ✅
-│   ├── excel_processor.py       ✅
-│   ├── data_detector.py         ✅
-│   └── visualizer.py            ✅
-├── pages/
-│   ├── 1_Dashboard.py
-│   ├── 2_Data_Aggregation.py   ✅ (جدید)
-│   └── ...
-├── app.py
-└── requirements.txt
