@@ -1,898 +1,552 @@
-# کتابخانه‌های مورد نیاز را ایمپورت می‌کنیم
-import pandas as pd
+"""
+Unemployment Auto‑Fetcher (ISTAT + Eurostat)
+===========================================
+A robust, single‑file Streamlit app that automatically fetches **monthly unemployment**
+(time series) from **ISTAT** (primary) with **Eurostat** fallback, plus optional
+monthly/quarterly auxiliary indicators. Designed to be resilient on Streamlit Cloud.
+
+Key features
+------------
+- Primary source: ISTAT SDMX REST (new endpoint). Fallback: Eurostat via `pandasdmx` if available.
+- Dynamic **edition** discovery for ISTAT (latest release auto‑detection, manual override).
+- Dimension‑aware key building for ISTAT (FREQ, GEO, DATA_TYPE, ADJUSTMENT, SEX, AGE, EDITION).
+- Clean SDMX‑JSON parsing (no XML required). Optional `pandasdmx` for Eurostat; if absent, app stays functional.
+- Caching, retry & timeout, graceful error messages, never crashes—falls back to sample data.
+- Target series: Unemployment Rate; optional helpers (Eurostat STS/CI) for nowcasting.
+
+Notes
+-----
+- ISTAT codes: SEX {"1": male, "2": female, "9": total}; ADJUSTMENT {"N": NSA, "Y": SA}.
+- Eurostat codes: `une_rt_m` with s_adj {NSA, SA, TC}, sex {M, F, T}, age {TOTAL, Y_LT25, Y25-74}, unit {PC_ACT}.
+- For auxiliary monthly indicators (Eurostat): IPI (sts_inpr_m), Retail Volume (sts_trtu_m), Services Turnover (sts_setu_m), Hours worked (sts_inlb_m), Consumer Confidence (ei_bsco_m). All are optional.
+
+This file intentionally contains **no requirements.txt**. If Eurostat access via `pandasdmx` is desired, add it
+in your deployment (Streamlit Cloud → App packages) together with `lxml`. The app still works without them.
+"""
+
+from __future__ import annotations
+import re
+import json
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Tuple
+from datetime import datetime
+
 import numpy as np
+import pandas as pd
 import requests
-from pandasdmx import Request
-import matplotlib.pyplot as plt
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
 import streamlit as st
-from lxml import etree
 
-# تنظیمات اولیه برای ظاهر نمودارها (فونت و اندازه)
-plt.rcParams.update({
-    "font.size": 10,
-    "axes.titlesize": 12,
-    "axes.labelsize": 11
-})
+# Try using pandasdmx for Eurostat (optional). If missing, we keep running without it.
+try:
+    import pandasdmx as sdmx  # type: ignore
+    HAS_PANDASDMX = True
+except Exception:
+    HAS_PANDASDMX = False
 
-# تابع کمکی برای واکشی فهرست نسخه‌های موجود (Edition) از ISTAT
+# =============================================================================
+# Streamlit page config & styles
+# =============================================================================
+st.set_page_config(page_title="Unemployment Auto‑Fetcher — ISTAT + Eurostat", page_icon="📈", layout="wide")
+
+st.markdown(
+    """
+    <style>
+      .title {font-size:2rem;font-weight:800;text-align:center;margin:0.3rem 0 0.6rem;}
+      .badge {display:inline-block;padding:.15rem .4rem;border-radius:.4rem;border:1px solid #e5e7eb;background:#f9fafb;font-size:.75rem}
+      .card {background:#fff;border:1px solid #e5e7eb;border-radius:.6rem;padding:1rem}
+      .ok {border-left:4px solid #10b981}
+      .warn {border-left:4px solid #f59e0b}
+      .bad {border-left:4px solid #ef4444}
+      .muted{color:#64748b}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+st.markdown('<div class="title">📈 Unemployment Auto‑Fetcher (ISTAT → Eurostat fallback)</div>', unsafe_allow_html=True)
+
+# =============================================================================
+# HTTP session with retries
+# =============================================================================
+
+def make_session() -> requests.Session:
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent": "ISTAT-Eurostat-Unemployment/1.0 (+streamlit)",
+        "Accept": "application/vnd.sdmx.data+json, application/json; q=0.9, */*; q=0.5",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+    })
+    retry = Retry(total=4, connect=4, read=4, backoff_factor=0.7,
+                  status_forcelist=[429, 500, 502, 503, 504], allowed_methods=["GET", "HEAD"],
+                  raise_on_status=False)
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=8, pool_maxsize=8)
+    s.mount("http://", adapter)
+    s.mount("https://", adapter)
+    return s
+
+HTTP = make_session()
+
+# =============================================================================
+# SDMX‑JSON parsing (generic)
+# =============================================================================
+
+def parse_sdmx_json(j: Dict[str, Any]) -> pd.DataFrame:
+    """Convert SDMX‑JSON to a tidy DataFrame with columns [date, value].
+    Returns empty DataFrame on any issue (never raises)."""
+    try:
+        root = j.get("data", j)
+        datasets = root.get("dataSets", [])
+        if not datasets:
+            return pd.DataFrame()
+        ds = datasets[0]
+        structure = root.get("structure", {})
+        obs_dims = (structure.get("dimensions", {}) or {}).get("observation", [])
+        time_values: Optional[List[str]] = None
+        for d in obs_dims:
+            if d.get("id") == "TIME_PERIOD":
+                time_values = [v.get("id") for v in d.get("values", [])]
+                break
+        if not time_values:
+            return pd.DataFrame()
+        rec: List[Dict[str, Any]] = []
+        series = ds.get("series", {}) or {}
+        if series:
+            for s in series.values():
+                for idx, raw in (s.get("observations", {}) or {}).items():
+                    t = time_values[int(idx)]
+                    v = raw[0] if isinstance(raw, list) else raw
+                    rec.append({"time": t, "value": float(v)})
+        else:
+            for idx, raw in (ds.get("observations", {}) or {}).items():
+                t = time_values[int(idx)]
+                v = raw[0] if isinstance(raw, list) else raw
+                rec.append({"time": t, "value": float(v)})
+        if not rec:
+            return pd.DataFrame()
+        df = pd.DataFrame(rec)
+        # map period to timestamp (monthly preferred)
+        def to_date(p: str) -> Optional[pd.Timestamp]:
+            p = str(p)
+            if re.match(r"^\d{4}-\d{2}$", p):
+                return pd.to_datetime(p) + pd.offsets.MonthEnd(0)
+            if "-Q" in p:
+                y, q = p.split("-Q"); y = int(y); m = int(q) * 3
+                return pd.Timestamp(y, m, 1) + pd.offsets.MonthEnd(0)
+            if re.match(r"^\d{4}$", p):
+                return pd.Timestamp(int(p), 12, 31)
+            return pd.to_datetime(p, errors="coerce")
+        df["date"] = df["time"].map(to_date)
+        return df.dropna(subset=["date"]).sort_values("date")[ ["date", "value"] ]
+    except Exception:
+        return pd.DataFrame()
+
+# =============================================================================
+# ISTAT helpers (dataflow 151_874: monthly unemployment rate)
+# =============================================================================
+ISTAT_BASE = "https://esploradati.istat.it/SDMXWS/rest"
+ISTAT_FLOW_UNEM = "151_874"          # Unemployment rate — monthly
+ISTAT_INDICATOR = "UNEM_R"
+
+# ISTAT codes (fixed)
+ISTAT_SEX_MAP = {"Total": "9", "Male": "1", "Female": "2"}
+ISTAT_ADJ_MAP = {"NSA": "N", "SA": "Y"}  # Trend not available in ISTAT monthly
+
+# Expose common age bands used by ISTAT (Eurostat will be mapped separately)
+AGE_CHOICES = {
+    "15–74 (Total)": "Y15-74",
+    "15–24": "Y15-24",
+    "25–74": "Y25-74",
+    "15–34": "Y15-34",
+    "35–49": "Y35-49",
+    "50–64": "Y50-64",
+    "50–74": "Y50-74",
+    "15–64": "Y15-64",
+}
+
 @st.cache_data(show_spinner=False)
-def get_istat_editions():
+def istat_list_editions(sex_code: str = "9", age_code: str = "Y15-74", adj_code: str = "N") -> List[str]:
+    """Return all available EDITION codes for the given slice using `serieskeysonly`.
+    We query a standard slice and collect the EDITION codes from series keys.
     """
-    این تابع فهرست همه کدهای Edition موجود برای نرخ بیکاری ماهانه ISTAT (151_874) را برمی‌گرداند.
-    از خروجی سری‌های ISTAT (با detail=serieskeysonly) استفاده می‌کند تا تمامی Editionها استخراج شوند.
-    """
-    url = "https://esploradati.istat.it/SDMXWS/rest/data/ISTAT/151_874/M.IT.UNEM_R.N.9.Y15-74?detail=serieskeysonly"
-    try:
-        resp = requests.get(url, timeout=10)
-        resp.raise_for_status()
-    except Exception as e:
-        # در صورت وقوع خطا (مثلا timeout یا عدم دسترسی)، یک لیست خالی برمی‌گردانیم تا بعداً مدیریت شود
+    key = f"M.IT.{ISTAT_INDICATOR}.{adj_code}.{sex_code}.{age_code}"
+    url = f"{ISTAT_BASE}/data/ISTAT/{ISTAT_FLOW_UNEM}/{key}"
+    params = {"detail": "serieskeysonly", "format": "sdmx-json"}
+    r = HTTP.get(url, params=params, timeout=(10, 45))
+    if r.status_code != 200:
         return []
-    # محتوای XML را با lxml تجزیه می‌کنیم تا کد Edition را استخراج کنیم
-    editions = set()
-    try:
-        root = etree.fromstring(resp.content)
-        # هر عنصر SeriesKey شامل چند مقدار (Value) است که یکی از آنها Edition است
-        for sk in root.findall(".//SeriesKey"):
-            for val in sk.findall(".//Value"):
-                if val.get("concept") == "EDITION":
-                    editions.add(val.get("value"))
-        # مجموعه Editionها را به صورت لیست برمی‌گردانیم و مرتب می‌کنیم
-        return sorted(list(editions))
-    except Exception as e:
+    j = r.json()
+    root = j.get("data", j)
+    structure = root.get("structure", {})
+    # series dimension metadata
+    s_dims = (structure.get("dimensions", {}) or {}).get("series", [])
+    idx_by_id = {d.get("id"): i for i, d in enumerate(s_dims)}
+    if "EDITION" not in idx_by_id:
         return []
+    ed_idx = idx_by_id["EDITION"]
+    # list of code values for each series dimension
+    value_lists = [ [v.get("id") for v in (d.get("values") or [])] for d in s_dims ]
+    out: List[str] = []
+    for key_str in (root.get("dataSets", [{}])[0].get("series") or {}).keys():
+        # series key is colon‑separated indices
+        try:
+            parts = [int(x) for x in key_str.split(":")]
+            code = value_lists[ed_idx][parts[ed_idx]]
+            out.append(code)
+        except Exception:
+            continue
+    return sorted(list(dict.fromkeys(out)))  # unique & ordered
 
-# تابع کمکی برای تعیین آخرین کد Edition (آخرین نسخه منتشرشده داده‌ها) از لیست Editionها
-def get_latest_edition_code(editions):
-    """
-    با داشتن لیست کدهای Edition، آخرین کد (بر اساس تاریخ) را پیدا می‌کند.
-    فرمت کدها: YYYYMxGy  (مثلاً 2025M10G2 یعنی 2 اکتبر 2025)
-    روش: بر اساس سال، ماه و روز مرتب‌سازی می‌کند.
-    """
+def istat_pick_latest_edition(editions: List[str]) -> Optional[str]:
     if not editions:
         return None
-    # تابع تبدیل کد Edition به یک مقدار قابل مقایسه (سال، ماه، روز)
-    def parse_edition_code(code):
-        # جدا کردن بخش‌های سال، ماه و روز (با حذف "M" و "G")
-        # مثال: "2025M10G2" -> سال=2025، ماه=10، روز=2
+    def parse(code: str) -> Tuple[int, int, int]:
+        # e.g., 2025M10G2 → (2025, 10, 2)
         try:
-            year_str, rest = code.split("M", 1)
-            year = int(year_str)
-            month_str, day_str = rest.split("G", 1)
-            month = int(month_str)
-            day = int(day_str)
-        except:
-            year = month = day = -1
-        return (year, month, day)
-    # بر اساس سال/ماه/روز مرتب می‌کنیم و آخرین را انتخاب می‌کنیم
-    latest = max(editions, key=lambda x: parse_edition_code(x))
-    return latest
-
-# تابع واکشی داده‌ها از ISTAT
-@st.cache_data(show_spinner=False)
-def fetch_from_istat(country_code, sex_code, age_code, adjust_code, start_period, end_period, edition_code=None):
-    """
-    تلاش برای واکشی سری زمانی نرخ بیکاری از ISTAT با استفاده از SDMX RESTful API.
-    اگر edition_code مشخص نشده باشد، آخرین نسخه را به صورت خودکار پیدا می‌کند.
-    country_code باید 'IT' باشد (داده‌های ISTAT فقط برای ایتالیا).
-    sex_code (کد جنسیت)، age_code (کد گروه سنی)، adjust_code (کد تعدیل فصلی).
-    """
-    # اگر کد Edition داده نشده، تلاش می‌کنیم آخرین را پیدا کنیم
-    ed_code = edition_code
-    if ed_code is None:
-        editions = get_istat_editions()
-        ed_code = get_latest_edition_code(editions)
-    # اگر هنوز هم Edition معلوم نیست، یک خطا ایجاد می‌کنیم
-    if ed_code is None:
-        raise ValueError("عدم تشخیص نسخه انتشار داده‌های ISTAT")
-    # ساخت کلید SDMX بر اساس کدهای ابعاد 
-    # ترتیب ابعاد: FREQ.REGION.DATA_TYPE.ADJUSTMENT.SEX.AGE.EDITION
-    freq = "M"  # نرخ بیکاری ماهانه
-    region = country_code  # برای ISTAT باید 'IT' باشد
-    data_type = "UNEM_R"  # نرخ بیکاری
-    adjustment = adjust_code  # 'N' یا 'Y' (و احتمالاً 'T' اگر وجود داشت)
-    sex = sex_code  # '1', '2', '9'
-    age = age_code  # مانند 'Y15-74' برای کل، یا 'Y15-24' و غیره
-    edition = ed_code
-    sdmx_key = f"{freq}.{region}.{data_type}.{adjustment}.{sex}.{age}.{edition}"
-    # ساخت URL درخواست داده
-    url = f"https://esploradati.istat.it/SDMXWS/rest/data/ISTAT/151_874/{sdmx_key}"
-    params = {}
-    # اگر تاریخ شروع/پایان مشخص شده باشد، آنها را به‌صورت پارامتر SDMX (startPeriod, endPeriod) اضافه می‌کنیم
-    if start_period:
-        params["startPeriod"] = start_period
-    if end_period:
-        params["endPeriod"] = end_period
-    # درخواست داده به ISTAT
-    resp = requests.get(url, params=params, timeout=15)
-    # اگر پاسخ موفق نبود، خطا می‌دهیم تا به fallback برسیم
-    resp.raise_for_status()
-    # واکشی داده با pandasdmx برای سادگی تبدیل به DataFrame
-    istat_req = Request('ISTAT')
-    # تلاش می‌کنیم از pandasdmx برای دریافت داده استفاده کنیم (پانداسDMX خودش از SDMX-ML استفاده می‌کند)
-    data_msg = istat_req.data('151_874', key={'FREQ': freq, 'REF_AREA': region, 'DATA_TYPE': data_type,
-                                             'ADJUSTMENT': adjustment, 'SEX': sex, 'AGE': age, 'EDITION': edition},
-                              params={'startPeriod': start_period, 'endPeriod': end_period})
-    # تبدیل پیام داده به یک DataFrame پانداس
-    data_series = None
-    try:
-        data_series = data_msg.to_pandas()
-    except Exception as e:
-        # اگر pandasdmx نتواند مستقیماً تبدیل کند، خودمان با xml parse می‌کنیم
-        root = etree.fromstring(resp.content)
-        obs_values = []
-        obs_dates = []
-        for obs in root.findall(".//Series/Obs"):
-            # هر Obs دارای TimePeriod و ObsValue است
-            time_elem = obs.find(".//ObsDimension")
-            val_elem = obs.find(".//ObsValue")
-            if time_elem is not None and val_elem is not None:
-                time_val = time_elem.get("value")
-                obs_val = val_elem.get("value")
-                # تبدیل مقادیر به float (مقادیر ممکن است به صورت رشته باشند)
-                try:
-                    obs_val = float(obs_val)
-                except:
-                    obs_val = None
-                obs_dates.append(time_val)
-                obs_values.append(obs_val)
-        if not obs_dates:
-            raise ValueError("داده‌ای از ISTAT بازیابی نشد")
-        data_series = pd.Series(data=obs_values, index=pd.to_datetime(obs_dates, format="%Y-%m"))
-    # اگر Series برگردانده شد، آن را به DataFrame (یک ستون) تبدیل می‌کنیم
-    df = pd.DataFrame({"Unemployment Rate": data_series})
-    # مرتب‌سازی بر اساس تاریخ (اندیس)
-    df = df.sort_index()
-    return df
-
-# تابع واکشی داده‌ها از Eurostat
-@st.cache_data(show_spinner=False)
-def fetch_from_eurostat(country_code, sex_code, age_code, adjust_code, start_period, end_period):
-    """
-    واکشی نرخ بیکاری ماهانه از Eurostat (دیتاست une_rt_m) با استفاده از pandasdmx.
-    country_code کد کشور (مانند 'IT' برای ایتالیا)، sex_code ('T','M','F'), age_code ('TOTAL','Y_LT25','Y25-74'),
-    adjust_code ('NSA','SA','TC').
-    """
-    estat_req = Request('ESTAT')
-    # استفاده از pandasdmx برای دریافت داده، تعیین فیلترها
-    # dataset: une_rt_m
-    # ابعاد: unit, s_adj, sex, age, geo
-    # واحد PC_ACT (درصد فعالان)
-    # sex, age, adjust طبق انتخاب کاربر
-    # geo طبق کشور
-    key_filters = {
-        'unit': 'PC_ACT',
-        's_adj': adjust_code,
-        'sex': sex_code,
-        'age': age_code,
-        'geo': country_code
-    }
-    params = {}
-    if start_period:
-        params["startPeriod"] = start_period
-    if end_period:
-        params["endPeriod"] = end_period
-    data_msg = estat_req.data('une_rt_m', key=key_filters, params=params)
-    # تبدیل به DataFrame (pandasdmx به صورت Series چندبعدی یا DataFrame چندشاخص برمی‌گرداند)
-    data_series = data_msg.to_pandas()
-    # data_series ممکن است یک Series چندشاخص (MultiIndex) باشد (اگر فقط یک سری باشد، خودش Series می‌شود)
-    # ما فقط یک ترکیب sex/age/geo داریم، بنابراین باید یک سری ساده باشد. اگر DataFrame بود، آن را تک ستونه می‌کنیم.
-    if isinstance(data_series, pd.Series):
-        df = pd.DataFrame({"Unemployment Rate": data_series})
-    else:
-        # اگر نتیجه DataFrame بود (چندین سری)، فیلتر می‌کنیم فقط سری مورد نظر را.
-        try:
-            df = pd.DataFrame({"Unemployment Rate": data_series.xs((sex_code, age_code, country_code, adjust_code, "PC_ACT"), level=[2,3,4,1,0])})
-        except:
-            # اگر xs موفق نبود، مستقیماً اولین ستون را می‌گیریم
-            df = pd.DataFrame(data_series)
-            df.columns = ["Unemployment Rate"]
-    # اندیس زمان را به تایم‌استمپ پایتون تبدیل می‌کنیم (اگر به صورت Period باشد)
-    if isinstance(df.index, pd.PeriodIndex):
-        df.index = df.index.to_timestamp()
-    # مرتب‌سازی تاریخ
-    df = df.sort_index()
-    return df
-
-# تابع واکشی داده‌های کمکی (Auxiliary) از Eurostat
-@st.cache_data(show_spinner=False)
-def fetch_aux_from_eurostat(dataset_code, country_code, sex_code, age_code):
-    """
-    واکشی داده‌های کمکی از Eurostat. dataset_code می‌تواند 'lfsq_argan' (نرخ مشارکت) یا 'lfsq_agan' (جمعیت فعال) باشد.
-    داده‌های LFS فصلی یا سالانه هستند. این تابع نزدیک‌ترین فرکانس را برمی‌گرداند (احتمالاً فصلی).
-    sex_code, age_code بر اساس انتخاب کاربر.
-    """
-    estat_req = Request('ESTAT')
-    # تنظیم فیلترها. فرض می‌کنیم اگر واحد لازم باشد، کتابخانه به‌صورت خودکار تنظیم می‌کند.
-    key_filters = {
-        'sex': sex_code,
-        'age': age_code,
-        'geo': country_code
-    }
-    # اگر dataset_code مربوط به جمعیت فعال باشد، احتمالاً واحد آن 'THS' (هزار نفر) است
-    if dataset_code == 'lfsq_agan':
-        key_filters['unit'] = 'THS'
-    elif dataset_code == 'lfsq_argan':
-        # برای نرخ مشارکت احتمالاً درصد جمعیت (ممکن است واحد 'PC_POP' باشد، بررسی می‌کنیم)
-        key_filters['unit'] = 'PC_POP'  # درصد جمعیت در نیروی کار (تخمینی)
-    try:
-        data_msg = estat_req.data(dataset_code, key=key_filters)
-    except Exception as e:
-        # اگر درخواست اولیه با واحد تنظیم‌شده خطا داد، بدون unit دوباره تلاش می‌کنیم (ممکن است واحد ثابت باشد)
-        key_filters.pop('unit', None)
-        data_msg = estat_req.data(dataset_code, key=key_filters)
-    data_series = data_msg.to_pandas()
-    # تبدیل به DataFrame
-    if isinstance(data_series, pd.Series):
-        df = pd.DataFrame({dataset_code: data_series})
-    else:
-        # اگر سری‌های متعدد بود، سعی می‌کنیم فیلتر sex/age/geo را انتخاب کنیم
-        try:
-            df = pd.DataFrame(data_series.xs((sex_code, age_code, country_code), level=[1,2,3]))
-            df.columns = [dataset_code]
-        except:
-            df = pd.DataFrame(data_series)
-            df.columns = [dataset_code]
-    # تبدیل اندیس دوره به تاریخ
-    if isinstance(df.index, pd.PeriodIndex):
-        df.index = df.index.to_timestamp()
-    df = df.sort_index()
-    return df
-
-# تابع واکشی داده‌های کمکی از ISTAT
-@st.cache_data(show_spinner=False)
-def fetch_aux_from_istat(flow_id, country_code, sex_code, age_code, adjust_code):
-    """
-    واکشی داده کمکی از ISTAT برای flow_id داده‌شده (مثلاً 150_876 برای نرخ فعالیت، 150_873 برای جمعیت فعال).
-    سایر کدهای ابعاد مشابه نرخ بیکاری پر می‌شوند.
-    adjust_code برای تعیین تعدیل فصلی ('N' یا 'Y') استفاده می‌شود.
-    """
-    # data_type بستگی به flow دارد. به عنوان مثال:
-    # برای 150_876 (نرخ مشارکت) ممکن است data_type = 'ACTIVITY_RATE' یا مشابه باشد.
-    # برای 150_873 (جمعیت فعال) ممکن است 'LABOUR_FORCE' باشد.
-    # برای سادگی، از flow_id استفاده می‌کنیم فرض بر این که فقط یک اندیکاتور دارد و نیازی به data_type نیست.
-    freq = "M"
-    region = country_code
-    # تعیین data_type بر اساس flow_id:
-    if flow_id == "150_876":
-        data_type = "ACTIVITY_RATE"  # فرضی: نرخ فعالیت
-    elif flow_id == "150_873":
-        data_type = "LABOUR_FORCE"   # فرضی: جمعیت فعال
-    else:
-        data_type = None
-    # اگر data_type تعریف شده باشد، در کلید استفاده می‌کنیم؛ در غیراینصورت خالی می‌گذاریم (احتمالاً flow فقط یک سری دارد)
-    # تلاش می‌کنیم Edition آخر را نیز مانند نرخ بیکاری بگیریم:
-    editions = get_istat_editions()  # ممکن است برای flowهای دیگر نیز Edition یکسان یا مشابه باشد (با نام متفاوت)
-    ed_code = get_latest_edition_code(editions) if editions else None
-    if ed_code is None:
-        raise ValueError("عدم یافتن نسخه انتشار برای داده‌های کمکی ISTAT.")
-    if data_type:
-        sdmx_key = f"{freq}.{region}.{data_type}.{adjust_code}.{sex_code}.{age_code}.{ed_code}"
-    else:
-        # اگر data_type وجود ندارد (flow تک‌سری)، ممکن است ساختار کلید یکی کمتر بعد داشته باشد
-        sdmx_key = f"{freq}.{region}.{adjust_code}.{sex_code}.{age_code}.{ed_code}"
-    url = f"https://esploradati.istat.it/SDMXWS/rest/data/ISTAT/{flow_id}/{sdmx_key}"
-    resp = requests.get(url, timeout=10)
-    resp.raise_for_status()
-    istat_req = Request('ISTAT')
-    # آماده‌سازی فیلترهای pandasdmx
-    key_filters = {
-        'FREQ': freq,
-        'REF_AREA': region,
-        'SEX': sex_code,
-        'AGE': age_code,
-        'ADJUSTMENT': adjust_code
-    }
-    if data_type:
-        key_filters['DATA_TYPE'] = data_type
-    data_msg = istat_req.data(flow_id, key=key_filters, params={})
-    data_series = data_msg.to_pandas()
-    if isinstance(data_series, pd.Series):
-        df = pd.DataFrame({flow_id: data_series})
-    else:
-        df = pd.DataFrame(data_series)
-        df.columns = [flow_id]
-    if isinstance(df.index, pd.PeriodIndex):
-        df.index = df.index.to_timestamp()
-    df = df.sort_index()
-    return df
-
-# ---- ساخت رابط کاربری Streamlit ----
-
-st.set_page_config(page_title="نرخ بیکاری - ISTAT/Eurostat", layout="wide")
-
-st.title("نمایش نرخ بیکاری ماهانه (意)")
-
-# فهرست کشورها (کدهای geo) برای انتخاب کاربر
-countries = {
-    "ایتالیا": "IT",
-    "آلمان": "DE",
-    "فرانسه": "FR",
-    "اسپانیا": "ES",
-    "اتحادیه اروپا": "EU27_2020"
-}
-country_name = st.sidebar.selectbox("کشور / منطقه:", list(countries.keys()), index=0)
-country_code = countries[country_name]
-
-# انتخاب جنسیت
-sex_options = {"کل جمعیت": "9", "مردان": "1", "زنان": "2"}
-# (برای Eurostat معادل‌های آنها: 'T','M','F')
-sex_label = st.sidebar.selectbox("جنسیت:", list(sex_options.keys()), index=0)
-sex_code_istat = sex_options[sex_label]    # برای ISTAT
-sex_code_eurostat = "T" if sex_code_istat == "9" else ("M" if sex_code_istat == "1" else "F")
-
-# انتخاب گروه سنی
-age_options = {
-    "15-74 (کل نیروی کار)": "Y15-74",
-    "15-24 (نرخ بیکاری جوانان)": "Y15-24",
-    "25-74 (بزرگسالان)": "Y25-74",
-    "15-34": "Y15-34",
-    "35-49": "Y35-49",
-    "50-64": "Y50-64",
-    "50-74": "Y50-74",
-    "15-64": "Y15-64"
-}
-age_label = st.sidebar.selectbox("گروه سنی:", list(age_options.keys()), index=0)
-age_code_istat = age_options[age_label]
-# تبدیل کد گروه سنی به فرمت Eurostat
-# Eurostat فقط از 'TOTAL','Y_LT25','Y25-74' استفاده می‌کند (در صورت انتخاب سایر گروه‌ها، به نزدیک‌ترین تقریب می‌بریم)
-if age_code_istat == "Y15-74":
-    age_code_eurostat = "TOTAL"
-elif age_code_istat in ["Y15-24", "Y15-34"]:
-    age_code_eurostat = "Y_LT25"  # فرض: کمتر از 25
-elif age_code_istat == "Y25-74":
-    age_code_eurostat = "Y25-74"
-elif age_code_istat == "Y15-64":
-    age_code_eurostat = "TOTAL"  # Eurostat تعریف 15-64 در این داده ندارد، از کل 15-74 استفاده می‌کنیم
-elif age_code_istat in ["Y35-49", "Y50-64", "Y50-74"]:
-    age_code_eurostat = "TOTAL"  # Eurostat چنین تفکیکی در این دیتاست ندارد، کل را می‌گیریم
-else:
-    age_code_eurostat = "TOTAL"
-
-# انتخاب نوع تعدیل فصلی
-adjust_options = {"خام (بدون تعدیل)": "NSA", "تعدیل‌شده فصلی": "SA", "مولفه‌ی روند": "TC"}
-adjust_label = st.sidebar.selectbox("تعدیل:", list(adjust_options.keys()), index=1)
-adjust_code_eurostat = adjust_options[adjust_label]
-# تبدیل به کد ISTAT ('N' یا 'Y' - مولفه روند در ISTAT موجود نیست)
-if adjust_code_eurostat == "NSA":
-    adjust_code_istat = "N"
-elif adjust_code_eurostat == "SA":
-    adjust_code_istat = "Y"
-else:
-    adjust_code_istat = "N"  # اگر TrendCycle انتخاب شود و ISTAT نداشته باشد، بر مبنای خام اقدام می‌کنیم
-
-# انتخاب بازه تاریخ
-start_year = st.sidebar.number_input("سال شروع:", min_value=2000, max_value=2030, value=2015)
-start_month = st.sidebar.selectbox("ماه شروع:", list(range(1, 13)), index=0)
-end_year = st.sidebar.number_input("سال پایان:", min_value=2000, max_value=2030, value=2025)
-end_month = st.sidebar.selectbox("ماه پایان:", list(range(1, 13)), index=9)
-start_period = f"{start_year}-{start_month:02d}"
-end_period = f"{end_year}-{end_month:02d}"
-
-# انتخاب متغیرهای کمکی برای واکشی
-aux_participation = st.sidebar.checkbox("نرخ مشارکت اقتصادی (نرخ فعالیت)", value=False)
-aux_active_pop = st.sidebar.checkbox("جمعیت فعال (نیروی کار)", value=False)
-
-# با زدن یک دکمه، عملیات واکشی و نمایش انجام می‌شود
-if st.sidebar.button("نمایش نتایج"):
-    data_source = None  # منبع داده استفاده شده (ISTAT یا Eurostat یا 'sample')
-    main_df = None      # دیتافریم اصلی نرخ بیکاری
-    aux_dfs = {}        # فرهنگ دیتافریم‌های متغیرهای کمکی
-    # تلاش برای واکشی از ISTAT (در صورت انتخاب ایتالیا و در دسترس بودن بعد Trend)
-    use_istat = (country_code == "IT")
-    # اگر کاربر TrendCycle را انتخاب کرده اما ISTAT این گزینه را ندارد، از Eurostat استفاده خواهیم کرد
-    if adjust_code_eurostat == "TC" and country_code == "IT":
-        # پیغام به کاربر که TrendCycle از Eurostat گرفته می‌شود
-        st.info("مولفه روند برای سری ایتالیا مستقیماً از Eurostat واکشی می‌شود (در ISTAT موجود نیست).")
-        use_istat = False
-    if use_istat:
-        try:
-            main_df = fetch_from_istat(country_code, sex_code_istat, age_code_istat, adjust_code_istat, start_period, end_period)
-            data_source = "ISTAT"
-        except Exception as e:
-            # در صورت هرگونه خطا، به Eurostat مراجعه می‌کنیم
-            use_istat = False
-    if not use_istat:
-        try:
-            main_df = fetch_from_eurostat(country_code, sex_code_eurostat, age_code_eurostat, adjust_code_eurostat, start_period, end_period)
-            data_source = "Eurostat"
-        except Exception as e:
-            # اگر Eurostat هم شکست خورد، از داده نمونه استفاده می‌کنیم
-            data_source = "sample"
-            # ساخت داده نمونه ساده
-            date_idx = pd.date_range(start=pd.to_datetime(start_period), end=pd.to_datetime(end_period), freq='M')
-            # تولید مقادیر فرضی برای نرخ بیکاری (صرفاً جهت نمایش)
-            sample_values = np.linspace(10, 5, num=len(date_idx)) + np.random.randn(len(date_idx)) * 0.5
-            main_df = pd.DataFrame({"Unemployment Rate": sample_values}, index=date_idx)
-            st.warning("عدم امکان واکشی داده‌های واقعی. نمایش داده نمونه.")
-    # اگر main_df آماده است، نمایش نتایج
-    if main_df is not None:
-        # واکشی داده‌های کمکی در صورت انتخاب کاربر
-        if aux_participation:
-            if data_source == "ISTAT" and country_code == "IT":
-                try:
-                    aux_df = fetch_aux_from_istat("150_876", country_code, sex_code_istat, age_code_istat, adjust_code_istat)
-                    aux_dfs["Activity Rate"] = aux_df
-                except Exception as e:
-                    # اگر ISTAT برای نرخ فعالیت خطا داد، سعی می‌کنیم Eurostat را امتحان کنیم
-                    try:
-                        aux_df = fetch_aux_from_eurostat("lfsq_argan", country_code, sex_code_eurostat, age_code_eurostat)
-                        aux_dfs["Activity Rate"] = aux_df
-                    except:
-                        st.error("عدم موفقیت در واکشی نرخ مشارکت اقتصادی.")
-            else:
-                # اگر از Eurostat برای داده اصلی استفاده شده یا کشور غیر از ایتالیاست
-                try:
-                    aux_df = fetch_aux_from_eurostat("lfsq_argan", country_code, sex_code_eurostat, age_code_eurostat)
-                    aux_dfs["Activity Rate"] = aux_df
-                except:
-                    st.error("عدم موفقیت در واکشی نرخ مشارکت اقتصادی.")
-        if aux_active_pop:
-            if data_source == "ISTAT" and country_code == "IT":
-                try:
-                    aux_df = fetch_aux_from_istat("150_873", country_code, sex_code_istat, age_code_istat, adjust_code_istat)
-                    aux_dfs["Active Population"] = aux_df
-                except Exception as e:
-                    try:
-                        aux_df = fetch_aux_from_eurostat("lfsq_agan", country_code, sex_code_eurostat, age_code_eurostat)
-                        aux_dfs["Active Population"] = aux_df
-                    except:
-                        st.error("عدم موفقیت در واکشی جمعیت فعال.")
-            else:
-                try:
-                    aux_df = fetch_aux_from_eurostat("lfsq_agan", country_code, sex_code_eurostat, age_code_eurostat)
-                    aux_dfs["Active Population"] = aux_df
-                except:
-                    st.error("عدم موفقیت در واکشی جمعیت فعال.")
-        # اگر داده اصلی از Eurostat باشد اما اولویت با ISTAT بوده (مثل کشور ایتالیا ولی ISTAT شکست خورده)، پیام اطلاع‌رسانی
-        if data_source == "Eurostat" and country_code == "IT":
-            st.info("داده‌ها از Eurostat واکشی شده‌اند (به‌عنوان جایگزین ISTAT).")
-        # ایجاد نمودار
-        fig, ax = plt.subplots(figsize=(8,4))
-        ax.plot(main_df.index, main_df["Unemployment Rate"], label="نرخ بیکاری", color='C0', linewidth=2)
-        # اگر داده کمکی وجود دارد، آنها را نیز روی نمودار ترسیم می‌کنیم (با محور ثانویه در صورت نیاز)
-        if aux_dfs:
-            # اگر یک متغیر کمکی انتخاب شده باشد، می‌توانیم آن را روی محور راست نمایش دهیم برای مقیاس متفاوت
-            # اگر دو متغیر باشند، هر دو را روی همان محور دوم یا یکی روی اول یکی روی دوم؟ 
-            # برای سادگی، هر دو را هم‌مقیاس نمی‌کنیم، فقط رسم با برچسب
-            for name, df_aux in aux_dfs.items():
-                # تنظیم اینکه داده کمکی ممکن است در فرکانس فصلی باشد. با reindex به فرکانس ماهانه (پراکندن مقادیر) تبدیل می‌کنیم.
-                df_aux_resampled = df_aux.copy()
-                if df_aux_resampled.index.inferred_freq is None or df_aux_resampled.index.freq != 'M':
-                    # مقادیر را فوروارد-فیل می‌کنیم تا به صورت ماهانه درآیند (هر مقدار فصلی به ماه‌های دوره تعمیم می‌یابد)
-                    df_aux_resampled = df_aux_resampled.resample('M').ffill()
-                # رسم
-                ax.plot(df_aux_resampled.index, df_aux_resampled[df_aux_resampled.columns[0]], label=name, linestyle='--')
-        ax.set_title(f"نرخ بیکاری ماهانه - {country_name} ({sex_label}, {age_label})")
-        ax.set_xlabel("تاریخ")
-        ax.set_ylabel("نرخ بیکاری (%)")
-        ax.legend()
-        st.pyplot(fig)
-        # محاسبه و نمایش شاخص‌های آماری (آخرین مقدار، میانگین، تغییر ماهانه و سالانه)
-        latest_value = main_df["Unemployment Rate"].iloc[-1]
-        avg_value = main_df["Unemployment Rate"].mean()
-        change_mom = None
-        change_yoy = None
-        if len(main_df) >= 2:
-            change_mom = latest_value - main_df["Unemployment Rate"].iloc[-2]
-        # تغییر سالانه (اختلاف نسبت به 12 ماه قبل در صورت وجود)
-        if len(main_df) > 12:
-            change_yoy = latest_value - main_df["Unemployment Rate"].iloc[-13]
-        # نمایش به‌صورت متن
-        st.subheader("شاخص‌های کلیدی:")
-        cols = st.columns(4)
-        cols[0].metric("آخرین مقدار", f"{latest_value:.2f}%")
-        cols[1].metric("میانگین", f"{avg_value:.2f}%")
-        if change_mom is not None:
-            cols[2].metric("تغییر ماه قبل", f"{change_mom:+.2f} واحد")
-        else:
-            cols[2].text("تغییر ماه قبل: داده کافی نیست")
-        if change_yoy is not None:
-            cols[3].metric("تغییر سال قبل", f"{change_yoy:+.2f} واحد")
-        else:
-            cols[3].text("تغییر سال قبل: داده کافی نیست")
-        # محاسبه و نمایش ضریب همبستگی اگر داده کمکی وجود دارد
-        if aux_dfs:
-            st.subheader("همبستگی با متغیرهای کمکی:")
-            for name, df_aux in aux_dfs.items():
-                # تراز زمانی دو سری (فقط در محدوده مشترک)
-                combined = pd.DataFrame({"unemp": main_df["Unemployment Rate"]})
-                # resample داده کمکی به ماهانه (مثل قبل)
-                df_aux_resampled = df_aux.copy()
-                if df_aux_resampled.index.inferred_freq is None or df_aux_resampled.index.freq != 'M':
-                    df_aux_resampled = df_aux_resampled.resample('M').ffill()
-                combined[name] = df_aux_resampled[df_aux_resampled.columns[0]]
-                # حذف مقادیر گمشده
-                combined = combined.dropna()
-                if combined.shape[0] < 2:
-                    st.write(f"محاسبه همبستگی برای {name}: داده کافی نیست.")
-                else:
-                    corr_val = combined["unemp"].corr(combined[name])
-                    st.write(f"ضریب همبستگی بین نرخ بیکاری و **{name}**: {corr_val:.2f}")
-
-# کتابخانه‌های مورد نیاز
-import pandas as pd
-import numpy as np
-import requests
-from pandasdmx import Request
-import matplotlib.pyplot as plt
-import streamlit as st
-from lxml import etree
-
-plt.rcParams.update({
-    "font.size": 10,
-    "axes.titlesize": 12,
-    "axes.labelsize": 11
-})
-
-# تابع کمکی: واکشی لیست نسخه‌های انتشار (Edition) از ISTAT
-@st.cache_data(show_spinner=False)
-def get_istat_editions():
-    """
-    فهرست تمام Editionهای موجود برای داده‌فلو 151_874 را واکشی می‌کند.
-    """
-    url = "https://esploradati.istat.it/SDMXWS/rest/data/ISTAT/151_874/M.IT.UNEM_R.N.9.Y15-74?detail=serieskeysonly"
-    try:
-        resp = requests.get(url, timeout=10)
-        resp.raise_for_status()
-    except Exception:
-        return []
-    editions = set()
-    try:
-        root = etree.fromstring(resp.content)
-        for sk in root.findall(".//SeriesKey"):
-            for val in sk.findall(".//Value"):
-                if val.get("concept") == "EDITION":
-                    editions.add(val.get("value"))
-        return sorted(list(editions))
-    except Exception:
-        return []
-
-# تابع کمکی: تعیین آخرین Edition (جدیدترین) از لیست کدها
-def get_latest_edition_code(editions):
-    if not editions:
-        return None
-    def parse_code(code):
-        try:
-            year_str, rest = code.split("M", 1)
-            month_str, day_str = rest.split("G", 1)
-            year = int(year_str)
-            month = int(month_str)
-            day = int(day_str)
-        except:
-            year = month = day = -1
-        return (year, month, day)
-    latest = max(editions, key=lambda x: parse_code(x))
-    return latest
-
-# تابع واکشی نرخ بیکاری از ISTAT
-@st.cache_data(show_spinner=False)
-def fetch_from_istat(country_code, sex_code, age_code, adjust_code, start_period, end_period, edition_code=None):
-    # تعیین Edition آخر در صورت عدم ارائه
-    ed_code = edition_code if edition_code else get_latest_edition_code(get_istat_editions())
-    if ed_code is None:
-        raise ValueError("عدم شناسایی نسخه انتشار داده‌های ISTAT")
-    freq = "M"
-    region = country_code
-    data_type = "UNEM_R"
-    adjustment = adjust_code
-    sex = sex_code
-    age = age_code
-    edition = ed_code
-    sdmx_key = f"{freq}.{region}.{data_type}.{adjustment}.{sex}.{age}.{edition}"
-    url = f"https://esploradati.istat.it/SDMXWS/rest/data/ISTAT/151_874/{sdmx_key}"
-    params = {}
-    if start_period:
-        params["startPeriod"] = start_period
-    if end_period:
-        params["endPeriod"] = end_period
-    resp = requests.get(url, params=params, timeout=15)
-    resp.raise_for_status()
-    istat_req = Request('ISTAT')
-    data_msg = istat_req.data('151_874', key={
-        'FREQ': freq, 'REF_AREA': region, 'DATA_TYPE': data_type,
-        'ADJUSTMENT': adjustment, 'SEX': sex, 'AGE': age, 'EDITION': edition
-    }, params={'startPeriod': start_period, 'endPeriod': end_period})
-    try:
-        data_series = data_msg.to_pandas()
-    except Exception:
-        root = etree.fromstring(resp.content)
-        obs_dates, obs_values = [], []
-        for obs in root.findall(".//Series/Obs"):
-            time_elem = obs.find(".//ObsDimension")
-            val_elem = obs.find(".//ObsValue")
-            if time_elem is not None and val_elem is not None:
-                obs_dates.append(time_elem.get("value"))
-                try:
-                    obs_values.append(float(val_elem.get("value")))
-                except:
-                    obs_values.append(None)
-        if not obs_dates:
-            raise ValueError("داده‌ای از ISTAT بازیابی نشد")
-        data_series = pd.Series(obs_values, index=pd.to_datetime(obs_dates, format="%Y-%m"))
-    df = pd.DataFrame({"Unemployment Rate": data_series}).sort_index()
-    return df
-
-# تابع واکشی نرخ بیکاری از Eurostat
-@st.cache_data(show_spinner=False)
-def fetch_from_eurostat(country_code, sex_code, age_code, adjust_code, start_period, end_period):
-    estat_req = Request('ESTAT')
-    key_filters = {
-        'unit': 'PC_ACT',
-        's_adj': adjust_code,
-        'sex': sex_code,
-        'age': age_code,
-        'geo': country_code
-    }
-    params = {}
-    if start_period:
-        params["startPeriod"] = start_period
-    if end_period:
-        params["endPeriod"] = end_period
-    data_msg = estat_req.data('une_rt_m', key=key_filters, params=params)
-    data_series = data_msg.to_pandas()
-    if isinstance(data_series, pd.Series):
-        df = pd.DataFrame({"Unemployment Rate": data_series})
-    else:
-        try:
-            df = pd.DataFrame({"Unemployment Rate": data_series.xs(
-                (sex_code, age_code, country_code, adjust_code, "PC_ACT"),
-                level=[2, 3, 4, 1, 0]
-            )})
-        except:
-            df = pd.DataFrame(data_series)
-            df.columns = ["Unemployment Rate"]
-    if isinstance(df.index, pd.PeriodIndex):
-        df.index = df.index.to_timestamp()
-    df = df.sort_index()
-    return df
-
-# تابع واکشی داده کمکی Eurostat
-@st.cache_data(show_spinner=False)
-def fetch_aux_from_eurostat(dataset_code, country_code, sex_code, age_code):
-    estat_req = Request('ESTAT')
-    key_filters = {'sex': sex_code, 'age': age_code, 'geo': country_code}
-    if dataset_code == 'lfsq_agan':
-        key_filters['unit'] = 'THS'
-    elif dataset_code == 'lfsq_argan':
-        key_filters['unit'] = 'PC_POP'
-    try:
-        data_msg = estat_req.data(dataset_code, key=key_filters)
-    except Exception:
-        key_filters.pop('unit', None)
-        data_msg = estat_req.data(dataset_code, key=key_filters)
-    data_series = data_msg.to_pandas()
-    if isinstance(data_series, pd.Series):
-        df = pd.DataFrame({dataset_code: data_series})
-    else:
-        try:
-            df = pd.DataFrame(data_series.xs((sex_code, age_code, country_code), level=[1, 2, 3]))
-            df.columns = [dataset_code]
-        except:
-            df = pd.DataFrame(data_series)
-            df.columns = [dataset_code]
-    if isinstance(df.index, pd.PeriodIndex):
-        df.index = df.index.to_timestamp()
-    df = df.sort_index()
-    return df
-
-# تابع واکشی داده کمکی ISTAT
-@st.cache_data(show_spinner=False)
-def fetch_aux_from_istat(flow_id, country_code, sex_code, age_code, adjust_code):
-    freq = "M"
-    region = country_code
-    # نگاشت flow_id به data_type (در صورت وجود)
-    if flow_id == "150_876":
-        data_type = "ACTIVITY_RATE"  # فرضی
-    elif flow_id == "150_873":
-        data_type = "LABOUR_FORCE"   # فرضی
-    else:
-        data_type = None
-    ed_code = get_latest_edition_code(get_istat_editions())
-    if ed_code is None:
-        raise ValueError("Edition داده‌های ISTAT نامشخص است")
-    if data_type:
-        sdmx_key = f"{freq}.{region}.{data_type}.{adjust_code}.{sex_code}.{age_code}.{ed_code}"
-    else:
-        sdmx_key = f"{freq}.{region}.{adjust_code}.{sex_code}.{age_code}.{ed_code}"
-    url = f"https://esploradati.istat.it/SDMXWS/rest/data/ISTAT/{flow_id}/{sdmx_key}"
-    resp = requests.get(url, timeout=10)
-    resp.raise_for_status()
-    istat_req = Request('ISTAT')
-    key_filters = {'FREQ': freq, 'REF_AREA': region, 'SEX': sex_code, 'AGE': age_code, 'ADJUSTMENT': adjust_code}
-    if data_type:
-        key_filters['DATA_TYPE'] = data_type
-    data_msg = istat_req.data(flow_id, key=key_filters)
-    data_series = data_msg.to_pandas()
-    if isinstance(data_series, pd.Series):
-        df = pd.DataFrame({flow_id: data_series})
-    else:
-        df = pd.DataFrame(data_series)
-        df.columns = [flow_id]
-    if isinstance(df.index, pd.PeriodIndex):
-        df.index = df.index.to_timestamp()
-    df = df.sort_index()
-    return df
-
-# --- رابط کاربری ---
-st.set_page_config(page_title="نرخ بیکاری - SDMX", layout="wide")
-st.title("نمایش نرخ بیکاری ماهانه")
-
-# ویجت‌های کناری:
-countries = {"ایتالیا": "IT", "آلمان": "DE", "فرانسه": "FR", "اسپانیا": "ES", "اتحادیه اروپا": "EU27_2020"}
-country_name = st.sidebar.selectbox("کشور / منطقه:", list(countries.keys()), index=0)
-country_code = countries[country_name]
-
-sex_options = {"کل جمعیت": "9", "مردان": "1", "زنان": "2"}  # ISTAT codes
-sex_label = st.sidebar.selectbox("جنسیت:", list(sex_options.keys()), index=0)
-sex_code_istat = sex_options[sex_label]
-sex_code_eurostat = "T" if sex_code_istat == "9" else ("M" if sex_code_istat == "1" else "F")
-
-age_options = {
-    "15-74 (کل)": "Y15-74",
-    "15-24 (جوانان)": "Y15-24",
-    "25-74 (بزرگسالان)": "Y25-74",
-    "15-34": "Y15-34", "35-49": "Y35-49",
-    "50-64": "Y50-64", "50-74": "Y50-74",
-    "15-64": "Y15-64"
-}
-age_label = st.sidebar.selectbox("گروه سنی:", list(age_options.keys()), index=0)
-age_code_istat = age_options[age_label]
-# نگاشت گروه سنی به Eurostat
-if age_code_istat == "Y15-74":
-    age_code_eurostat = "TOTAL"
-elif age_code_istat in ["Y15-24", "Y15-34"]:
-    age_code_eurostat = "Y_LT25"
-elif age_code_istat == "Y25-74":
-    age_code_eurostat = "Y25-74"
-else:
-    age_code_eurostat = "TOTAL"  # سایر موارد روی کل تخمین زده می‌شوند
-
-adjust_options = {"خام (NSA)": "NSA", "تعدیل فصلی (SA)": "SA", "روند (Trend)": "TC"}
-adjust_label = st.sidebar.selectbox("تعدیل:", list(adjust_options.keys()), index=1)
-adjust_code_eurostat = adjust_options[adjust_label]
-# نگاشت به ISTAT
-adjust_code_istat = "N" if adjust_code_eurostat == "NSA" else ("Y" if adjust_code_eurostat == "SA" else "N")
-
-start_year = st.sidebar.number_input("سال شروع:", min_value=2000, max_value=2030, value=2015)
-start_month = st.sidebar.selectbox("ماه شروع:", list(range(1, 13)), index=0)
-end_year = st.sidebar.number_input("سال پایان:", min_value=2000, max_value=2030, value=2025)
-end_month = st.sidebar.selectbox("ماه پایان:", list(range(1, 13)), index=9)
-start_period = f"{start_year}-{start_month:02d}"
-end_period = f"{end_year}-{end_month:02d}"
-
-aux_participation = st.sidebar.checkbox("نرخ مشارکت اقتصادی (نرخ فعالیت)")
-aux_active_pop = st.sidebar.checkbox("جمعیت فعال (هزار نفر)")
-
-if st.sidebar.button("نمایش نتایج"):
-    data_source = None
-    main_df = None
-    aux_dfs = {}
-    use_istat = (country_code == "IT")
-    # اگر TrendCycle برای ایتالیا انتخاب شده باشد، از Eurostat استفاده می‌کنیم چون ISTAT ارائه نمی‌کند
-    if adjust_code_eurostat == "TC" and country_code == "IT":
-        st.info("مولفه روند از Eurostat واکشی خواهد شد (در ISTAT موجود نیست).")
-        use_istat = False
-    if use_istat:
-        try:
-            main_df = fetch_from_istat(country_code, sex_code_istat, age_code_istat, adjust_code_istat, start_period, end_period)
-            data_source = "ISTAT"
+            y, rest = code.split("M", 1)
+            m, g = rest.split("G", 1)
+            return (int(y), int(m), int(g))
         except Exception:
-            use_istat = False
-    if not use_istat:
+            return (0, 0, 0)
+    return sorted(editions, key=parse)[-1]
+
+@st.cache_data(show_spinner=False)
+def istat_fetch_unemployment(sex: str, age: str, adj: str, start: str, end: str, edition: Optional[str]) -> pd.DataFrame:
+    """Fetch ISTAT monthly unemployment rate for Italy with given dimensions.
+    Dimensions:
+      - sex in {"1","2","9"}
+      - age like "Y15-74"
+      - adj in {"N","Y"}
+      - edition required (latest auto‑picked if None)
+    """
+    ed = edition or istat_pick_latest_edition(istat_list_editions(sex, age, adj))
+    if not ed:
+        return pd.DataFrame()
+    key = f"M.IT.{ISTAT_INDICATOR}.{adj}.{sex}.{age}.{ed}"
+    url = f"{ISTAT_BASE}/data/ISTAT/{ISTAT_FLOW_UNEM}/{key}"
+    params = {"startPeriod": start, "endPeriod": end, "format": "sdmx-json"}
+    r = HTTP.get(url, params=params, timeout=(10, 90))
+    if r.status_code != 200:
+        return pd.DataFrame()
+    return parse_sdmx_json(r.json())
+
+# =============================================================================
+# Eurostat helpers (optional via pandasdmx)
+# =============================================================================
+EUROSTAT_DATASET = "une_rt_m"
+EUROSTAT_AGE_ALLOWED = {"TOTAL", "Y_LT25", "Y25-74"}
+
+# Map ISTAT‑style age to Eurostat set (fallback to TOTAL if not available)
+
+def map_age_to_eurostat(age_code: str) -> str:
+    if age_code in ("Y15-24", "Y15-34"):
+        return "Y_LT25"
+    if age_code == "Y25-74":
+        return "Y25-74"
+    # default bucket
+    return "TOTAL"
+
+@st.cache_data(show_spinner=False)
+def eurostat_fetch_unemployment(geo: str, sex: str, age: str, s_adj: str, start: str, end: str) -> pd.DataFrame:
+    """Fetch Eurostat monthly unemployment (une_rt_m) using pandasdmx if available.
+    Returns empty DataFrame if pandasdmx is not installed or request fails.
+    """
+    if not HAS_PANDASDMX:
+        return pd.DataFrame()
+    try:
+        req = sdmx.Request("ESTAT")
+        params = {"startPeriod": start, "endPeriod": end}
+        # unit=PC_ACT (rate, % of active population)
+        key = {"unit": "PC_ACT", "s_adj": s_adj, "sex": sex, "age": age, "geo": geo}
+        resp = req.data(EUROSTAT_DATASET, key=key, params=params)
+        # Convert to pandas Series/DataFrame
         try:
-            main_df = fetch_from_eurostat(country_code, sex_code_eurostat, age_code_eurostat, adjust_code_eurostat, start_period, end_period)
-            data_source = "Eurostat"
+            ser = resp.to_pandas()
         except Exception:
-            data_source = "sample"
-            date_idx = pd.date_range(start=pd.to_datetime(start_period), end=pd.to_datetime(end_period), freq='M')
-            sample_values = np.linspace(10, 6, num=len(date_idx)) + np.random.randn(len(date_idx)) * 0.3
-            main_df = pd.DataFrame({"Unemployment Rate": sample_values}, index=date_idx)
-            st.warning("عدم امکان واکشی داده‌های واقعی - نمایش داده نمونه")
-    if main_df is not None:
-        # واکشی داده‌های کمکی در صورت انتخاب
-        if aux_participation:
-            if data_source == "ISTAT" and country_code == "IT":
-                try:
-                    aux_df = fetch_aux_from_istat("150_876", country_code, sex_code_istat, age_code_istat, adjust_code_istat)
-                    aux_dfs["Activity Rate"] = aux_df
-                except Exception:
-                    try:
-                        aux_df = fetch_aux_from_eurostat("lfsq_argan", country_code, sex_code_eurostat, age_code_eurostat)
-                        aux_dfs["Activity Rate"] = aux_df
-                    except:
-                        st.error("خطا در واکشی نرخ مشارکت")
-            else:
-                try:
-                    aux_df = fetch_aux_from_eurostat("lfsq_argan", country_code, sex_code_eurostat, age_code_eurostat)
-                    aux_dfs["Activity Rate"] = aux_df
-                except:
-                    st.error("خطا در واکشی نرخ مشارکت")
-        if aux_active_pop:
-            if data_source == "ISTAT" and country_code == "IT":
-                try:
-                    aux_df = fetch_aux_from_istat("150_873", country_code, sex_code_istat, age_code_istat, adjust_code_istat)
-                    aux_dfs["Active Population"] = aux_df
-                except Exception:
-                    try:
-                        aux_df = fetch_aux_from_eurostat("lfsq_agan", country_code, sex_code_eurostat, age_code_eurostat)
-                        aux_dfs["Active Population"] = aux_df
-                    except:
-                        st.error("خطا در واکشی جمعیت فعال")
-            else:
-                try:
-                    aux_df = fetch_aux_from_eurostat("lfsq_agan", country_code, sex_code_eurostat, age_code_eurostat)
-                    aux_dfs["Active Population"] = aux_df
-                except:
-                    st.error("خطا در واکشی جمعیت فعال")
-        if data_source == "Eurostat" and country_code == "IT":
-            st.info("داده‌ها از Eurostat نمایش یافته‌اند (fallback از ISTAT).")
-        # رسم نمودار
-        fig, ax = plt.subplots(figsize=(8, 4))
-        ax.plot(main_df.index, main_df["Unemployment Rate"], label="نرخ بیکاری", color='C0', linewidth=2)
-        ax.set_title(f"نرخ بیکاری ماهانه - {country_name} ({sex_label}, {age_label})")
-        ax.set_xlabel("تاریخ")
-        ax.set_ylabel("نرخ بیکاری (%)")
-        # آماده‌سازی برای رسم داده‌های کمکی
-        aux_percent = {}   # متغیرهای کمکی درصدی (نرخ‌ها)
-        aux_absolute = {}  # متغیرهای کمکی مقداری (جمعیت)
-        for name, df_aux in aux_dfs.items():
-            if name == "Active Population":
-                aux_absolute[name] = df_aux
-            else:
-                aux_percent[name] = df_aux
-        # رسم متغیرهای درصدی بر روی محور اصلی
-        for name, df_aux in aux_percent.items():
-            df_res = df_aux.copy()
-            # در صورت فصلی بودن، به ماهانه تبدیل می‌کنیم
-            if df_res.index.inferred_freq is None or df_res.index.freq != 'M':
-                df_res = df_res.resample('M').ffill()
-            ax.plot(df_res.index, df_res[df_res.columns[0]], label=name, linestyle='--')
-        # اگر متغیر مقداری (مثل جمعیت فعال) داریم، محور دوم اضافه می‌کنیم
-        ax2 = None
-        if aux_absolute:
-            ax2 = ax.twinx()
-            for name, df_aux in aux_absolute.items():
-                df_res = df_aux.copy()
-                if df_res.index.inferred_freq is None or df_res.index.freq != 'M':
-                    df_res = df_res.resample('M').ffill()
-                ax2.plot(df_res.index, df_res[df_res.columns[0]], label=name, color='green', linestyle=':')
-            ax2.set_ylabel("جمعیت فعال (هزار نفر)")
-        # ترکیب legend‌ها از دو محور (در صورت وجود محور دوم)
-        lines1, labels1 = ax.get_legend_handles_labels()
-        if ax2:
-            lines2, labels2 = ax2.get_legend_handles_labels()
-            ax2.legend(lines1 + lines2, labels1 + labels2, loc='upper left')
+            # fallback via SDMX‑JSON representation if available
+            j = resp.msg.to_json()
+            df = parse_sdmx_json(j if isinstance(j, dict) else {})
+            return df.rename(columns={"value": "value"})
+        if isinstance(ser, pd.Series):
+            df = ser.to_frame(name="value").reset_index()
+            # detect time column
+            tcol = next((c for c in df.columns if str(c).upper() in ("TIME_PERIOD", "TIME", "index")), None)
+            if tcol is None:
+                return pd.DataFrame()
+            df.rename(columns={tcol: "date"}, inplace=True)
+            # unify timestamps
+            df["date"] = pd.to_datetime(df["date"], errors="coerce").map(lambda x: x + pd.offsets.MonthEnd(0) if pd.notna(x) else x)
+            return df.dropna(subset=["date"])[["date", "value"]].sort_values("date")
+        # If DataFrame with explicit column
+        if "TIME_PERIOD" in ser.columns:
+            df = ser.rename(columns={"TIME_PERIOD": "date"})
+            df["date"] = pd.to_datetime(df["date"], errors="coerce").map(lambda x: x + pd.offsets.MonthEnd(0) if pd.notna(x) else x)
+            # find numeric column
+            vcol = next((c for c in df.columns if c not in {"date"} and pd.api.types.is_numeric_dtype(df[c])), None)
+            if vcol is None:
+                return pd.DataFrame()
+            df = df[["date", vcol]].rename(columns={vcol: "value"}).dropna()
+            return df.sort_values("date")
+        return pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
+
+# Optional Eurostat auxiliary fetchers (monthly):
+EUROSTAT_AUX_DATASETS = {
+    "IPI (industry production index)": ("sts_inpr_m", "I19: Volume index (2015=100)", {}),
+    "Retail trade volume": ("sts_trtu_m", "I19: Volume index (2015=100)", {}),
+    "Services turnover": ("sts_setu_m", "I19: Working day adj index", {}),
+    "Hours worked (industry)": ("sts_inlb_m", "I19: Hours worked index", {}),
+    "Consumer confidence": ("ei_bsco_m", "CI: balance", {}),
+}
+
+@st.cache_data(show_spinner=False)
+def eurostat_fetch_aux(dataset: str, geo: str, start: str, end: str) -> pd.DataFrame:
+    if not HAS_PANDASDMX:
+        return pd.DataFrame()
+    try:
+        req = sdmx.Request("ESTAT")
+        # We keep filters minimal; many STS datasets accept s_adj and unit; here we rely on defaults
+        resp = req.data(dataset, params={"startPeriod": start, "endPeriod": end})
+        ser = resp.to_pandas()
+        # try to collapse to single series by selecting geo
+        if isinstance(ser, pd.Series):
+            df = ser.reset_index()
         else:
-            ax.legend(loc='upper left')
-        st.pyplot(fig)
-        # محاسبه شاخص‌های آماری
-        latest_val = main_df["Unemployment Rate"].iloc[-1]
-        avg_val = main_df["Unemployment Rate"].mean()
-        change_mom = None
-        change_yoy = None
-        if len(main_df) >= 2:
-            change_mom = latest_val - main_df["Unemployment Rate"].iloc[-2]
-        if len(main_df) > 12:
-            change_yoy = latest_val - main_df["Unemployment Rate"].iloc[-13]
-        st.subheader("شاخص‌های کلیدی:")
-        cols = st.columns(4)
-        cols[0].metric("آخرین مقدار", f"{latest_val:.2f}%")
-        cols[1].metric("میانگین", f"{avg_val:.2f}%")
-        cols[2].metric("تغییر ماهانه", f"{change_mom:+.2f} واحد" if change_mom is not None else "نمیر")
-        cols[3].metric("تغییر سالانه", f"{change_yoy:+.2f} واحد" if change_yoy is not None else "نمیر")
-        # محاسبه و نمایش همبستگی با متغیرهای کمکی
-        if aux_dfs:
-            st.subheader("همبستگی با متغیرهای انتخاب‌شده:")
-            for name, df_aux in aux_dfs.items():
-                combined = pd.DataFrame({"unemp": main_df["Unemployment Rate"]})
-                df_res = df_aux.copy()
-                if df_res.index.inferred_freq is None or df_res.index.freq != 'M':
-                    df_res = df_res.resample('M').ffill()
-                combined[name] = df_res[df_res.columns[0]]
-                combined = combined.dropna()
-                if combined.shape[0] < 2:
-                    st.write(f"محاسبه همبستگی برای {name}: داده کافی نیست.")
-                else:
-                    corr_val = combined["unemp"].corr(combined[name])
-                    st.write(f"ضریب همبستگی بین نرخ بیکاری و **{name}**: {corr_val:.2f}")
+            df = ser.reset_index()
+        # try to filter chosen geo column
+        if "geo" in df.columns:
+            df = df[df["geo"] == geo]
+        # standardize columns
+        tcol = next((c for c in df.columns if str(c).upper() in ("TIME_PERIOD", "TIME", "index")), None)
+        vcol = next((c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])), None)
+        if tcol is None or vcol is None:
+            return pd.DataFrame()
+        out = df[[tcol, vcol]].rename(columns={tcol: "date", vcol: "value"})
+        out["date"] = pd.to_datetime(out["date"], errors="coerce").map(lambda x: x + pd.offsets.MonthEnd(0) if pd.notna(x) else x)
+        return out.dropna().sort_values("date")
+    except Exception:
+        return pd.DataFrame()
+
+# =============================================================================
+# Demo data fallback
+# =============================================================================
+
+def demo_monthly(start: str, end: str, base: float = 9.5) -> pd.DataFrame:
+    idx = pd.date_range(start + "-01", end + "-01", freq="MS") + pd.offsets.MonthEnd(0)
+    n = len(idx)
+    np.random.seed(42)
+    seasonal = np.sin(np.arange(n) * 2 * np.pi / 12) * 0.25
+    drift = np.linspace(0, -0.8, n)
+    noise = np.random.randn(n) * 0.2
+    val = base + seasonal + drift + noise
+    return pd.DataFrame({"date": idx, "value": val}).sort_values("date")
+
+# =============================================================================
+# Business objects
+# =============================================================================
+
+@dataclass
+class FetchOptions:
+    geo: str = "IT"
+    sex_label: str = "Total"    # Total/Male/Female
+    age_code: str = "Y15-74"
+    s_adj_label: str = "SA"      # NSA/SA/TC (TC for Eurostat only)
+    start_year: int = 2010
+    start_month: int = 1
+    end_year: int = datetime.utcnow().year
+    end_month: int = datetime.utcnow().month
+    istat_edition: Optional[str] = None
+    source_priority: List[str] = field(default_factory=lambda: ["ISTAT", "EUROSTAT"])  # order
+
+    @property
+    def start(self) -> str:
+        return f"{self.start_year}-{self.start_month:02d}"
+
+    @property
+    def end(self) -> str:
+        return f"{self.end_year}-{self.end_month:02d}"
+
+@dataclass
+class SeriesResult:
+    df: pd.DataFrame
+    source: str
+    meta: Dict[str, Any] = field(default_factory=dict)
+
+# =============================================================================
+# Fetcher orchestrator
+# =============================================================================
+
+class UnemploymentFetcher:
+    def __init__(self):
+        pass
+
+    def fetch(self, opt: FetchOptions) -> SeriesResult:
+        # Prepare dimension codes for both providers
+        istat_sex = ISTAT_SEX_MAP.get(opt.sex_label, "9")
+        istat_adj = ISTAT_ADJ_MAP.get(opt.s_adj_label, "Y") if opt.s_adj_label in ("NSA", "SA") else ISTAT_ADJ_MAP["SA"]
+        euro_sex = {"Total": "T", "Male": "M", "Female": "F"}[opt.sex_label]
+        euro_age = map_age_to_eurostat(opt.age_code)
+        euro_adj = opt.s_adj_label if opt.s_adj_label in ("NSA", "SA", "TC") else "SA"
+
+        # Decide priority
+        sources = [s.upper() for s in opt.source_priority if s]
+        if not sources:
+            sources = ["ISTAT", "EUROSTAT"]
+
+        for s in sources:
+            if s == "ISTAT":
+                if opt.geo != "IT":
+                    continue  # ISTAT monthly unemployment is national (IT) only
+                if opt.s_adj_label == "TC":
+                    continue  # trend not in ISTAT dataset
+                df = istat_fetch_unemployment(istat_sex, opt.age_code, istat_adj, opt.start, opt.end, opt.istat_edition)
+                if not df.empty:
+                    return SeriesResult(df=df.rename(columns={"value": "unemployment"}), source="ISTAT", meta={"edition": opt.istat_edition or "(latest)"})
+            elif s == "EUROSTAT":
+                df = eurostat_fetch_unemployment(opt.geo, euro_sex, euro_age, euro_adj, opt.start, opt.end)
+                if not df.empty:
+                    return SeriesResult(df=df.rename(columns={"value": "unemployment"}), source="EUROSTAT", meta={})
+        # Final fallback
+        df = demo_monthly(opt.start, opt.end)
+        return SeriesResult(df=df.rename(columns={"value": "unemployment"}), source="DEMO")
+
+# =============================================================================
+# UI — Controls
+# =============================================================================
+with st.sidebar:
+    st.subheader("Settings")
+    st.caption("Primary = ISTAT (IT only), fallback = Eurostat. The app won’t crash; it will show demo data if needed.")
+
+    geo = st.selectbox("Geo (country)", options=["IT", "DE", "FR", "ES", "EU27_2020"], index=0, help="Eurostat supports many geos; ISTAT is Italy only.")
+    sex_label = st.selectbox("Sex", options=["Total", "Male", "Female"], index=0)
+    age_label = st.selectbox("Age band (ISTAT style)", options=list(AGE_CHOICES.keys()), index=0)
+    age_code = AGE_CHOICES[age_label]
+
+    s_adj_label = st.selectbox("Seasonal adjustment", options=["SA", "NSA", "TC"], index=0, help="ISTAT supports SA/NSA; Eurostat supports SA/NSA/TC.")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        start_year = st.number_input("Start year", min_value=1990, max_value=2100, value=2015, step=1)
+        start_month = st.number_input("Start month", min_value=1, max_value=12, value=1, step=1)
+    with c2:
+        end_year = st.number_input("End year", min_value=1990, max_value=2100, value=datetime.utcnow().year, step=1)
+        end_month = st.number_input("End month", min_value=1, max_value=12, value=min(datetime.utcnow().month, 12), step=1)
+
+    st.markdown("---")
+    st.markdown("**Source priority**")
+    srcs = st.multiselect("Try in order", options=["ISTAT", "EUROSTAT"], default=["ISTAT", "EUROSTAT"])
+    if not srcs:
+        srcs = ["ISTAT", "EUROSTAT"]
+
+    st.markdown("---")
+    st.markdown("**ISTAT edition**")
+    # Only meaningful for Italy + SA/NSA
+    istat_editions = istat_list_editions(ISTAT_SEX_MAP.get(sex_label, "9"), age_code, ISTAT_ADJ_MAP.get(s_adj_label, "Y")) if geo == "IT" and s_adj_label in ("SA", "NSA") else []
+    ed_choice = None
+    if istat_editions:
+        ed_choice = st.selectbox("Edition (release)", options=["<latest>"] + istat_editions, index=0)
+        if ed_choice == "<latest>":
+            ed_choice = None
+
+    st.markdown("---")
+    st.markdown("**Auxiliary indicators (Eurostat)**")
+    aux_selected = st.multiselect("Optional monthly helpers", options=list(EUROSTAT_AUX_DATASETS.keys()), default=["IPI (industry production index)", "Consumer confidence"])    
+
+    st.markdown("---")
+    show_debug = st.checkbox("Show debug info", value=False)
+
+fetcher = UnemploymentFetcher()
+
+if st.button("Fetch data", type="primary", use_container_width=True):
+    opt = FetchOptions(
+        geo=geo, sex_label=sex_label, age_code=age_code, s_adj_label=s_adj_label,
+        start_year=int(start_year), start_month=int(start_month), end_year=int(end_year), end_month=int(end_month),
+        istat_edition=ed_choice, source_priority=srcs,
+    )
+
+    with st.spinner("Fetching unemployment series…"):
+        res = fetcher.fetch(opt)
+
+    # status card
+    if res.source == "ISTAT":
+        st.markdown("<div class='card ok'><b>Success:</b> Source = ISTAT (official, Italy)</div>", unsafe_allow_html=True)
+    elif res.source == "EUROSTAT":
+        st.markdown("<div class='card ok'><b>Success:</b> Source = Eurostat</div>", unsafe_allow_html=True)
+    else:
+        st.markdown("<div class='card warn'><b>Using demo data</b> — all primary sources failed.</div>", unsafe_allow_html=True)
+
+    df = res.df.copy().dropna()
+    if df.empty:
+        st.markdown("<div class='card bad'>No observations returned. Try different dimensions or a wider time window.</div>", unsafe_allow_html=True)
+    else:
+        # KPIs
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Observations", len(df))
+        c2.metric("Start", df["date"].min().strftime("%Y-%m"))
+        c3.metric("End", df["date"].max().strftime("%Y-%m"))
+        c4.metric("Latest", f"{df['unemployment'].iloc[-1]:.2f}%")
+
+        st.markdown("### Target series")
+        st.line_chart(df.set_index("date")["unemployment"])
+        st.dataframe(df, use_container_width=True)
+
+        # Derived metrics
+        m = df.set_index("date").sort_index()
+        m["mom"] = m["unemployment"].pct_change() * 100
+        m["yoy"] = m["unemployment"].pct_change(12) * 100
+        with st.expander("Derived rates (m/m %, y/y %)"):
+            st.dataframe(m[["mom", "yoy"]].reset_index())
+
+        # Aux series
+        aux_frames: List[Tuple[str, pd.DataFrame]] = []
+        if aux_selected:
+            with st.spinner("Fetching auxiliary indicators…"):
+                for label in aux_selected:
+                    ds, _desc, _kw = EUROSTAT_AUX_DATASETS[label]
+                    aux = eurostat_fetch_aux(ds, opt.geo, opt.start, opt.end)
+                    if not aux.empty:
+                        aux_frames.append((label, aux))
+                    elif show_debug:
+                        st.info(f"Aux dataset '{label}' returned empty or pandasdmx missing.")
+        if aux_frames:
+            st.markdown("### Auxiliary indicators")
+            # Plot each and compute correlation with unemployment
+            for label, adf in aux_frames:
+                merged = pd.merge(df[["date", "unemployment"]], adf, on="date", how="inner")
+                merged.rename(columns={"value": label}, inplace=True)
+                st.line_chart(merged.set_index("date")[[label]])
+                if len(merged) >= 3:
+                    corr = merged["unemployment"].corr(merged[label])
+                    st.caption(f"Correlation with unemployment: **{corr:.2f}**")
+
+        # Download
+        st.download_button(
+            "Download CSV (target)", data=df.to_csv(index=False), mime="text/csv",
+            file_name=f"unemployment_{res.source.lower()}_{opt.geo}_{opt.start}_{opt.end}.csv",
+            use_container_width=True,
+        )
+
+    if show_debug:
+        st.markdown("---")
+        st.subheader("Debug info")
+        st.write({
+            "HAS_PANDASDMX": HAS_PANDASDMX,
+            "options": opt.__dict__,
+            "source": res.source,
+        })
+
+# Helpful footer
+st.markdown(
+    """
+    <div class='muted' style='margin-top:1rem'>
+      <span class='badge'>Tips</span>
+      If Eurostat access is desired, install <code>pandasdmx</code> (and <code>lxml</code>) in your environment.
+      ISTAT endpoint is rate‑limited; caching is enabled to reduce calls.
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
