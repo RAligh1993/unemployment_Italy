@@ -18,7 +18,7 @@ shap>=0.46  # optional; heavy; enables SHAP plots on page 7
 streamlit>=1.28.0
 pandas>=2.0.0
 plotly>=5.17.0
-
+urllib3
 # For ISTAT API
 requests>=2.31.0
 lxml>=4.9.0  # For XML parsing if needed
