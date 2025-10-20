@@ -1,15 +1,15 @@
 """
-🤖 ISTAT Auto Data Fetcher v3.0 - Enhanced
-==========================================
-Multiple fallback methods for reliable data fetching.
+🎯 Smart Data Fetcher - Ultimate Edition
+=========================================
+Multiple reliable data sources + Easy manual upload
 
-Methods:
-1. SDMX REST API (primary)
-2. I.Stat OECD.Stat interface (fallback 1)
-3. Direct bulk download (fallback 2)
+Sources:
+1. Eurostat API (stable, includes Italy data)
+2. Manual Excel upload with smart processing
+3. Direct I.Stat guide
 
 Author: ISTAT Nowcasting Team
-Version: 3.0.0
+Version: 4.0.0 (Ultimate)
 """
 
 import streamlit as st
@@ -17,13 +17,15 @@ import pandas as pd
 import numpy as np
 import requests
 from typing import Optional, Dict, List, Tuple
-import time
-import json
-from io import StringIO, BytesIO
+from io import BytesIO, StringIO
 from datetime import datetime
+import time
 
 try:
     from utils.state import AppState
+    from utils.istat_handler import ISTATHandler
+    from utils.excel_processor import ExcelProcessor
+    from utils.data_detector import DataDetector
     from utils.visualizer import Visualizer
     UTILS_AVAILABLE = True
 except:
@@ -34,8 +36,8 @@ except:
 # =============================================================================
 
 st.set_page_config(
-    page_title="ISTAT Auto Fetcher v3",
-    page_icon="🤖",
+    page_title="Smart Data Fetcher",
+    page_icon="🎯",
     layout="wide"
 )
 
@@ -45,408 +47,357 @@ st.markdown("""
         font-size: 3rem;
         font-weight: 800;
         text-align: center;
-        background: linear-gradient(120deg, #059669, #10b981, #34d399);
+        background: linear-gradient(120deg, #7c3aed, #a78bfa, #c4b5fd);
         -webkit-background-clip: text;
         -webkit-text-fill-color: transparent;
+        margin-bottom: 1rem;
     }
     .method-card {
-        background: white;
-        padding: 1rem;
-        border-radius: 8px;
-        border: 2px solid #e5e7eb;
-        margin: 0.5rem 0;
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        color: white;
+        padding: 1.5rem;
+        border-radius: 12px;
+        margin: 1rem 0;
+        box-shadow: 0 4px 12px rgba(0,0,0,0.15);
     }
     .success-card {
         background: #d1fae5;
-        border-left: 4px solid #10b981;
-        padding: 1rem;
+        border-left: 5px solid #10b981;
+        padding: 1.5rem;
         border-radius: 8px;
+        margin: 1rem 0;
     }
-    .error-card {
-        background: #fee2e2;
-        border-left: 4px solid #ef4444;
-        padding: 1rem;
+    .guide-card {
+        background: #dbeafe;
+        border-left: 5px solid #3b82f6;
+        padding: 1.5rem;
         border-radius: 8px;
+        margin: 1rem 0;
     }
 </style>
 """, unsafe_allow_html=True)
 
 # =============================================================================
-# Enhanced ISTAT Client with Multiple Methods
+# Eurostat API Client (More Reliable!)
 # =============================================================================
 
-class ISTATMultiClient:
+class EurostatClient:
     """
-    Multi-method ISTAT data fetcher with intelligent fallbacks
+    Eurostat API client - خیلی پایدارتر از ISTAT!
+    
+    Eurostat has Italy data and is much more stable.
     """
+    
+    BASE_URL = "https://ec.europa.eu/eurostat/api/dissemination/statistics/1.0/data"
+    
+    # Unemployment datasets
+    DATASETS = {
+        'unemployment_rate': 'une_rt_q',  # Quarterly unemployment rate
+        'unemployment_monthly': 'une_rt_m',  # Monthly unemployment rate
+        'youth_unemployment': 'yth_empl_090',  # Youth unemployment
+    }
     
     def __init__(self):
         self.session = requests.Session()
         self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'Accept': 'application/json, text/html, */*'
+            'Accept': 'application/json',
+            'User-Agent': 'Mozilla/5.0'
         })
-        self.timeout = 30
-        
-        # Track which methods work
-        self.method_status = {
-            'sdmx': 'unknown',
-            'istat_bulk': 'unknown',
-            'istat_api': 'unknown'
-        }
     
-    # =========================================================================
-    # Method 1: SDMX REST API
-    # =========================================================================
-    
-    def fetch_via_sdmx(self,
-                       indicator: str,
-                       region: str = 'IT',
-                       start_year: int = 2020,
-                       end_year: int = 2024) -> Optional[pd.DataFrame]:
-        """
-        Method 1: SDMX REST API
-        """
-        st.write("🔄 **Method 1:** Trying SDMX REST API...")
-        
-        # Different endpoints to try
-        base_urls = [
-            "http://sdmx.istat.it/SDMXWS/rest",
-            "https://sdmx.istat.it/SDMXWS/rest",
-            "http://sdmx.istat.it/NSI",
-        ]
-        
-        # Dataflow mapping
-        dataflow_map = {
-            'unemployment_rate': '22_781',
-            'employment_rate': '22_777',
-            'inactive_rate': '22_783'
-        }
-        
-        dataflow_id = dataflow_map.get(indicator, '22_781')
-        
-        # Different key patterns to try
-        key_patterns = [
-            f"Q.{region}.9.Y15-64",  # Quarterly, Total, 15-64
-            f"A.{region}.9.Y15-64",  # Annual
-            f"Q.{region}...",         # All dimensions
-            f"A.{region}...",
-        ]
-        
-        for base_url in base_urls:
-            for key in key_patterns:
-                try:
-                    url = f"{base_url}/data/{dataflow_id}/{key}"
-                    
-                    params = {
-                        'startPeriod': str(start_year),
-                        'endPeriod': str(end_year)
-                    }
-                    
-                    st.write(f"   Trying: `{url[:80]}...`")
-                    
-                    response = self.session.get(
-                        url,
-                        params=params,
-                        timeout=self.timeout
-                    )
-                    
-                    st.write(f"   Status: {response.status_code}")
-                    
-                    if response.status_code == 200:
-                        df = self._parse_response(response)
-                        
-                        if df is not None and not df.empty:
-                            self.method_status['sdmx'] = 'working'
-                            st.success(f"   ✅ Success with SDMX!")
-                            return df
-                    
-                    elif response.status_code == 500:
-                        st.warning(f"   ⚠️ Server error 500 - trying next...")
-                        continue
-                    
-                    elif response.status_code == 404:
-                        st.info(f"   ℹ️ Not found - trying next pattern...")
-                        continue
-                
-                except requests.Timeout:
-                    st.warning(f"   ⏱️ Timeout - trying next...")
-                    continue
-                
-                except Exception as e:
-                    st.warning(f"   ❌ Error: {e}")
-                    continue
-        
-        self.method_status['sdmx'] = 'failed'
-        st.error("   ❌ SDMX method failed")
-        return None
-    
-    def _parse_response(self, response) -> Optional[pd.DataFrame]:
-        """Parse SDMX response (JSON or XML)"""
+    def test_connection(self) -> Tuple[bool, str]:
+        """Test Eurostat API"""
         try:
-            # Try JSON first
+            # Simple test query
+            url = f"{self.BASE_URL}/une_rt_q"
+            params = {
+                'format': 'JSON',
+                'lang': 'EN',
+                'geo': 'IT',
+                'time': '2024'
+            }
+            
+            response = self.session.get(url, params=params, timeout=15)
+            
+            if response.status_code == 200:
+                return True, "✅ Eurostat API working!"
+            else:
+                return False, f"Status: {response.status_code}"
+        
+        except Exception as e:
+            return False, f"Error: {e}"
+    
+    def fetch_unemployment(self,
+                          country: str = 'IT',
+                          start_year: int = 2015,
+                          end_year: int = 2024,
+                          freq: str = 'Q') -> Optional[pd.DataFrame]:
+        """
+        Fetch unemployment data from Eurostat
+        
+        Args:
+            country: Country code (IT, DE, FR, etc.)
+            start_year: Start year
+            end_year: End year
+            freq: Frequency ('Q' or 'M')
+        
+        Returns:
+            DataFrame with date and value
+        """
+        
+        # Select dataset
+        dataset = self.DATASETS['unemployment_monthly'] if freq == 'M' else self.DATASETS['unemployment_rate']
+        
+        url = f"{self.BASE_URL}/{dataset}"
+        
+        # Build parameters
+        params = {
+            'format': 'JSON',
+            'lang': 'EN',
+            'geo': country,
+            'sex': 'T',  # Total
+            'age': 'Y15-74',
+            's_adj': 'SA',  # Seasonally adjusted
+        }
+        
+        try:
+            st.write(f"🔍 Fetching from Eurostat: `{dataset}`...")
+            
+            response = self.session.get(url, params=params, timeout=30)
+            
+            st.write(f"   Status: {response.status_code}")
+            
+            if response.status_code != 200:
+                return None
+            
             data = response.json()
-            return self._parse_sdmx_json(data)
-        except:
-            # Try XML
-            try:
-                return self._parse_sdmx_xml(response.text)
-            except:
-                return None
+            
+            # Parse Eurostat JSON
+            df = self._parse_eurostat_json(data, start_year, end_year)
+            
+            if df is not None and not df.empty:
+                st.success(f"   ✅ Got {len(df)} observations from Eurostat!")
+                return df
+            
+            return None
+        
+        except Exception as e:
+            st.error(f"   ❌ Eurostat error: {e}")
+            return None
     
-    def _parse_sdmx_json(self, data: dict) -> Optional[pd.DataFrame]:
-        """Parse SDMX JSON"""
+    def _parse_eurostat_json(self, 
+                            data: dict,
+                            start_year: int,
+                            end_year: int) -> Optional[pd.DataFrame]:
+        """Parse Eurostat JSON response"""
         try:
-            if 'data' not in data:
+            # Eurostat JSON structure:
+            # data -> value -> {index: value}
+            # data -> dimension -> time -> category -> index -> {index: time_code}
+            
+            if 'value' not in data:
                 return None
             
-            data_root = data['data']
+            values = data['value']
             
-            if 'dataSets' not in data_root or not data_root['dataSets']:
+            # Get time dimension
+            if 'dimension' not in data or 'time' not in data['dimension']:
                 return None
             
-            dataset = data_root['dataSets'][0]
+            time_info = data['dimension']['time']['category']['index']
             
-            if 'series' not in dataset:
-                return None
-            
-            # Get time values
-            structure = data_root.get('structure', {})
-            dimensions = structure.get('dimensions', {})
-            obs_dims = dimensions.get('observation', [])
-            
-            time_values = None
-            for dim in obs_dims:
-                if dim.get('id') == 'TIME_PERIOD':
-                    time_values = [v['id'] for v in dim.get('values', [])]
-                    break
-            
-            if not time_values:
-                return None
-            
-            # Extract data
+            # Build DataFrame
             records = []
             
-            for series_key, series_data in dataset['series'].items():
-                observations = series_data.get('observations', {})
-                
-                for obs_idx, obs_value in observations.items():
-                    time_idx = int(obs_idx)
+            for idx, time_code in time_info.items():
+                if idx in values:
+                    value = values[idx]
                     
-                    if time_idx < len(time_values):
-                        time_period = time_values[time_idx]
-                        value = obs_value[0] if isinstance(obs_value, list) else obs_value
+                    # Parse time code
+                    date = self._parse_eurostat_time(time_code)
+                    
+                    if date is not None:
+                        year = date.year
                         
-                        records.append({
-                            'time_period': time_period,
-                            'value': float(value)
-                        })
+                        if start_year <= year <= end_year:
+                            records.append({
+                                'date': date,
+                                'value': float(value)
+                            })
             
             if not records:
                 return None
             
             df = pd.DataFrame(records)
-            df['date'] = df['time_period'].apply(self._parse_time_period)
-            df = df.dropna(subset=['date'])
-            df = df.sort_values('date')
+            df = df.sort_values('date').reset_index(drop=True)
             
-            return df[['date', 'value']].drop_duplicates()
+            return df
         
         except Exception as e:
-            st.write(f"   JSON parse error: {e}")
+            st.write(f"   Parse error: {e}")
             return None
     
-    def _parse_sdmx_xml(self, xml_text: str) -> Optional[pd.DataFrame]:
-        """Parse SDMX XML - simplified"""
-        # Skip XML parsing for now (complex)
-        return None
-    
-    def _parse_time_period(self, period: str) -> Optional[pd.Timestamp]:
-        """Parse time period to datetime"""
+    def _parse_eurostat_time(self, time_code: str) -> Optional[pd.Timestamp]:
+        """
+        Parse Eurostat time codes
+        
+        Formats:
+        - 2024Q1 → 2024-03-31
+        - 2024M01 → 2024-01-31
+        - 2024 → 2024-12-31
+        """
         try:
-            period = str(period).strip()
+            time_code = str(time_code).strip()
             
-            # Quarterly: 2020-Q1
-            if '-Q' in period:
-                year, quarter = period.split('-Q')
-                year = int(year)
-                quarter = int(quarter)
+            # Quarterly: 2024Q1
+            if 'Q' in time_code:
+                year = int(time_code[:4])
+                quarter = int(time_code[-1])
                 month = quarter * 3
                 date = pd.Timestamp(year=year, month=month, day=1)
                 return date + pd.offsets.MonthEnd(0)
             
-            # Monthly: 2020-01
-            elif len(period) == 7 and '-' in period:
-                return pd.to_datetime(period) + pd.offsets.MonthEnd(0)
+            # Monthly: 2024M01
+            elif 'M' in time_code:
+                year = int(time_code[:4])
+                month = int(time_code[5:7])
+                date = pd.Timestamp(year=year, month=month, day=1)
+                return date + pd.offsets.MonthEnd(0)
             
-            # Annual: 2020
-            elif len(period) == 4:
-                return pd.Timestamp(year=int(period), month=12, day=31)
+            # Annual: 2024
+            elif len(time_code) == 4 and time_code.isdigit():
+                year = int(time_code)
+                return pd.Timestamp(year=year, month=12, day=31)
             
-            else:
-                return pd.to_datetime(period)
+            return None
         
         except:
             return None
+
+
+# =============================================================================
+# Excel Upload Helper
+# =============================================================================
+
+class SmartExcelUploader:
+    """Smart Excel uploader with auto-processing"""
     
-    # =========================================================================
-    # Method 2: I.Stat Bulk Download
-    # =========================================================================
+    def __init__(self):
+        if UTILS_AVAILABLE:
+            self.excel_processor = ExcelProcessor()
+            self.istat_handler = ISTATHandler()
+            self.detector = DataDetector()
     
-    def fetch_via_istat_bulk(self,
-                             indicator: str,
-                             region: str = 'IT') -> Optional[pd.DataFrame]:
-        """
-        Method 2: Download pre-built datasets from I.Stat
+    def process_upload(self, uploaded_file) -> Optional[pd.DataFrame]:
+        """Process uploaded Excel/CSV file"""
         
-        ISTAT provides bulk downloads of common datasets
-        """
-        st.write("🔄 **Method 2:** Trying I.Stat bulk download...")
-        
-        # Known bulk download URLs
-        bulk_urls = {
-            'unemployment_rate': [
-                'http://dati.istat.it/OECDStat_Metadata/ShowMetadata.ashx?Dataset=DCCV_TAXDISOCC1&ShowOnWeb=true&Lang=en',
-                'http://dati.istat.it/Index.aspx?DataSetCode=DCCV_TAXDISOCC1',
-            ],
-            'employment_rate': [
-                'http://dati.istat.it/Index.aspx?DataSetCode=DCCV_TAXOCCU1',
-            ]
-        }
-        
-        urls = bulk_urls.get(indicator, [])
-        
-        for url in urls:
-            try:
-                st.write(f"   Trying: `{url[:80]}...`")
-                
-                response = self.session.get(url, timeout=self.timeout)
-                
-                st.write(f"   Status: {response.status_code}")
-                
-                if response.status_code == 200:
-                    # Try to find CSV download link in HTML
-                    if 'text/html' in response.headers.get('Content-Type', ''):
-                        # Look for download links
-                        html = response.text
-                        
-                        # Common patterns for CSV/Excel download links
-                        import re
-                        csv_pattern = r'href="([^"]*\.csv[^"]*)"'
-                        excel_pattern = r'href="([^"]*\.xlsx?[^"]*)"'
-                        
-                        csv_links = re.findall(csv_pattern, html, re.IGNORECASE)
-                        excel_links = re.findall(excel_pattern, html, re.IGNORECASE)
-                        
-                        if csv_links:
-                            st.info(f"   Found {len(csv_links)} CSV download links")
-                            # Would need to download and parse
-                        
-                        if excel_links:
-                            st.info(f"   Found {len(excel_links)} Excel download links")
-                    
-                    # This method needs more development
-                    st.warning("   ℹ️ Bulk download needs manual intervention")
-                    continue
+        try:
+            file_name = uploaded_file.name
+            file_ext = file_name.split('.')[-1].lower()
             
-            except Exception as e:
-                st.warning(f"   ❌ Error: {e}")
-                continue
+            st.info(f"📄 Processing: **{file_name}**")
+            
+            # Read file
+            if file_ext == 'csv':
+                # Try multiple encodings
+                for encoding in ['utf-8', 'latin-1', 'cp1252']:
+                    try:
+                        uploaded_file.seek(0)
+                        df = pd.read_csv(uploaded_file, encoding=encoding)
+                        st.success(f"✅ Read with {encoding}")
+                        break
+                    except:
+                        continue
+            
+            else:
+                # Excel
+                if UTILS_AVAILABLE:
+                    uploaded_file.seek(0)
+                    sheets = self.excel_processor.read_file(uploaded_file)
+                    
+                    if len(sheets) > 1:
+                        sheet_name = st.selectbox("Select sheet:", list(sheets.keys()))
+                    else:
+                        sheet_name = list(sheets.keys())[0]
+                    
+                    df = sheets[sheet_name]
+                else:
+                    uploaded_file.seek(0)
+                    df = pd.read_excel(uploaded_file)
+            
+            if df is None or df.empty:
+                st.error("❌ Could not read file")
+                return None
+            
+            st.success(f"✅ Loaded: {df.shape[0]} rows × {df.shape[1]} columns")
+            
+            # Auto-detect
+            if UTILS_AVAILABLE:
+                
+                # Check if ISTAT format
+                if self.istat_handler.is_istat_format(df):
+                    st.info("🇮🇹 ISTAT format detected!")
+                    return self._process_istat_format(df)
+                
+                # Check if time series
+                analysis = self.detector.analyze_dataset(df)
+                
+                if analysis.is_time_series:
+                    st.info(f"📊 Time series detected! Date: {analysis.date_column}")
+                    return self._process_time_series(df, analysis)
+            
+            # Show preview
+            st.dataframe(df.head(), use_container_width=True)
+            
+            return df
         
-        self.method_status['istat_bulk'] = 'failed'
-        st.error("   ❌ Bulk download method failed")
-        return None
+        except Exception as e:
+            st.error(f"❌ Error: {e}")
+            return None
     
-    # =========================================================================
-    # Method 3: Sample/Demo Data
-    # =========================================================================
+    def _process_istat_format(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Process ISTAT long format"""
+        
+        cols = self.istat_handler.detect_columns(df)
+        options = self.istat_handler.get_filter_options(df, cols)
+        
+        st.markdown("#### 🎯 Filter ISTAT Data")
+        
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            territory = st.selectbox("Territory", options.get('territorys', ['Italy']))
+        with col2:
+            sex = st.selectbox("Sex", options.get('sexs', ['Total']))
+        with col3:
+            age = st.selectbox("Age", options.get('ages', ['Y15-64']))
+        
+        filtered = self.istat_handler.filter_data(df, cols, territory, sex, age)
+        ts = self.istat_handler.convert_to_timeseries(filtered, cols)
+        
+        result = ts.to_frame('unemployment_rate').reset_index()
+        result.columns = ['date', 'value']
+        
+        return result
     
-    def fetch_demo_data(self,
-                       indicator: str,
-                       region: str = 'IT',
-                       start_year: int = 2020,
-                       end_year: int = 2024) -> pd.DataFrame:
-        """
-        Method 3: Generate realistic sample data
+    def _process_time_series(self, df: pd.DataFrame, analysis) -> pd.DataFrame:
+        """Process regular time series"""
         
-        Use this when all APIs fail - for demonstration
-        """
-        st.write("🔄 **Method 3:** Generating sample data...")
+        date_col = analysis.date_column
         
-        # Generate quarterly dates
-        dates = pd.date_range(
-            start=f'{start_year}-03-31',
-            end=f'{end_year}-12-31',
-            freq='Q'
-        )
+        # Select value column
+        value_cols = analysis.value_columns
         
-        # Generate realistic unemployment data
-        np.random.seed(42)
+        if len(value_cols) == 1:
+            value_col = value_cols[0]
+        else:
+            value_col = st.selectbox("Select value column:", value_cols)
         
-        # Base values by indicator
-        base_values = {
-            'unemployment_rate': 9.5,
-            'employment_rate': 58.0,
-            'inactive_rate': 35.0
-        }
+        result = df[[date_col, value_col]].copy()
+        result.columns = ['date', 'value']
+        result['date'] = pd.to_datetime(result['date'])
+        result = result.sort_values('date')
         
-        base = base_values.get(indicator, 9.5)
-        
-        # Generate with trend and seasonality
-        n = len(dates)
-        trend = np.linspace(0, -1, n)  # Slight downward trend
-        seasonal = np.sin(np.arange(n) * 2 * np.pi / 4) * 0.5  # Quarterly seasonality
-        noise = np.random.randn(n) * 0.3
-        
-        values = base + trend + seasonal + noise
-        
-        df = pd.DataFrame({
-            'date': dates,
-            'value': values
-        })
-        
-        st.success("   ✅ Sample data generated")
-        st.warning("   ⚠️ This is SAMPLE data, not real ISTAT data!")
-        
-        return df
-    
-    # =========================================================================
-    # Master Fetch Method
-    # =========================================================================
-    
-    def fetch_data(self,
-                   indicator: str,
-                   region: str = 'IT',
-                   start_year: int = 2020,
-                   end_year: int = 2024,
-                   allow_demo: bool = True) -> Tuple[Optional[pd.DataFrame], str]:
-        """
-        Try all methods in sequence
-        
-        Returns:
-            (DataFrame, method_used)
-        """
-        
-        # Method 1: SDMX
-        df = self.fetch_via_sdmx(indicator, region, start_year, end_year)
-        if df is not None and not df.empty:
-            return df, 'sdmx'
-        
-        st.markdown("---")
-        
-        # Method 2: Bulk download
-        df = self.fetch_via_istat_bulk(indicator, region)
-        if df is not None and not df.empty:
-            return df, 'bulk'
-        
-        st.markdown("---")
-        
-        # Method 3: Demo data (if allowed)
-        if allow_demo:
-            df = self.fetch_demo_data(indicator, region, start_year, end_year)
-            return df, 'demo'
-        
-        return None, 'none'
+        return result
 
 
 # =============================================================================
@@ -454,252 +405,320 @@ class ISTATMultiClient:
 # =============================================================================
 
 def main():
-    st.markdown('<h1 class="main-header">🤖 ISTAT Auto Fetcher v3.0</h1>', unsafe_allow_html=True)
+    st.markdown('<h1 class="main-header">🎯 Smart Data Fetcher</h1>', unsafe_allow_html=True)
     
-    st.info("""
-    **🔄 Enhanced with Multiple Fallback Methods:**
-    - Method 1: SDMX REST API (official)
-    - Method 2: I.Stat bulk download (alternative)
-    - Method 3: Sample data (demo mode)
-    """)
+    st.markdown("""
+    <div class="method-card">
+        <h3>🚀 3 Reliable Methods</h3>
+        <p><strong>✅ Method 1:</strong> Eurostat API (Italy data, very stable)</p>
+        <p><strong>✅ Method 2:</strong> Manual Excel/CSV upload (100% reliable)</p>
+        <p><strong>✅ Method 3:</strong> Direct I.Stat download guide</p>
+    </div>
+    """, unsafe_allow_html=True)
     
     # Initialize
     if UTILS_AVAILABLE:
         state = AppState.get()
         viz = Visualizer()
     
-    client = ISTATMultiClient()
+    eurostat = EurostatClient()
+    uploader = SmartExcelUploader() if UTILS_AVAILABLE else None
     
-    # Sidebar
-    with st.sidebar:
-        st.header("⚙️ Settings")
+    # Tabs
+    tab1, tab2, tab3 = st.tabs([
+        "🌍 Eurostat API",
+        "📁 Manual Upload",
+        "📖 I.Stat Guide"
+    ])
+    
+    # =========================================================================
+    # TAB 1: Eurostat API
+    # =========================================================================
+    
+    with tab1:
+        st.markdown("### 🌍 Eurostat API (Recommended)")
         
-        allow_demo = st.checkbox(
-            "Allow sample data if APIs fail",
-            value=True,
-            help="Use realistic sample data if all API methods fail"
-        )
-        
-        st.markdown("---")
-        
-        st.header("ℹ️ About")
         st.info("""
-        **This app tries multiple methods:**
-        
-        1. **SDMX API** (official)
-        2. **Bulk downloads** (alternative)
-        3. **Sample data** (demo)
-        
-        If Method 1 fails, it automatically tries Method 2, then 3.
+        **Why Eurostat?**
+        - ✅ Much more stable than ISTAT API
+        - ✅ Includes all Italy data
+        - ✅ Well-documented and reliable
+        - ✅ Used by researchers worldwide
         """)
-    
-    # Main form
-    st.markdown("## 🎯 Select Data")
-    
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        indicator = st.selectbox(
-            "📊 Indicator",
-            options=[
-                'unemployment_rate',
-                'employment_rate',
-                'inactive_rate'
-            ],
-            format_func=lambda x: {
-                'unemployment_rate': 'Unemployment Rate',
-                'employment_rate': 'Employment Rate',
-                'inactive_rate': 'Inactivity Rate'
-            }[x]
-        )
-    
-    with col2:
-        region = st.selectbox(
-            "🗺️ Region",
-            options=['IT', 'ITC4', 'ITH3', 'ITI4', 'ITF3'],
-            format_func=lambda x: {
-                'IT': 'Italia',
-                'ITC4': 'Lombardia',
-                'ITH3': 'Veneto',
-                'ITI4': 'Lazio',
-                'ITF3': 'Campania'
-            }.get(x, x)
-        )
-    
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        start_year = st.number_input("Start Year", 2000, 2024, 2020)
-    
-    with col2:
-        end_year = st.number_input("End Year", 2000, 2024, 2024)
-    
-    # Fetch button
-    if st.button("🚀 Fetch Data", type="primary", use_container_width=True):
         
-        st.markdown("---")
-        st.markdown("## 🔄 Fetching Process")
+        col1, col2, col3 = st.columns(3)
         
-        with st.spinner("Trying multiple methods..."):
-            df, method = client.fetch_data(
-                indicator=indicator,
-                region=region,
-                start_year=start_year,
-                end_year=end_year,
-                allow_demo=allow_demo
+        with col1:
+            country = st.selectbox(
+                "Country",
+                ['IT', 'DE', 'FR', 'ES', 'NL'],
+                format_func=lambda x: {
+                    'IT': '🇮🇹 Italy',
+                    'DE': '🇩🇪 Germany',
+                    'FR': '🇫🇷 France',
+                    'ES': '🇪🇸 Spain',
+                    'NL': '🇳🇱 Netherlands'
+                }[x]
             )
         
-        st.markdown("---")
+        with col2:
+            start_year = st.number_input("Start Year", 2000, 2024, 2015)
         
-        if df is not None and not df.empty:
+        with col3:
+            end_year = st.number_input("End Year", 2000, 2024, 2024)
+        
+        freq = st.radio("Frequency", ['Q', 'M'], format_func=lambda x: 'Quarterly' if x == 'Q' else 'Monthly', horizontal=True)
+        
+        if st.button("🚀 Fetch from Eurostat", type="primary", use_container_width=True):
             
-            # Success message
-            if method == 'sdmx':
+            with st.spinner("Fetching from Eurostat..."):
+                df = eurostat.fetch_unemployment(country, start_year, end_year, freq)
+            
+            if df is not None and not df.empty:
+                
                 st.markdown("""
                 <div class="success-card">
                     <h3>✅ Success!</h3>
-                    <p><strong>Method:</strong> SDMX REST API (Official ISTAT data)</p>
-                    <p>This is real-time official data from ISTAT.</p>
+                    <p>Data retrieved from Eurostat (official EU statistics)</p>
                 </div>
                 """, unsafe_allow_html=True)
-            
-            elif method == 'bulk':
-                st.markdown("""
-                <div class="success-card">
-                    <h3>✅ Success!</h3>
-                    <p><strong>Method:</strong> Bulk Download (Official ISTAT data)</p>
-                    <p>Downloaded from I.Stat bulk datasets.</p>
-                </div>
-                """, unsafe_allow_html=True)
-            
-            elif method == 'demo':
-                st.markdown("""
-                <div class="error-card">
-                    <h3>⚠️ Using Sample Data</h3>
-                    <p><strong>Method:</strong> Demo mode</p>
-                    <p><strong>Warning:</strong> All API methods failed. This is SAMPLE data for demonstration only.</p>
-                    <p>For real ISTAT data, you may need to:</p>
-                    <ul>
-                        <li>Try again later (server might be temporarily down)</li>
-                        <li>Use manual Excel upload instead</li>
-                        <li>Contact ISTAT support</li>
-                    </ul>
-                </div>
-                """, unsafe_allow_html=True)
-            
-            # Display data
-            st.markdown("## 📊 Retrieved Data")
-            
-            col1, col2, col3, col4 = st.columns(4)
-            
-            with col1:
-                st.metric("Observations", len(df))
-            with col2:
-                st.metric("Start", df['date'].min().strftime('%Y-%m'))
-            with col3:
-                st.metric("End", df['date'].max().strftime('%Y-%m'))
-            with col4:
-                st.metric("Latest", f"{df['value'].iloc[-1]:.2f}")
-            
-            # Visualization
-            if UTILS_AVAILABLE:
-                st.markdown("### 📈 Chart")
                 
-                plot_df = df.copy()
-                plot_df.columns = ['date', indicator]
-                
-                fig = viz.plot_time_series(
-                    plot_df,
-                    'date',
-                    [indicator],
-                    title=f"{indicator.replace('_', ' ').title()} - {region}",
-                    show_points=True
-                )
-                
-                st.plotly_chart(fig, use_container_width=True)
-            
-            # Data table
-            st.markdown("### 📋 Data")
-            st.dataframe(df, use_container_width=True)
-            
-            # Download
-            csv = df.to_csv(index=False)
-            st.download_button(
-                "💾 Download CSV",
-                csv,
-                f"istat_{indicator}_{region}_{datetime.now().strftime('%Y%m%d')}.csv",
-                "text/csv",
-                use_container_width=True
-            )
-            
-            # Save options
-            if UTILS_AVAILABLE and method != 'demo':
-                st.markdown("---")
-                st.markdown("### 💾 Save to State")
-                
-                col1, col2 = st.columns(2)
+                # Display
+                col1, col2, col3, col4 = st.columns(4)
                 
                 with col1:
-                    if st.button("Save as Target", use_container_width=True):
-                        ts = pd.Series(
-                            df['value'].values,
-                            index=df['date'],
-                            name=indicator
-                        )
-                        state.y_monthly = ts
-                        AppState.update_timestamp()
-                        st.success("✅ Saved!")
-                        st.balloons()
+                    st.metric("Observations", len(df))
+                with col2:
+                    st.metric("Start", df['date'].min().strftime('%Y-%m'))
+                with col3:
+                    st.metric("End", df['date'].max().strftime('%Y-%m'))
+                with col4:
+                    st.metric("Latest", f"{df['value'].iloc[-1]:.2f}%")
+                
+                # Visualization
+                if UTILS_AVAILABLE:
+                    plot_df = df.copy()
+                    plot_df.columns = ['date', 'unemployment_rate']
+                    
+                    fig = viz.plot_time_series(
+                        plot_df,
+                        'date',
+                        ['unemployment_rate'],
+                        title=f"Unemployment Rate - {country}",
+                        show_points=True
+                    )
+                    
+                    st.plotly_chart(fig, use_container_width=True)
+                
+                # Data table
+                st.dataframe(df, use_container_width=True, height=300)
+                
+                # Save options
+                col1, col2, col3 = st.columns(3)
+                
+                with col1:
+                    csv = df.to_csv(index=False)
+                    st.download_button(
+                        "💾 Download CSV",
+                        csv,
+                        f"eurostat_unemployment_{country}_{datetime.now().strftime('%Y%m%d')}.csv",
+                        use_container_width=True
+                    )
+                
+                if UTILS_AVAILABLE:
+                    with col2:
+                        if st.button("💾 Save as Target", use_container_width=True):
+                            ts = pd.Series(df['value'].values, index=df['date'], name='unemployment')
+                            state.y_monthly = ts
+                            AppState.update_timestamp()
+                            st.success("✅ Saved!")
+                            st.balloons()
+                    
+                    with col3:
+                        if st.button("💾 Add to Panel", use_container_width=True):
+                            panel_df = df.set_index('date')
+                            panel_df.columns = [f'unemp_{country}']
+                            
+                            if state.panel_monthly is not None:
+                                state.panel_monthly = state.panel_monthly.join(panel_df, how='outer')
+                            else:
+                                state.panel_monthly = panel_df
+                            
+                            AppState.update_timestamp()
+                            st.success("✅ Added!")
+                            st.balloons()
+            
+            else:
+                st.error("❌ Could not fetch data")
+                st.info("Try manual upload instead!")
+    
+    # =========================================================================
+    # TAB 2: Manual Upload
+    # =========================================================================
+    
+    with tab2:
+        st.markdown("### 📁 Manual Excel/CSV Upload")
+        
+        st.info("""
+        **Upload your data file:**
+        - Excel: .xlsx, .xls, .xlsm
+        - CSV: any encoding
+        - Auto-detects ISTAT format
+        - Auto-detects time series
+        """)
+        
+        uploaded_file = st.file_uploader(
+            "Choose file",
+            type=['csv', 'xlsx', 'xls', 'xlsm'],
+            key='manual_upload'
+        )
+        
+        if uploaded_file and uploader:
+            
+            df = uploader.process_upload(uploaded_file)
+            
+            if df is not None and not df.empty:
+                
+                st.success("✅ File processed successfully!")
+                
+                # Show data
+                col1, col2 = st.columns([3, 1])
+                
+                with col1:
+                    st.dataframe(df, use_container_width=True, height=400)
                 
                 with col2:
-                    if st.button("Add to Panel", use_container_width=True):
-                        panel_df = df.set_index('date')
-                        panel_df.columns = [f"{indicator}_{region}"]
-                        
-                        if state.panel_monthly is not None:
-                            state.panel_monthly = state.panel_monthly.join(panel_df, how='outer')
-                        else:
-                            state.panel_monthly = panel_df
-                        
-                        AppState.update_timestamp()
-                        st.success("✅ Added!")
-                        st.balloons()
+                    st.metric("Rows", len(df))
+                    st.metric("Columns", len(df.columns))
+                    
+                    if 'date' in df.columns and 'value' in df.columns:
+                        st.metric("Latest", f"{df['value'].iloc[-1]:.2f}")
+                
+                # Visualization
+                if UTILS_AVAILABLE and 'date' in df.columns and 'value' in df.columns:
+                    plot_df = df.copy()
+                    
+                    fig = viz.plot_time_series(
+                        plot_df,
+                        'date',
+                        ['value'],
+                        title="Uploaded Data",
+                        show_points=True
+                    )
+                    
+                    st.plotly_chart(fig, use_container_width=True)
+                
+                # Save options
+                if UTILS_AVAILABLE and 'date' in df.columns and 'value' in df.columns:
+                    st.markdown("---")
+                    
+                    col1, col2 = st.columns(2)
+                    
+                    with col1:
+                        if st.button("💾 Save as Target", key='save_target_upload', use_container_width=True):
+                            ts = pd.Series(df['value'].values, index=pd.to_datetime(df['date']), name='unemployment')
+                            state.y_monthly = ts
+                            AppState.update_timestamp()
+                            st.success("✅ Saved!")
+                            st.balloons()
+                    
+                    with col2:
+                        if st.button("💾 Add to Panel", key='save_panel_upload', use_container_width=True):
+                            panel_df = df.set_index(pd.to_datetime(df['date']))
+                            panel_df.columns = ['unemployment_manual']
+                            
+                            if state.panel_monthly is not None:
+                                state.panel_monthly = state.panel_monthly.join(panel_df, how='outer')
+                            else:
+                                state.panel_monthly = panel_df
+                            
+                            AppState.update_timestamp()
+                            st.success("✅ Added!")
+                            st.balloons()
+    
+    # =========================================================================
+    # TAB 3: I.Stat Guide
+    # =========================================================================
+    
+    with tab3:
+        st.markdown("### 📖 How to Download from I.Stat")
         
-        else:
-            st.error("❌ All methods failed")
-            st.info("Try manual Excel upload in the Data Aggregation page")
-    
-    # Troubleshooting
-    st.markdown("---")
-    
-    with st.expander("🔧 Why Error 500?"):
         st.markdown("""
-        ### Error 500 = Server Error
+        <div class="guide-card">
+            <h4>📝 Step-by-Step Guide</h4>
+            <p>Follow these steps to manually download data from I.Stat:</p>
+        </div>
+        """, unsafe_allow_html=True)
         
-        **این خطا از سمت سرور ISTAT است، نه کد شما!**
+        st.markdown("""
+        #### 1️⃣ Go to I.Stat Website
         
-        **دلایل احتمالی:**
-        1. سرور ISTAT موقتاً down است
-        2. سرور overloaded است (خیلی درخواست دارد)
-        3. SDMX endpoint تغییر کرده
-        4. Dataflow ID اشتباه است
-        5. نگهداری (maintenance)
+        🔗 **Link:** [http://dati.istat.it/](http://dati.istat.it/)
         
-        **راهکارها:**
-        1. ✅ چند دقیقه صبر کن و دوباره امتحان کن
-        2. ✅ این app خودکار روش‌های دیگر را هم امتحان می‌کند
-        3. ✅ از "sample data" برای demo استفاده کن
-        4. ✅ از manual Excel upload استفاده کن
-        5. ✅ بررسی کن: http://sdmx.istat.it/ آیا accessible است؟
+        ---
         
-        **چک کن:**
-```bash
-        # در terminal:
-        curl -I http://sdmx.istat.it/SDMXWS/rest/dataflow
-```
+        #### 2️⃣ Navigate to Unemployment Data
         
-        اگر 500 میده، مشکل از سرور است!
+        - Click on **"Lavoro e retribuzioni"** (Work and wages)
+        - Then **"Disoccupazione"** (Unemployment)
+        - Select **"Tasso di disoccupazione"** (Unemployment rate)
+        
+        ---
+        
+        #### 3️⃣ Customize Your Query
+        
+        - **Territory:** Select Italy or specific region
+        - **Sex:** Total, Males, Females
+        - **Age:** 15-64, 15-24, etc.
+        - **Time period:** Select your date range
+        
+        ---
+        
+        #### 4️⃣ Download the Data
+        
+        - Click **"Estrazione dati"** (Extract data)
+        - Choose format: **Excel** or **CSV**
+        - Download the file
+        
+        ---
+        
+        #### 5️⃣ Upload Here
+        
+        - Go to the **"Manual Upload"** tab
+        - Upload your downloaded file
+        - The app will automatically detect and process it!
+        
+        ---
+        
+        ### 🎥 Alternative: Direct Links
+        
+        **Unemployment Rate (Monthly):**
+        - [http://dati.istat.it/Index.aspx?DataSetCode=DCCV_TAXDISOCC1](http://dati.istat.it/Index.aspx?DataSetCode=DCCV_TAXDISOCC1)
+        
+        **Unemployment Rate (Quarterly):**
+        - [http://dati.istat.it/Index.aspx?DataSetCode=DCCV_TAXDISOCC](http://dati.istat.it/Index.aspx?DataSetCode=DCCV_TAXDISOCC)
+        
+        ---
+        
+        ### 💡 Pro Tips
+        
+        1. ✅ **Use Eurostat tab** - faster and more reliable
+        2. ✅ **Download Excel format** - easier to process
+        3. ✅ **Select "Seasonally adjusted" data** if available
+        4. ✅ **Include headers** in your download
         """)
+        
+        st.markdown("""
+        <div class="guide-card">
+            <h4>❓ Need Help?</h4>
+            <p>If you're having trouble:</p>
+            <ul>
+                <li>Try the <strong>Eurostat tab</strong> first (easiest!)</li>
+                <li>Download Excel manually and use <strong>Manual Upload</strong></li>
+                <li>Check I.Stat documentation: <a href="https://www.istat.it/en/methods-and-tools">ISTAT Methods & Tools</a></li>
+            </ul>
+        </div>
+        """, unsafe_allow_html=True)
 
 
 if __name__ == "__main__":
