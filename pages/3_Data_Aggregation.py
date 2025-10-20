@@ -1,17 +1,23 @@
 """
-Streamlit App — Unemployment Auto‑Fetcher (ISTAT primary, Eurostat fallback)
-- Zero hard dependency on pandasdmx (optional). App never crashes: ISTAT → Eurostat → Demo data.
-- Nice UI, KPI cards, chart, CSV download, caching & retries.
+Streamlit App — Unemployment Auto‑Fetcher (ISTAT primary, Eurostat fallback w/o pandasdmx)
+- Robust on Streamlit Cloud. No hard dependency except: streamlit, pandas, numpy, requests, urllib3.
+- Order: ISTAT → Eurostat (Statistics API JSON‑stat) → Demo. No crashes.
+- Clean UI, KPI, chart, CSV, caching & retries.
 
 Deploy notes (Streamlit Cloud):
-- Minimum packages: streamlit, pandas, numpy, requests, urllib3
-- Optional for Eurostat live fallback: pandasdmx, lxml
+- requirements.txt minimal:
+    streamlit
+    pandas
+    numpy
+    requests
+    urllib3
+- (Optional) Add `pandasdmx` and `lxml` if you also want the classic SDMX client; this app does not require them.
 """
 
 from __future__ import annotations
 import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 from datetime import datetime
 
 import numpy as np
@@ -21,15 +27,6 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 import streamlit as st
-
-# -----------------------------------------------------------------------------
-# Optional: use pandasdmx if available (Eurostat convenience). Keep app alive if absent.
-# -----------------------------------------------------------------------------
-try:  # why: avoid ModuleNotFoundError on Streamlit Cloud
-    import pandasdmx as sdmx  # type: ignore
-    HAS_PANDASDMX = True
-except Exception:
-    HAS_PANDASDMX = False
 
 # -----------------------------------------------------------------------------
 # Streamlit page config & styles
@@ -64,8 +61,8 @@ st.markdown('<div class="title">📈 Unemployment Auto‑Fetcher (ISTAT → Euro
 def make_session() -> requests.Session:
     s = requests.Session()
     s.headers.update({
-        "User-Agent": "ISTAT-Eurostat-Unemployment/1.0 (+streamlit)",
-        "Accept": "application/vnd.sdmx.data+json, application/json; q=0.9, */*; q=0.5",
+        "User-Agent": "ISTAT-Eurostat-Unemployment/1.1 (+streamlit)",
+        "Accept": "application/json, application/vnd.sdmx.data+json; q=0.9, */*; q=0.5",
         "Accept-Encoding": "gzip, deflate, br",
         "Connection": "keep-alive",
     })
@@ -82,7 +79,7 @@ def make_session() -> requests.Session:
 HTTP = make_session()
 
 # -----------------------------------------------------------------------------
-# SDMX‑JSON parsing (generic)
+# Parsers: SDMX‑JSON and JSON‑stat 2.0
 # -----------------------------------------------------------------------------
 
 def parse_sdmx_json(j: Dict[str, Any]) -> pd.DataFrame:
@@ -109,11 +106,15 @@ def parse_sdmx_json(j: Dict[str, Any]) -> pd.DataFrame:
                 for idx, raw in (s.get("observations", {}) or {}).items():
                     t = time_values[int(idx)]
                     v = raw[0] if isinstance(raw, list) else raw
+                    if v is None:
+                        continue
                     rec.append({"time": t, "value": float(v)})
         else:
             for idx, raw in (ds.get("observations", {}) or {}).items():
                 t = time_values[int(idx)]
                 v = raw[0] if isinstance(raw, list) else raw
+                if v is None:
+                    continue
                 rec.append({"time": t, "value": float(v)})
         if not rec:
             return pd.DataFrame()
@@ -135,15 +136,101 @@ def parse_sdmx_json(j: Dict[str, Any]) -> pd.DataFrame:
     except Exception:
         return pd.DataFrame()
 
+
+def parse_jsonstat_dataset(obj: Dict[str, Any]) -> pd.DataFrame:
+    """Parse Eurostat Statistics API JSON‑stat dataset to DataFrame[date,value]."""
+    try:
+        if obj.get("class") != "dataset":
+            datasets = obj.get("datasets") or obj.get("data")
+            if isinstance(datasets, list) and datasets:
+                obj = datasets[0]
+        dim = obj["dimension"]
+        ids: List[str] = obj.get("id") or dim.get("id")
+        size: List[int] = obj.get("size") or dim.get("size")
+        role = (dim.get("role") or {})
+        time_id = (role.get("time") or [None])[0] or next((i for i in ids if i.lower() == "time"), None)
+        if not time_id:
+            return pd.DataFrame()
+        def codes_for(did: str) -> List[str]:
+            cat = dim[did]["category"]
+            idx = cat.get("index")
+            if isinstance(idx, dict):
+                return [k for k, _ in sorted(idx.items(), key=lambda kv: kv[1])]
+            if isinstance(idx, list):
+                return idx
+            if "label" in cat and isinstance(cat["label"], dict):
+                return list(cat["label"].keys())
+            return []
+        codes: Dict[str, List[str]] = {did: codes_for(did) for did in ids}
+        values = obj.get("value")
+        if isinstance(values, dict):
+            full = [None] * int(np.prod(size))
+            for k, v in values.items():
+                try:
+                    full[int(k)] = v
+                except Exception:
+                    pass
+            values = full
+        if not isinstance(values, list):
+            return pd.DataFrame()
+        if len(ids) == 1 and ids[0] == time_id:
+            t_codes = codes[time_id]
+            rec = [
+                {"time": t_codes[i], "value": float(values[i])}
+                for i in range(min(len(values), len(t_codes)))
+                if values[i] is not None
+            ]
+            return _jsonstat_time_to_df(rec)
+        strides = _compute_strides(size)
+        ti = ids.index(time_id)
+        t_codes = codes[time_id]
+        selector = [0] * len(ids)
+        out: List[Dict[str, Any]] = []
+        for tpos, t in enumerate(t_codes):
+            selector[ti] = tpos
+            lin = sum(selector[i] * strides[i] for i in range(len(ids)))
+            if lin < len(values) and values[lin] is not None:
+                out.append({"time": t, "value": float(values[lin])})
+        return _jsonstat_time_to_df(out)
+    except Exception:
+        return pd.DataFrame()
+
+
+def _compute_strides(size: List[int]) -> List[int]:
+    stride = [1] * len(size)
+    for i in range(len(size) - 2, -1, -1):
+        stride[i] = stride[i + 1] * size[i + 1]
+    return stride
+
+
+def _jsonstat_time_to_df(rec: List[Dict[str, Any]]) -> pd.DataFrame:
+    if not rec:
+        return pd.DataFrame()
+    df = pd.DataFrame(rec)
+    def to_date(p: str) -> Optional[pd.Timestamp]:
+        p = str(p)
+        if re.match(r"^\d{4}-\d{2}$", p):
+            return pd.to_datetime(p) + pd.offsets.MonthEnd(0)
+        if "-Q" in p:
+            y, q = p.split("-Q"); y = int(y); m = int(q) * 3
+            return pd.Timestamp(y, m, 1) + pd.offsets.MonthEnd(0)
+        if re.match(r"^\d{4}$", p):
+            return pd.Timestamp(int(p), 12, 31)
+        return pd.to_datetime(p, errors="coerce")
+    df["date"] = df["time"].map(to_date)
+    return df.dropna(subset=["date"]).sort_values("date")[ ["date", "value"] ]
+
 # -----------------------------------------------------------------------------
-# ISTAT helpers (dataflow 151_874: monthly unemployment rate)
+# ISTAT helpers — 151_874 Unemployment rate (monthly). No EDITION needed.
 # -----------------------------------------------------------------------------
 ISTAT_BASE = "https://esploradati.istat.it/SDMXWS/rest"
-ISTAT_FLOW_UNEM = "151_874"          # Unemployment rate — monthly
+ISTAT_FLOW_ID = "151_874"
+ISTAT_AGENCY = "IT1"
+ISTAT_VERSIONS_TRY = ["1.2", "1.1", "1.0"]
 ISTAT_INDICATOR = "UNEM_R"
 
 ISTAT_SEX_MAP = {"Total": "9", "Male": "1", "Female": "2"}
-ISTAT_ADJ_MAP = {"NSA": "N", "SA": "Y"}  # Trend not available in ISTAT monthly
+ISTAT_ADJ_MAP = {"NSA": "N", "SA": "Y"}
 
 AGE_CHOICES = {
     "15–74 (Total)": "Y15-74",
@@ -157,71 +244,40 @@ AGE_CHOICES = {
 }
 
 @st.cache_data(show_spinner=False)
-def istat_list_editions(sex_code: str = "9", age_code: str = "Y15-74", adj_code: str = "N") -> List[str]:
-    key = f"M.IT.{ISTAT_INDICATOR}.{adj_code}.{sex_code}.{age_code}"
-    url = f"{ISTAT_BASE}/data/ISTAT/{ISTAT_FLOW_UNEM}/{key}"
-    params = {"detail": "serieskeysonly", "format": "sdmx-json"}
-    try:
-        r = HTTP.get(url, params=params, timeout=(10, 45))
-        if r.status_code != 200:
-            return []
-        j = r.json()
-        root = j.get("data", j)
-        structure = root.get("structure", {})
-        s_dims = (structure.get("dimensions", {}) or {}).get("series", [])
-        idx_by_id = {d.get("id"): i for i, d in enumerate(s_dims)}
-        if "EDITION" not in idx_by_id:
-            return []
-        ed_idx = idx_by_id["EDITION"]
-        value_lists = [[v.get("id") for v in (d.get("values") or [])] for d in s_dims]
-        out: List[str] = []
-        for key_str in (root.get("dataSets", [{}])[0].get("series") or {}).keys():
-            try:
-                parts = [int(x) for x in key_str.split(":")]
-                code = value_lists[ed_idx][parts[ed_idx]]
-                out.append(code)
-            except Exception:
-                continue
-        return sorted(list(dict.fromkeys(out)))
-    except Exception:
-        return []
-
-
-def istat_pick_latest_edition(editions: List[str]) -> Optional[str]:
-    if not editions:
-        return None
-    def parse(code: str) -> Tuple[int, int, int]:
-        # e.g., 2025M10G2 → (2025, 10, 2)
-        try:
-            y, rest = code.split("M", 1)
-            m, g = rest.split("G", 1)
-            return (int(y), int(m), int(g))
-        except Exception:
-            return (0, 0, 0)
-    return sorted(editions, key=parse)[-1]
-
-
-@st.cache_data(show_spinner=False)
-def istat_fetch_unemployment(sex: str, age: str, adj: str, start: str, end: str, edition: Optional[str]) -> pd.DataFrame:
-    ed = edition or istat_pick_latest_edition(istat_list_editions(sex, age, adj))
-    if not ed:
-        return pd.DataFrame()
-    key = f"M.IT.{ISTAT_INDICATOR}.{adj}.{sex}.{age}.{ed}"
-    url = f"{ISTAT_BASE}/data/ISTAT/{ISTAT_FLOW_UNEM}/{key}"
+def istat_fetch_unemployment(sex: str, age: str, adj: str, start: str, end: str) -> pd.DataFrame:
+    """Query ISTAT SDMX REST. Build key: FREQ.GEO.INDICATOR.ADJ.SEX.AGE"""
+    key = f"M.IT.{ISTAT_INDICATOR}.{adj}.{sex}.{age}"
     params = {"startPeriod": start, "endPeriod": end, "format": "sdmx-json"}
-    try:
-        r = HTTP.get(url, params=params, timeout=(10, 90))
-        if r.status_code != 200:
-            return pd.DataFrame()
-        return parse_sdmx_json(r.json())
-    except Exception:
-        return pd.DataFrame()
+    for ver in ISTAT_VERSIONS_TRY:
+        flowref = f"{ISTAT_AGENCY},{ISTAT_FLOW_ID},{ver}"
+        url = f"{ISTAT_BASE}/data/{flowref}/{key}"
+        try:
+            r = HTTP.get(url, params=params, timeout=(10, 90))
+            if r.status_code == 200:
+                df = parse_sdmx_json(r.json())
+                if not df.empty:
+                    return df
+        except Exception:
+            continue
+    # try wildcard extra slot (harmless if 404)
+    for ver in ISTAT_VERSIONS_TRY:
+        flowref = f"{ISTAT_AGENCY},{ISTAT_FLOW_ID},{ver}"
+        url = f"{ISTAT_BASE}/data/{flowref}/{key}.*"
+        try:
+            r = HTTP.get(url, params=params, timeout=(10, 90))
+            if r.status_code == 200:
+                df = parse_sdmx_json(r.json())
+                if not df.empty:
+                    return df
+        except Exception:
+            continue
+    return pd.DataFrame()
 
 # -----------------------------------------------------------------------------
-# Eurostat helpers (fallback).
-# If pandasdmx is unavailable, we return empty and let orchestrator fallback to demo.
+# Eurostat — Statistics API (JSON‑stat). No external libs.
 # -----------------------------------------------------------------------------
-EUROSTAT_DATASET = "une_rt_m"
+EUROSTAT_STATS_BASE = "https://ec.europa.eu/eurostat/api/dissemination/statistics/1.0/data"
+EUROSTAT_DATASET = "UNE_RT_M"
 
 
 def map_age_to_eurostat(age_code: str) -> str:
@@ -234,36 +290,27 @@ def map_age_to_eurostat(age_code: str) -> str:
 
 @st.cache_data(show_spinner=False)
 def eurostat_fetch_unemployment(geo: str, sex: str, age: str, s_adj: str, start: str, end: str) -> pd.DataFrame:
-    if not HAS_PANDASDMX:
-        return pd.DataFrame()
+    url = f"{EUROSTAT_STATS_BASE}/{EUROSTAT_DATASET}"
+    params = {
+        "lang": "en",
+        "unit": "PC_ACT",
+        "s_adj": s_adj,
+        "sex": sex,
+        "age": age,
+        "geo": geo,
+        "time": f"{start[:4]}-{end[:4]}",
+    }
     try:
-        req = sdmx.Request("ESTAT")
-        params = {"startPeriod": start, "endPeriod": end}
-        key = {"unit": "PC_ACT", "s_adj": s_adj, "sex": sex, "age": age, "geo": geo}
-        resp = req.data(EUROSTAT_DATASET, key=key, params=params)
-        try:
-            ser = resp.to_pandas()
-        except Exception:
-            j = resp.msg.to_json()
-            if isinstance(j, dict):
-                return parse_sdmx_json(j)
+        r = HTTP.get(url, params=params, timeout=(10, 60))
+        if r.status_code != 200:
             return pd.DataFrame()
-        if isinstance(ser, pd.Series):
-            df = ser.to_frame(name="value").reset_index()
-            tcol = next((c for c in df.columns if str(c).upper() in ("TIME_PERIOD", "TIME", "index")), None)
-            if tcol is None:
-                return pd.DataFrame()
-            df.rename(columns={tcol: "date"}, inplace=True)
-            df["date"] = pd.to_datetime(df["date"], errors="coerce").map(lambda x: x + pd.offsets.MonthEnd(0) if pd.notna(x) else x)
-            return df.dropna(subset=["date"])[["date", "value"]].sort_values("date")
-        if isinstance(ser, pd.DataFrame) and "TIME_PERIOD" in ser.columns:
-            df = ser.rename(columns={"TIME_PERIOD": "date"})
-            df["date"] = pd.to_datetime(df["date"], errors="coerce").map(lambda x: x + pd.offsets.MonthEnd(0) if pd.notna(x) else x)
-            vcol = next((c for c in df.columns if c not in {"date"} and pd.api.types.is_numeric_dtype(df[c])), None)
-            if vcol is None:
-                return pd.DataFrame()
-            return df[["date", vcol]].rename(columns={vcol: "value"}).dropna().sort_values("date")
-        return pd.DataFrame()
+        df = parse_jsonstat_dataset(r.json())
+        if df.empty:
+            return pd.DataFrame()
+        sdt = pd.to_datetime(f"{start}-01") + pd.offsets.MonthEnd(0)
+        edt = pd.to_datetime(f"{end}-01") + pd.offsets.MonthEnd(0)
+        df = df[(df["date"] >= sdt) & (df["date"] <= edt)]
+        return df
     except Exception:
         return pd.DataFrame()
 
@@ -290,12 +337,11 @@ class FetchOptions:
     geo: str = "IT"
     sex_label: str = "Total"    # Total/Male/Female
     age_code: str = "Y15-74"
-    s_adj_label: str = "SA"      # NSA/SA/TC (TC Eurostat only)
+    s_adj_label: str = "SA"      # NSA/SA/TC (Eurostat supports TC)
     start_year: int = 2010
     start_month: int = 1
     end_year: int = datetime.utcnow().year
     end_month: int = datetime.utcnow().month
-    istat_edition: Optional[str] = None
     source_priority: List[str] = field(default_factory=lambda: ["ISTAT", "EUROSTAT"])  # order
 
     @property
@@ -326,17 +372,14 @@ class UnemploymentFetcher:
 
         for s in sources:
             if s == "ISTAT":
-                if opt.geo != "IT":
-                    continue
-                if opt.s_adj_label == "TC":
-                    continue
-                df = istat_fetch_unemployment(istat_sex, opt.age_code, istat_adj, opt.start, opt.end, opt.istat_edition)
-                if not df.empty:
-                    return SeriesResult(df=df.rename(columns={"value": "unemployment"}), source="ISTAT", meta={"edition": opt.istat_edition or "(latest)"})
+                if opt.geo == "IT" and opt.s_adj_label != "TC":
+                    df = istat_fetch_unemployment(istat_sex, opt.age_code, istat_adj, opt.start, opt.end)
+                    if not df.empty:
+                        return SeriesResult(df=df.rename(columns={"value": "unemployment"}), source="ISTAT")
             elif s == "EUROSTAT":
                 df = eurostat_fetch_unemployment(opt.geo, euro_sex, euro_age, euro_adj, opt.start, opt.end)
                 if not df.empty:
-                    return SeriesResult(df=df.rename(columns={"value": "unemployment"}), source="EUROSTAT", meta={"via": "pandasdmx" if HAS_PANDASDMX else "requests"})
+                    return SeriesResult(df=df.rename(columns={"value": "unemployment"}), source="EUROSTAT")
 
         df = demo_monthly(opt.start, opt.end)
         return SeriesResult(df=df.rename(columns={"value": "unemployment"}), source="DEMO")
@@ -371,15 +414,6 @@ with st.sidebar:
         srcs = ["ISTAT", "EUROSTAT"]
 
     st.markdown("---")
-    st.markdown("**ISTAT edition**")
-    istat_editions = istat_list_editions(ISTAT_SEX_MAP.get(sex_label, "9"), age_code, ISTAT_ADJ_MAP.get(s_adj_label, "Y")) if geo == "IT" and s_adj_label in ("SA", "NSA") else []
-    ed_choice: Optional[str] = None
-    if istat_editions:
-        ed_choice = st.selectbox("Edition (release)", options=["<latest>"] + istat_editions, index=0)
-        if ed_choice == "<latest>":
-            ed_choice = None
-
-    st.markdown("---")
     show_debug = st.checkbox("Show debug info", value=False)
 
 fetcher = UnemploymentFetcher()
@@ -388,7 +422,7 @@ if st.button("Fetch data", type="primary", use_container_width=True):
     opt = FetchOptions(
         geo=geo, sex_label=sex_label, age_code=age_code, s_adj_label=s_adj_label,
         start_year=int(start_year), start_month=int(start_month), end_year=int(end_year), end_month=int(end_month),
-        istat_edition=ed_choice, source_priority=srcs,
+        source_priority=srcs,
     )
 
     with st.spinner("Fetching unemployment series…"):
@@ -397,7 +431,7 @@ if st.button("Fetch data", type="primary", use_container_width=True):
     if res.source == "ISTAT":
         st.markdown("<div class='card ok'><b>Success:</b> Source = ISTAT (official, Italy)</div>", unsafe_allow_html=True)
     elif res.source == "EUROSTAT":
-        st.markdown("<div class='card ok'><b>Success:</b> Source = Eurostat</div>", unsafe_allow_html=True)
+        st.markdown("<div class='card ok'><b>Success:</b> Source = Eurostat (Statistics API)</div>", unsafe_allow_html=True)
     else:
         st.markdown("<div class='card warn'><b>Using demo data</b> — all primary sources failed.</div>", unsafe_allow_html=True)
 
@@ -431,7 +465,6 @@ if st.button("Fetch data", type="primary", use_container_width=True):
         st.markdown("---")
         st.subheader("Debug info")
         st.write({
-            "HAS_PANDASDMX": HAS_PANDASDMX,
             "options": opt.__dict__,
             "source": res.source,
         })
@@ -440,8 +473,7 @@ st.markdown(
     """
     <div class='muted' style='margin-top:1rem'>
       <span class='badge'>Tips</span>
-      For Eurostat live fallback install <code>pandasdmx</code> and <code>lxml</code> in your environment (optional).
-      ISTAT endpoint is rate‑limited; caching reduces calls.
+      ISTAT via SDMX REST (IT1, 151_874). Eurostat via Statistics API (JSON‑stat). No extra libs required.
     </div>
     """,
     unsafe_allow_html=True,
