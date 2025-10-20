@@ -1,28 +1,8 @@
-"""
-Unemployment Auto‑Fetcher (ISTAT + Eurostat)
-===========================================
-A robust, single‑file Streamlit app that automatically fetches **monthly unemployment**
-(time series) from **ISTAT** (primary) with **Eurostat** fallback, plus optional
-monthly/quarterly auxiliary indicators. Designed to be resilient on Streamlit Cloud.
+# Unemployment Auto-Fetcher (ISTAT + Eurostat)
+# Robust single-file Streamlit app.
+# Primary: ISTAT SDMX REST (Italy). Fallback: Eurostat via pandasdmx (optional).
+# Caching, retries, graceful errors; demo data as last resort.
 
-Key features
-------------
-- Primary source: ISTAT SDMX REST (new endpoint). Fallback: Eurostat via `pandasdmx` if available.
-- Dynamic **edition** discovery for ISTAT (latest release auto‑detection, manual override).
-- Dimension‑aware key building for ISTAT (FREQ, GEO, DATA_TYPE, ADJUSTMENT, SEX, AGE, EDITION).
-- Clean SDMX‑JSON parsing (no XML required). Optional `pandasdmx` for Eurostat; if absent, app stays functional.
-- Caching, retry & timeout, graceful error messages, never crashes—falls back to sample data.
-- Target series: Unemployment Rate; optional helpers (Eurostat STS/CI) for nowcasting.
-
-Notes
------
-- ISTAT codes: SEX {"1": male, "2": female, "9": total}; ADJUSTMENT {"N": NSA, "Y": SA}.
-- Eurostat codes: `une_rt_m` with s_adj {NSA, SA, TC}, sex {M, F, T}, age {TOTAL, Y_LT25, Y25-74}, unit {PC_ACT}.
-- For auxiliary monthly indicators (Eurostat): IPI (sts_inpr_m), Retail Volume (sts_trtu_m), Services Turnover (sts_setu_m), Hours worked (sts_inlb_m), Consumer Confidence (ei_bsco_m). All are optional.
-
-This file intentionally contains **no requirements.txt**. If Eurostat access via `pandasdmx` is desired, add it
-in your deployment (Streamlit Cloud → App packages) together with `lxml`. The app still works without them.
-"""
 
 from __future__ import annotations
 import re
