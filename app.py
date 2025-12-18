@@ -1,833 +1,932 @@
 """
-🏠 ISTAT Nowcasting Lab - Executive Home v2.0
-=================================================
-Professional command center for Italian unemployment nowcasting.
-Features: Quick start, system status, data quality, model performance.
+Italian Unemployment Nowcasting System
+Professional Streamlit App with Multi-Model Framework
 
-Author: AI Assistant
-Date: October 2025
+Author: Rajabali Ghasempour
+Institution: ISTAT
 """
 
 import streamlit as st
 import pandas as pd
 import numpy as np
+from datetime import datetime
 import plotly.graph_objects as go
 import plotly.express as px
-from plotly.subplots import make_subplots
-from datetime import datetime, timedelta
 from pathlib import Path
-import os
-from typing import Optional, List, Dict, Tuple
 
-# =============================================================================
-# APP CONFIGURATION
-# =============================================================================
+# Backend imports
+from backend.data_loader import DataLoader
+from backend.feature_engineering import FeatureEngineer
+from backend.models import ModelFactory
+from backend.evaluation import Evaluator
+from backend.forecaster import RealTimeForecaster
+from utils.visualizations import Visualizer
+from utils.helpers import format_number, get_signal_status
 
-APP_NAME = "ISTAT Nowcasting Lab"
-APP_VERSION = "2.0.0"
-APP_SUBTITLE = "Italian Unemployment Nowcasting System"
-
+# Page config
 st.set_page_config(
-    page_title=APP_NAME,
-    page_icon="📈",
+    page_title="Unemployment Nowcasting System",
+    page_icon="📊",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# =============================================================================
-# CUSTOM CSS
-# =============================================================================
-
+# Custom CSS
 st.markdown("""
 <style>
-    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
-    
-    * {
-        font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-    }
-    
-    .hero-title {
-        font-size: 3.5rem;
-        font-weight: 800;
-        text-align: center;
-        background: linear-gradient(120deg, #0F766E, #14B8A6, #06B6D4);
-        -webkit-background-clip: text;
-        -webkit-text-fill-color: transparent;
-        margin-bottom: 0.5rem;
-        letter-spacing: -0.02em;
-    }
-    
-    .hero-subtitle {
-        text-align: center;
-        color: #64748B;
-        font-size: 1.25rem;
-        margin-bottom: 3rem;
-        font-weight: 400;
-    }
-    
-    .section-header {
-        background: linear-gradient(135deg, #0F766E 0%, #14B8A6 100%);
-        color: white;
-        padding: 1.25rem 1.5rem;
-        border-radius: 12px;
-        margin: 2rem 0 1.5rem 0;
-        font-size: 1.5rem;
-        font-weight: 700;
-        box-shadow: 0 4px 12px rgba(15, 118, 110, 0.2);
-    }
-    
-    .metric-card {
-        background: linear-gradient(135deg, #0F766E 0%, #14B8A6 100%);
-        padding: 1.75rem;
-        border-radius: 12px;
-        color: white;
-        box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
-        transition: transform 0.2s;
-    }
-    
-    .metric-card:hover {
-        transform: translateY(-4px);
-        box-shadow: 0 8px 20px rgba(0, 0, 0, 0.15);
-    }
-    
-    .metric-value {
+    .main-header {
         font-size: 2.5rem;
-        font-weight: 800;
-        margin: 0.5rem 0;
-    }
-    
-    .metric-label {
-        font-size: 0.875rem;
-        opacity: 0.9;
-        text-transform: uppercase;
-        letter-spacing: 0.1em;
-        font-weight: 600;
-    }
-    
-    .status-badge {
-        display: inline-flex;
-        align-items: center;
-        gap: 0.5rem;
-        padding: 0.5rem 1rem;
-        border-radius: 999px;
-        font-weight: 600;
-        font-size: 0.875rem;
-    }
-    
-    .status-good {
-        background: #D1FAE5;
-        color: #065F46;
-        border: 2px solid #10B981;
-    }
-    
-    .status-warn {
-        background: #FEF3C7;
-        color: #92400E;
-        border: 2px solid #F59E0B;
-    }
-    
-    .status-error {
-        background: #FEE2E2;
-        color: #991B1B;
-        border: 2px solid #EF4444;
-    }
-    
-    .info-card {
-        background: white;
-        padding: 1.5rem;
-        border-radius: 12px;
-        border: 1px solid #E5E7EB;
-        box-shadow: 0 2px 8px rgba(0, 0, 0, 0.04);
-    }
-    
-    .quick-action {
-        background: white;
-        padding: 1.5rem;
-        border-radius: 12px;
-        border: 2px solid #E5E7EB;
+        font-weight: bold;
+        color: #1f77b4;
         text-align: center;
-        transition: all 0.2s;
-        cursor: pointer;
+        margin-bottom: 2rem;
     }
-    
-    .quick-action:hover {
-        border-color: #0F766E;
-        transform: translateY(-2px);
-        box-shadow: 0 4px 12px rgba(15, 118, 110, 0.15);
+    .sub-header {
+        font-size: 1.5rem;
+        font-weight: bold;
+        color: #2c3e50;
+        margin-top: 2rem;
+        margin-bottom: 1rem;
     }
-    
-    .stButton>button {
-        background: linear-gradient(135deg, #0F766E 0%, #14B8A6 100%);
-        color: white;
-        border: none;
+    .metric-card {
+        background-color: #f8f9fa;
+        padding: 1.5rem;
         border-radius: 10px;
-        padding: 0.75rem 1.5rem;
-        font-weight: 600;
-        transition: all 0.2s;
-        box-shadow: 0 4px 12px rgba(15, 118, 110, 0.25);
+        border-left: 5px solid #1f77b4;
+        margin: 1rem 0;
     }
-    
-    .stButton>button:hover {
-        transform: translateY(-2px);
-        box-shadow: 0 6px 20px rgba(15, 118, 110, 0.35);
-    }
-    
-    .progress-container {
-        background: #F3F4F6;
-        border-radius: 8px;
+    .success-box {
+        background-color: #d4edda;
+        border: 1px solid #c3e6cb;
+        border-radius: 5px;
         padding: 1rem;
         margin: 1rem 0;
     }
-    
-    .step-indicator {
-        display: flex;
-        align-items: center;
-        gap: 0.5rem;
-        padding: 0.75rem;
-        border-radius: 8px;
-        margin-bottom: 0.5rem;
+    .warning-box {
+        background-color: #fff3cd;
+        border: 1px solid #ffeaa7;
+        border-radius: 5px;
+        padding: 1rem;
+        margin: 1rem 0;
     }
-    
-    .step-complete {
-        background: #D1FAE5;
-        border-left: 4px solid #10B981;
+    .info-box {
+        background-color: #d1ecf1;
+        border: 1px solid #bee5eb;
+        border-radius: 5px;
+        padding: 1rem;
+        margin: 1rem 0;
     }
-    
-    .step-active {
-        background: #DBEAFE;
-        border-left: 4px solid #3B82F6;
+    .stTabs [data-baseweb="tab-list"] {
+        gap: 2rem;
     }
-    
-    .step-pending {
-        background: #F3F4F6;
-        border-left: 4px solid #9CA3AF;
+    .stTabs [data-baseweb="tab"] {
+        height: 3rem;
+        padding: 0 2rem;
+        background-color: #f0f2f6;
+        border-radius: 5px 5px 0 0;
+    }
+    .stTabs [aria-selected="true"] {
+        background-color: #1f77b4;
+        color: white;
     }
 </style>
 """, unsafe_allow_html=True)
 
-# =============================================================================
-# STATE MANAGEMENT
-# =============================================================================
+# Initialize session state
+if 'data_loaded' not in st.session_state:
+    st.session_state.data_loaded = False
+if 'models_trained' not in st.session_state:
+    st.session_state.models_trained = False
+if 'results' not in st.session_state:
+    st.session_state.results = {}
 
-try:
-    from utils.state import AppState
-except Exception:
-    class _State:
-        def __init__(self):
-            self.y_monthly: Optional[pd.Series] = None
-            self.panel_monthly: Optional[pd.DataFrame] = None
-            self.panel_quarterly: Optional[pd.DataFrame] = None
-            self.bt_results: Dict[str, pd.Series] = {}
-            self.bt_metrics: Optional[pd.DataFrame] = None
-            self.raw_daily: List[pd.DataFrame] = []
-            self.google_trends: Optional[pd.DataFrame] = None
-    
-    class AppState:
-        @staticmethod
-        def init():
-            if "_app" not in st.session_state:
-                st.session_state["_app"] = _State()
-            return st.session_state["_app"]
-        
-        @staticmethod
-        def get():
-            return AppState.init()
-
-state = AppState.init()
-
-# =============================================================================
-# UTILITY FUNCTIONS
-# =============================================================================
-
-def get_system_status() -> Dict[str, str]:
-    """Get overall system status"""
-    status = {
-        'target': 'none',
-        'panel': 'none',
-        'features': 'none',
-        'models': 'none'
-    }
-    
-    # Check target
-    try:
-        if state.y_monthly is not None and not state.y_monthly.empty:
-            status['target'] = 'ready'
-    except:
-        pass
-    
-    # Check panel
-    try:
-        if state.panel_monthly is not None and not state.panel_monthly.empty:
-            status['panel'] = 'ready'
-            if state.panel_monthly.shape[1] > 10:
-                status['features'] = 'ready'
-    except:
-        pass
-    
-    # Check models - FIX: Safe check for bt_results
-    try:
-        if hasattr(state, 'bt_results') and state.bt_results is not None:
-            if isinstance(state.bt_results, dict) and len(state.bt_results) > 0:
-                status['models'] = 'ready'
-    except:
-        pass
-    
-    return status
-
-def calculate_progress() -> int:
-    """Calculate overall progress percentage"""
-    try:
-        status = get_system_status()
-        completed = sum(1 for v in status.values() if v == 'ready')
-        return int((completed / len(status)) * 100)
-    except:
-        return 0
-
-def get_api_status() -> Dict[str, bool]:
-    """Check API key availability"""
-    try:
-        return {
-            'OpenAI': bool(os.getenv('OPENAI_API_KEY')),
-            'Anthropic': bool(os.getenv('ANTHROPIC_API_KEY')),
-            'Google': bool(os.getenv('GOOGLE_API_KEY')),
-            'NewsAPI': bool(os.getenv('NEWSAPI_KEY'))
-        }
-    except:
-        return {
-            'OpenAI': False,
-            'Anthropic': False,
-            'Google': False,
-            'NewsAPI': False
-        }
-
-def detect_date_col(df: pd.DataFrame) -> str:
-    """Smart date column detection"""
-    for c in ['date', 'Date', 'ds', 'time', 'Time', 'period', 'Week', 'Month']:
-        if c in df.columns:
-            return c
-    for c in df.columns:
-        if pd.api.types.is_datetime64_any_dtype(df[c]):
-            return c
-    return df.columns[0]
-
-def to_datetime_safe(s) -> pd.Series:
-    """Safe datetime conversion"""
-    return pd.to_datetime(pd.Series(s), errors='coerce').dt.tz_localize(None).dt.normalize()
-
-def end_of_month(s: pd.Series) -> pd.Series:
-    """Convert to month-end"""
-    return (to_datetime_safe(s) + pd.offsets.MonthEnd(0)).dt.normalize()
-
-def load_target(file) -> Optional[pd.Series]:
-    """Load monthly target"""
-    try:
-        df = pd.read_csv(file)
-        dcol = detect_date_col(df)
-        vcol = [c for c in df.columns if c != dcol][0]
-        df = df[[dcol, vcol]].copy()
-        df.columns = ['date', 'y']
-        df['date'] = end_of_month(df['date'])
-        df['y'] = pd.to_numeric(df['y'], errors='coerce')
-        return df.dropna().set_index('date')['y'].sort_index()
-    except Exception as e:
-        st.error(f"Error loading target: {str(e)}")
-        return None
-
-def load_daily(file) -> Optional[pd.DataFrame]:
-    """Load daily data"""
-    try:
-        df = pd.read_csv(file)
-        dcol = detect_date_col(df)
-        df = df.rename(columns={dcol: 'date'})
-        df['date'] = to_datetime_safe(df['date'])
-        for c in df.columns:
-            if c != 'date':
-                df[c] = pd.to_numeric(df[c], errors='coerce')
-        return df.dropna(subset=['date']).sort_values('date')
-    except Exception as e:
-        st.error(f"Error loading daily: {str(e)}")
-        return None
-
-def load_google_trends(files: List) -> pd.DataFrame:
-    """Load Google Trends"""
-    frames = []
-    for f in files:
-        try:
-            df = pd.read_csv(f)
-            date_col = 'Week' if 'Week' in df.columns else ('Month' if 'Month' in df.columns else detect_date_col(df))
-            df = df.rename(columns={date_col: 'date'})
-            df['date'] = to_datetime_safe(df['date'])
-            frames.append(df)
-        except:
-            continue
-    
-    if not frames:
-        return pd.DataFrame()
-    
-    result = frames[0]
-    for df in frames[1:]:
-        result = pd.merge(result, df, on='date', how='outer')
-    
-    return result.sort_values('date').reset_index(drop=True)
-
-# =============================================================================
-# VISUALIZATION FUNCTIONS
-# =============================================================================
-
-def create_progress_chart(progress: int) -> go.Figure:
-    """Create progress donut chart"""
-    fig = go.Figure(data=[go.Pie(
-        values=[progress, 100-progress],
-        hole=0.7,
-        marker=dict(colors=['#0F766E', '#F3F4F6']),
-        textinfo='none',
-        hoverinfo='none'
-    )])
-    
-    fig.update_layout(
-        showlegend=False,
-        height=200,
-        margin=dict(l=0, r=0, t=0, b=0),
-        annotations=[dict(
-            text=f'{progress}%',
-            x=0.5, y=0.5,
-            font=dict(size=32, color='#0F766E', family='Inter'),
-            showarrow=False
-        )]
-    )
-    
-    return fig
-
-def create_mini_sparkline(series: pd.Series, color: str = '#0F766E') -> go.Figure:
-    """Create mini sparkline"""
-    fig = go.Figure()
-    
-    fig.add_trace(go.Scatter(
-        x=series.index,
-        y=series.values,
-        mode='lines',
-        line=dict(color=color, width=2),
-        fill='tozeroy',
-        fillcolor=f'rgba(15, 118, 110, 0.1)'
-    ))
-    
-    fig.update_layout(
-        height=80,
-        margin=dict(l=0, r=0, t=0, b=0),
-        showlegend=False,
-        xaxis=dict(visible=False),
-        yaxis=dict(visible=False),
-        paper_bgcolor='rgba(0,0,0,0)',
-        plot_bgcolor='rgba(0,0,0,0)'
-    )
-    
-    return fig
-
-# =============================================================================
-# SIDEBAR - Simple version (Streamlit handles navigation automatically)
-# =============================================================================
-
+# Sidebar
 with st.sidebar:
-    # Version badge
-    st.markdown(f"""
-    <div style='text-align: center; padding: 0.75rem; background: linear-gradient(135deg, #0F766E, #14B8A6); 
-                color: white; border-radius: 10px; font-weight: 700; font-size: 1rem; margin-bottom: 1.5rem;'>
-        {APP_NAME}<br/>
-        <span style='font-size: 0.875rem; opacity: 0.9;'>v{APP_VERSION}</span>
-    </div>
-    """, unsafe_allow_html=True)
+    st.image("https://via.placeholder.com/200x80/1f77b4/ffffff?text=ISTAT", use_column_width=True)
+    st.markdown("### 📊 Nowcasting System")
+    st.markdown("---")
     
-    # API Status
-    st.markdown("### 🔑 API Status")
-    api_status = get_api_status()
+    st.markdown("#### ⚙️ Configuration")
     
-    for api, available in api_status.items():
-        status_color = "#10B981" if available else "#EF4444"
-        status_icon = "✓" if available else "✗"
-        st.markdown(f"""
-        <div style='display: flex; justify-content: space-between; align-items: center; 
-                    padding: 0.5rem; margin: 0.25rem 0; background: #F9FAFB; border-radius: 6px;'>
-            <span style='color: #475569; font-weight: 500;'>{api}</span>
-            <span style='color: {status_color}; font-weight: 700; font-size: 1.1rem;'>{status_icon}</span>
-        </div>
-        """, unsafe_allow_html=True)
+    # Mode selection
+    mode = st.radio(
+        "Operating Mode",
+        ["Default (Unemployment + GT)", "Custom Analysis"],
+        help="Default mode uses Italian unemployment data with Google Trends"
+    )
     
     st.markdown("---")
     
-    # System Status Summary
-    try:
-        system_status = get_system_status()
-        progress = calculate_progress()
-        
-        st.markdown("### 📊 Quick Status")
-        st.markdown(f"""
-        <div style='text-align: center; padding: 1rem; background: #F9FAFB; border-radius: 8px;'>
-            <div style='font-size: 2rem; font-weight: 700; color: #0F766E;'>{progress}%</div>
-            <div style='color: #64748B; font-size: 0.875rem;'>Complete</div>
+    # Data upload
+    st.markdown("#### 📁 Data Upload")
+    
+    uploaded_unemployment = st.file_uploader(
+        "Unemployment Data (CSV)",
+        type=['csv'],
+        help="Monthly unemployment rate time series"
+    )
+    
+    uploaded_gt = st.file_uploader(
+        "Google Trends (Excel)",
+        type=['xlsx', 'xls'],
+        accept_multiple_files=True,
+        help="Multiple 5-year segments (optional)"
+    )
+    
+    uploaded_exog = st.file_uploader(
+        "Exogenous Variables (CSV)",
+        type=['csv'],
+        help="Additional predictors (CCI, HICP, etc.)"
+    )
+    
+    st.markdown("---")
+    
+    # Model settings
+    st.markdown("#### 🎯 Model Settings")
+    
+    train_test_split = st.slider(
+        "Train/Test Split (%)",
+        min_value=50,
+        max_value=90,
+        value=70,
+        step=5,
+        help="Percentage of data for training"
+    )
+    
+    include_gt = st.checkbox(
+        "Include Google Trends",
+        value=True,
+        help="Use GT features in models"
+    )
+    
+    models_to_run = st.multiselect(
+        "Models to Train",
+        ["MIDAS Exponential", "MIDAS Beta", "Ridge", "Lasso", "Random Forest", "XGBoost", "LSTM"],
+        default=["MIDAS Exponential", "Ridge"],
+        help="Select multiple models for comparison"
+    )
+    
+    st.markdown("---")
+    
+    # Action buttons
+    if st.button("🚀 Load & Process Data", type="primary", use_container_width=True):
+        st.session_state.trigger_load = True
+    
+    if st.button("🤖 Train Models", disabled=not st.session_state.data_loaded, use_container_width=True):
+        st.session_state.trigger_train = True
+    
+    st.markdown("---")
+    st.markdown("**Version:** 1.0.0")
+    st.markdown("**Author:** Ali Ghanbari")
+    st.markdown("**Institution:** ISTAT")
+
+# Main content
+st.markdown('<div class="main-header">🇮🇹 Italian Unemployment Nowcasting System</div>', unsafe_allow_html=True)
+
+# Tabs
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    "📊 Overview",
+    "📈 Data Explorer",
+    "🤖 Models",
+    "📉 Results",
+    "🔮 Live Nowcast",
+    "📚 Documentation"
+])
+
+# ============================================================================
+# TAB 1: OVERVIEW
+# ============================================================================
+
+with tab1:
+    st.markdown("### Welcome to the Unemployment Nowcasting System")
+    
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        st.markdown("""
+        <div class="metric-card">
+            <h4>🎯 Purpose</h4>
+            <p>Provide real-time unemployment estimates using high-frequency Google Trends data, 2-3 weeks before official releases.</p>
         </div>
         """, unsafe_allow_html=True)
-    except:
-        pass
-
-# =============================================================================
-# MAIN CONTENT
-# =============================================================================
-
-# Hero Section
-st.markdown(f'<h1 class="hero-title">{APP_NAME}</h1>', unsafe_allow_html=True)
-st.markdown(f'<p class="hero-subtitle">{APP_SUBTITLE}</p>', unsafe_allow_html=True)
-
-# =============================================================================
-# SYSTEM STATUS OVERVIEW
-# =============================================================================
-
-st.markdown('<div class="section-header">🎯 System Status</div>', unsafe_allow_html=True)
-
-system_status = get_system_status()
-progress = calculate_progress()
-
-col1, col2, col3, col4, col5 = st.columns(5)
-
-# Progress Circle
-with col1:
-    progress_fig = create_progress_chart(progress)
-    st.plotly_chart(progress_fig, use_container_width=True, config={'displayModeBar': False})
-    st.markdown("<p style='text-align: center; color: #64748B; font-size: 0.875rem;'>Overall Progress</p>", unsafe_allow_html=True)
-
-# Status Cards
-status_mapping = {
-    'target': ('Target Data', '🎯'),
-    'panel': ('Panel Built', '🧱'),
-    'features': ('Features Ready', '🧪'),
-    'models': ('Models Trained', '🤖')
-}
-
-for col, (key, (label, emoji)) in zip([col2, col3, col4, col5], status_mapping.items()):
-    with col:
-        status = system_status[key]
-        
-        if status == 'ready':
-            badge_class = 'status-good'
-            status_text = 'Ready'
-        else:
-            badge_class = 'status-warn'
-            status_text = 'Pending'
-        
-        st.markdown(f"""
-        <div style='text-align: center; padding: 1rem;'>
-            <div style='font-size: 2.5rem;'>{emoji}</div>
-            <div style='margin: 0.5rem 0; font-weight: 600; color: #1F2937;'>{label}</div>
-            <div class='status-badge {badge_class}'>{status_text}</div>
+    
+    with col2:
+        st.markdown("""
+        <div class="metric-card">
+            <h4>⚡ Key Features</h4>
+            <ul>
+                <li>Multi-model framework</li>
+                <li>MIDAS aggregation</li>
+                <li>Statistical testing</li>
+                <li>Real-time nowcasting</li>
+            </ul>
         </div>
         """, unsafe_allow_html=True)
-
-# =============================================================================
-# WORKFLOW STEPS
-# =============================================================================
-
-st.markdown('<div class="section-header">📋 Workflow Status</div>', unsafe_allow_html=True)
-
-steps = [
-    {
-        'name': '1. Upload Target Data',
-        'status': 'complete' if system_status['target'] == 'ready' else 'pending',
-        'page': 'pages/2_Data_Aggregation.py'
-    },
-    {
-        'name': '2. Build Monthly Panel',
-        'status': 'complete' if system_status['panel'] == 'ready' else 'active' if system_status['target'] == 'ready' else 'pending',
-        'page': 'pages/2_Data_Aggregation.py'
-    },
-    {
-        'name': '3. Engineer Features',
-        'status': 'complete' if system_status['features'] == 'ready' else 'active' if system_status['panel'] == 'ready' else 'pending',
-        'page': 'pages/3_Feature_Engineering.py'
-    },
-    {
-        'name': '4. Train & Backtest Models',
-        'status': 'complete' if system_status['models'] == 'ready' else 'active' if system_status['features'] == 'ready' else 'pending',
-        'page': 'pages/4_Backtesting.py'
-    }
-]
-
-for step in steps:
-    status_class = f"step-{step['status']}"
     
-    if step['status'] == 'complete':
-        icon = '✅'
-    elif step['status'] == 'active':
-        icon = '🔄'
-    else:
-        icon = '⭕'
+    with col3:
+        st.markdown("""
+        <div class="metric-card">
+            <h4>📊 Current Status</h4>
+            <p><strong>Data Loaded:</strong> {}</p>
+            <p><strong>Models Trained:</strong> {}</p>
+        </div>
+        """.format(
+            "✅ Yes" if st.session_state.data_loaded else "❌ No",
+            "✅ Yes" if st.session_state.models_trained else "❌ No"
+        ), unsafe_allow_html=True)
     
-    st.markdown(f"""
-    <div class='step-indicator {status_class}'>
-        <span style='font-size: 1.5rem;'>{icon}</span>
-        <span style='flex: 1; font-weight: 600;'>{step['name']}</span>
-    </div>
-    """, unsafe_allow_html=True)
-
-# =============================================================================
-# QUICK START
-# =============================================================================
-
-st.markdown('<div class="section-header">🚀 Quick Start</div>', unsafe_allow_html=True)
-
-st.markdown("""
-Upload your data to get started with nowcasting Italian unemployment.
-All files should be CSV format with proper date columns.
-""")
-
-col1, col2, col3 = st.columns(3)
-
-with col1:
-    st.markdown("#### 🎯 Monthly Target")
-    target_file = st.file_uploader(
-        "Upload monthly unemployment data",
-        type=['csv'],
-        key='target_home',
-        help="CSV with columns: date, value"
-    )
-
-with col2:
-    st.markdown("#### 📊 Daily Data")
-    daily_files = st.file_uploader(
-        "Upload daily financial data",
-        type=['csv'],
-        accept_multiple_files=True,
-        key='daily_home',
-        help="Stock prices, VIX, etc."
-    )
-
-with col3:
-    st.markdown("#### 🔍 Google Trends")
-    trends_files = st.file_uploader(
-        "Upload Google Trends data",
-        type=['csv'],
-        accept_multiple_files=True,
-        key='trends_home',
-        help="Weekly/monthly trends data"
-    )
-
-# Process uploads
-if target_file:
-    with st.spinner("Loading target data..."):
-        state.y_monthly = load_target(target_file)
-        if state.y_monthly is not None:
-            st.success(f"✅ Loaded {len(state.y_monthly)} months of data")
-
-if daily_files:
-    with st.spinner("Loading daily data..."):
-        state.raw_daily = []
-        for f in daily_files:
-            df = load_daily(f)
-            if df is not None:
-                state.raw_daily.append(df)
-        st.success(f"✅ Loaded {len(state.raw_daily)} daily files")
-
-if trends_files:
-    with st.spinner("Loading Google Trends..."):
-        state.google_trends = load_google_trends(trends_files)
-        if not state.google_trends.empty:
-            st.success(f"✅ Loaded {state.google_trends.shape[1]-1} trend series")
-
-# =============================================================================
-# DATA PREVIEW
-# =============================================================================
-
-if hasattr(state, 'y_monthly') and state.y_monthly is not None and not state.y_monthly.empty:
-    st.markdown('<div class="section-header">📈 Data Preview</div>', unsafe_allow_html=True)
+    st.markdown("---")
     
-    try:
-        col1, col2 = st.columns([2, 1])
+    # Quick Start Guide
+    st.markdown("### 🚀 Quick Start")
+    
+    with st.expander("📖 How to Use This App", expanded=not st.session_state.data_loaded):
+        st.markdown("""
+        #### Step 1: Upload Data
+        - **Unemployment Data**: Monthly unemployment rate (required)
+        - **Google Trends**: Weekly search data (optional but recommended)
+        - **Exogenous Variables**: CCI, HICP, etc. (optional)
+        
+        #### Step 2: Configure Settings
+        - Choose operating mode (Default or Custom)
+        - Select train/test split ratio
+        - Pick models to train
+        
+        #### Step 3: Load & Process
+        - Click "🚀 Load & Process Data" in sidebar
+        - Review data quality and correlations
+        
+        #### Step 4: Train Models
+        - Click "🤖 Train Models" to start training
+        - Compare model performance
+        
+        #### Step 5: Generate Nowcasts
+        - Navigate to "🔮 Live Nowcast" tab
+        - Get real-time predictions with confidence intervals
+        """)
+    
+    # System Architecture
+    with st.expander("🏗️ System Architecture"):
+        st.markdown("""
+```
+        Data Sources          Processing              Models                Output
+        ─────────────        ──────────────         ─────────────         ────────────
+        │ Unemployment   →   │ 5-Seg Merge    →    │ MIDAS Exp     →    │ Nowcast
+        │ Google Trends  →   │ Feature Eng    →    │ MIDAS Beta    →    │ ± CI
+        │ CCI, HICP      →   │ Lag Creation   →    │ Ridge/Lasso   →    │ Alerts
+                             │ Scaling        →    │ ML Models     →    │ Viz
+```
+        
+        **Backend Components:**
+        - Data Loader: Handles uploads, cleaning, validation
+        - Feature Engineer: Creates lags, MIDAS weights, interactions
+        - Model Factory: Trains multiple model types
+        - Evaluator: Computes metrics, statistical tests
+        - Forecaster: Real-time nowcasting engine
+        """)
+    
+    # Performance Summary (if models trained)
+    if st.session_state.models_trained and 'model_results' in st.session_state.results:
+        st.markdown("### 📊 Latest Performance Summary")
+        
+        results = st.session_state.results['model_results']
+        best_model = results.loc[results['RMSE'].idxmin()]
+        
+        col1, col2, col3, col4 = st.columns(4)
         
         with col1:
-            st.markdown("#### Target Time Series")
-            
-            fig = go.Figure()
-            
-            fig.add_trace(go.Scatter(
-                x=state.y_monthly.index,
-                y=state.y_monthly.values,
-                mode='lines+markers',
-                name='Unemployment Rate',
-                line=dict(color='#0F766E', width=3),
-                marker=dict(size=6)
-            ))
-            
-            fig.update_layout(
-                title='Italian Unemployment Rate',
-                xaxis_title='Date',
-                yaxis_title='Rate (%)',
-                template='plotly_white',
-                height=400,
-                hovermode='x unified'
+            st.metric(
+                "Best Model",
+                best_model['Model'],
+                delta=None
             )
-            
-            st.plotly_chart(fig, use_container_width=True)
         
         with col2:
-            st.markdown("#### Statistics")
-            
-            stats = {
-                'Observations': len(state.y_monthly),
-                'Start Date': state.y_monthly.index.min().strftime('%Y-%m'),
-                'End Date': state.y_monthly.index.max().strftime('%Y-%m'),
-                'Mean': f"{state.y_monthly.mean():.2f}%",
-                'Std Dev': f"{state.y_monthly.std():.2f}%",
-                'Min': f"{state.y_monthly.min():.2f}%",
-                'Max': f"{state.y_monthly.max():.2f}%"
-            }
-            
-            for label, value in stats.items():
-                st.markdown(f"""
-                <div style='padding: 0.5rem; margin: 0.25rem 0; background: #F9FAFB; border-radius: 6px;'>
-                    <div style='color: #64748B; font-size: 0.75rem; text-transform: uppercase;'>{label}</div>
-                    <div style='color: #1F2937; font-size: 1.25rem; font-weight: 700;'>{value}</div>
+            st.metric(
+                "RMSE",
+                f"{best_model['RMSE']:.4f}",
+                delta=None
+            )
+        
+        with col3:
+            improvement = best_model.get('Improvement_pct', 0)
+            st.metric(
+                "Improvement",
+                f"{improvement:+.1f}%",
+                delta=f"{improvement:+.1f}%"
+            )
+        
+        with col4:
+            p_value = best_model.get('p_value', 1.0)
+            st.metric(
+                "Significance",
+                "Yes ✅" if p_value < 0.05 else "No ❌",
+                delta=f"p={p_value:.4f}"
+            )
+
+# ============================================================================
+# TAB 2: DATA EXPLORER
+# ============================================================================
+
+with tab2:
+    st.markdown("### 📈 Data Explorer & Quality Assessment")
+    
+    if not st.session_state.data_loaded:
+        st.info("👆 Please upload data and click 'Load & Process Data' in the sidebar to begin.")
+    else:
+        data_loader = st.session_state.get('data_loader')
+        
+        # Data Summary
+        st.markdown("#### 📊 Dataset Summary")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.markdown("""
+            <div class="info-box">
+                <h5>Unemployment Data</h5>
+                <p><strong>Observations:</strong> {}</p>
+                <p><strong>Date Range:</strong> {} to {}</p>
+                <p><strong>Mean:</strong> {:.2f}%</p>
+                <p><strong>Std Dev:</strong> {:.2f}%</p>
+            </div>
+            """.format(
+                len(st.session_state.df_clean),
+                st.session_state.df_clean['date'].min().date(),
+                st.session_state.df_clean['date'].max().date(),
+                st.session_state.df_clean['target'].mean(),
+                st.session_state.df_clean['target'].std()
+            ), unsafe_allow_html=True)
+        
+        with col2:
+            if include_gt and 'gt_data' in st.session_state:
+                gt_quality = st.session_state.get('gt_quality', {})
+                st.markdown("""
+                <div class="success-box">
+                    <h5>Google Trends Quality</h5>
+                    <p><strong>GOOD Keywords:</strong> {}</p>
+                    <p><strong>CAUTION Keywords:</strong> {}</p>
+                    <p><strong>WARNING Keywords:</strong> {}</p>
+                    <p><strong>Total Merged Weeks:</strong> {}</p>
                 </div>
-                """, unsafe_allow_html=True)
-    
-    except Exception as e:
-        st.error(f"Could not display data preview: {str(e)}")
+                """.format(
+                    len(gt_quality.get('GOOD', [])),
+                    len(gt_quality.get('CAUTION', [])),
+                    len(gt_quality.get('WARNING', [])),
+                    len(st.session_state.gt_data)
+                ), unsafe_allow_html=True)
+        
+        # Time Series Plot
+        st.markdown("#### 📉 Time Series Visualization")
+        
+        viz = Visualizer()
+        fig = viz.plot_time_series_interactive(
+            st.session_state.df_clean,
+            'date',
+            'target',
+            title="Unemployment Rate Changes Over Time"
+        )
+        st.plotly_chart(fig, use_container_width=True)
+        
+        # Correlation Matrix
+        st.markdown("#### 🔗 Correlation Analysis")
+        
+        target_col = 'target'
+        feature_cols = [col for col in st.session_state.df_clean.columns 
+                       if col not in ['date', target_col] and 
+                       st.session_state.df_clean[col].dtype in ['float64', 'int64']]
+        
+        if len(feature_cols) > 0:
+            corr_matrix = st.session_state.df_clean[feature_cols + [target_col]].corr()
+            
+            fig = px.imshow(
+                corr_matrix,
+                labels=dict(color="Correlation"),
+                x=corr_matrix.columns,
+                y=corr_matrix.columns,
+                color_continuous_scale='RdBu_r',
+                zmin=-1, zmax=1
+            )
+            fig.update_layout(height=600)
+            st.plotly_chart(fig, use_container_width=True)
+            
+            # Top Correlations with Target
+            st.markdown("##### Top Correlations with Target")
+            
+            target_corr = corr_matrix[target_col].drop(target_col).abs().sort_values(ascending=False)
+            
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.markdown("**Strongest Positive:**")
+                positive_corr = corr_matrix[target_col].drop(target_col).sort_values(ascending=False).head(5)
+                for feat, corr in positive_corr.items():
+                    st.write(f"- **{feat}**: {corr:+.3f}")
+            
+            with col2:
+                st.markdown("**Strongest Negative:**")
+                negative_corr = corr_matrix[target_col].drop(target_col).sort_values().head(5)
+                for feat, corr in negative_corr.items():
+                    st.write(f"- **{feat}**: {corr:+.3f}")
+        
+        # Data Table
+        with st.expander("📋 View Raw Data"):
+            st.dataframe(
+                st.session_state.df_clean,
+                use_container_width=True,
+                height=400
+            )
 
-# =============================================================================
-# MODEL PERFORMANCE SUMMARY
-# =============================================================================
+# ============================================================================
+# TAB 3: MODELS
+# ============================================================================
 
-if hasattr(state, 'bt_metrics') and state.bt_metrics is not None and not state.bt_metrics.empty:
-    st.markdown('<div class="section-header">🏆 Model Performance</div>', unsafe_allow_html=True)
+with tab3:
+    st.markdown("### 🤖 Model Training & Comparison")
     
-    try:
-        # Best models
-        top_models = state.bt_metrics.nsmallest(3, 'MAE')
+    if not st.session_state.data_loaded:
+        st.warning("⚠️ Please load data first in the sidebar.")
+    else:
+        # Model Configuration
+        st.markdown("#### ⚙️ Model Configuration")
         
         col1, col2, col3 = st.columns(3)
         
-        for i, (col, (_, model)) in enumerate(zip([col1, col2, col3], top_models.iterrows())):
-            with col:
-                rank_emoji = ['🥇', '🥈', '🥉'][i]
-                
-                st.markdown(f"""
-                <div class='info-card'>
-                    <div style='font-size: 2rem; text-align: center;'>{rank_emoji}</div>
-                    <div style='text-align: center; font-weight: 700; font-size: 1.1rem; margin: 0.5rem 0;'>
-                        {model.get('model', 'Unknown')}
-                    </div>
-                    <div style='display: flex; justify-content: space-between; margin-top: 1rem;'>
-                        <div>
-                            <div style='color: #64748B; font-size: 0.75rem;'>MAE</div>
-                            <div style='font-weight: 700;'>{model.get('MAE', 0):.4f}</div>
-                        </div>
-                        <div>
-                            <div style='color: #64748B; font-size: 0.75rem;'>RMSE</div>
-                            <div style='font-weight: 700;'>{model.get('RMSE', 0):.4f}</div>
-                        </div>
-                    </div>
+        with col1:
+            st.markdown("""
+            <div class="metric-card">
+                <h5>Selected Models</h5>
+                <ul>
+                    {}
+                </ul>
+            </div>
+            """.format("\n".join([f"<li>{m}</li>" for m in models_to_run])), unsafe_allow_html=True)
+        
+        with col2:
+            st.markdown("""
+            <div class="metric-card">
+                <h5>Training Configuration</h5>
+                <p><strong>Train Size:</strong> {}%</p>
+                <p><strong>Test Size:</strong> {}%</p>
+                <p><strong>GT Included:</strong> {}</p>
+            </div>
+            """.format(train_test_split, 100-train_test_split, "Yes" if include_gt else "No"), unsafe_allow_html=True)
+        
+        with col3:
+            if st.session_state.models_trained:
+                st.markdown("""
+                <div class="success-box">
+                    <h5>Training Complete ✅</h5>
+                    <p>Models trained successfully</p>
+                    <p>Check Results tab for details</p>
+                </div>
+                """, unsafe_allow_html=True)
+            else:
+                st.markdown("""
+                <div class="warning-box">
+                    <h5>Not Trained Yet ⏳</h5>
+                    <p>Click "Train Models" in sidebar</p>
                 </div>
                 """, unsafe_allow_html=True)
         
-        # Full metrics table
-        st.markdown("#### All Models")
+        # Training Progress (if triggered)
+        if st.session_state.get('trigger_train', False):
+            with st.spinner("🤖 Training models... This may take a few minutes."):
+                # Initialize components
+                factory = ModelFactory()
+                evaluator = Evaluator()
+                
+                # Get data splits
+                train_data = st.session_state.train
+                test_data = st.session_state.test
+                
+                # Progress bar
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                
+                results_list = []
+                
+                for idx, model_name in enumerate(models_to_run):
+                    status_text.text(f"Training {model_name}... ({idx+1}/{len(models_to_run)})")
+                    
+                    # Train model
+                    model = factory.create_model(model_name, include_gt=include_gt)
+                    model.fit(train_data)
+                    
+                    # Predict
+                    pred = model.predict(test_data)
+                    
+                    # Evaluate
+                    metrics = evaluator.compute_metrics(
+                        test_data['target'].values,
+                        pred,
+                        baseline_pred=np.full(len(pred), train_data['target'].mean())
+                    )
+                    
+                    results_list.append({
+                        'Model': model_name,
+                        'RMSE': metrics['RMSE'],
+                        'MAE': metrics['MAE'],
+                        'Improvement_pct': metrics['Improvement_pct'],
+                        'p_value': metrics.get('p_value', np.nan)
+                    })
+                    
+                    progress_bar.progress((idx + 1) / len(models_to_run))
+                
+                # Save results
+                st.session_state.results['model_results'] = pd.DataFrame(results_list)
+                st.session_state.models_trained = True
+                st.session_state.trigger_train = False
+                
+                status_text.text("✅ Training complete!")
+                st.success("All models trained successfully!")
+                st.rerun()
+
+# ============================================================================
+# TAB 4: RESULTS
+# ============================================================================
+
+with tab4:
+    st.markdown("### 📉 Model Results & Performance")
+    
+    if not st.session_state.models_trained:
+        st.info("📊 Train models first to see results here.")
+    else:
+        results_df = st.session_state.results['model_results']
         
-        format_dict = {}
-        if 'MAE' in state.bt_metrics.columns:
-            format_dict['MAE'] = '{:.4f}'
-        if 'RMSE' in state.bt_metrics.columns:
-            format_dict['RMSE'] = '{:.4f}'
-        if 'SMAPE' in state.bt_metrics.columns:
-            format_dict['SMAPE'] = '{:.2f}'
-        if 'MASE' in state.bt_metrics.columns:
-            format_dict['MASE'] = '{:.4f}'
+        # Performance Table
+        st.markdown("#### 📊 Model Comparison")
         
-        styled_df = state.bt_metrics.style.format(format_dict)
-        if 'MAE' in state.bt_metrics.columns:
-            styled_df = styled_df.background_gradient(subset=['MAE'], cmap='RdYlGn_r')
+        st.dataframe(
+            results_df.style.background_gradient(subset=['RMSE'], cmap='RdYlGn_r')
+                     .background_gradient(subset=['Improvement_pct'], cmap='RdYlGn')
+                     .format({'RMSE': '{:.4f}', 'MAE': '{:.4f}', 
+                             'Improvement_pct': '{:+.2f}%', 'p_value': '{:.4f}'}),
+            use_container_width=True
+        )
         
-        st.dataframe(styled_df, use_container_width=True)
+        # Best Model Highlight
+        best_idx = results_df['RMSE'].idxmin()
+        best_model = results_df.loc[best_idx]
+        
+        st.markdown(f"""
+        <div class="success-box">
+            <h4>🏆 Best Model: {best_model['Model']}</h4>
+            <p><strong>RMSE:</strong> {best_model['RMSE']:.4f}</p>
+            <p><strong>Improvement:</strong> {best_model['Improvement_pct']:+.2f}%</p>
+            <p><strong>Statistical Significance:</strong> {'✅ Yes (p < 0.05)' if best_model['p_value'] < 0.05 else '❌ No'}</p>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        # Visualization
+        st.markdown("#### 📈 Performance Visualization")
+        
+        viz = Visualizer()
+        fig = viz.plot_model_comparison(results_df)
+        st.plotly_chart(fig, use_container_width=True)
+        
+        # Period-wise Performance
+        if 'period_results' in st.session_state.results:
+            st.markdown("#### 📅 Period-wise Performance")
+            period_df = st.session_state.results['period_results']
+            
+            fig = viz.plot_period_performance(period_df)
+            st.plotly_chart(fig, use_container_width=True)
+
+# ============================================================================
+# TAB 5: LIVE NOWCAST
+# ============================================================================
+
+with tab5:
+    st.markdown("### 🔮 Live Unemployment Nowcast")
     
-    except Exception as e:
-        st.info("Model metrics available but couldn't display. Check data format.")
+    if not st.session_state.models_trained:
+        st.warning("⚠️ Please train models first to generate nowcasts.")
+    else:
+        # Current Nowcast
+        st.markdown("#### 📊 Current Month Nowcast")
+        
+        forecaster = st.session_state.get('forecaster')
+        
+        if forecaster:
+            nowcast = forecaster.generate_nowcast()
+            
+            col1, col2, col3 = st.columns(3)
+            
+            with col1:
+                st.metric(
+                    "Nowcast (MIDAS)",
+                    f"{nowcast['prediction']:+.2f} pp",
+                    delta=nowcast.get('vs_historical', None)
+                )
+            
+            with col2:
+                st.metric(
+                    "Confidence Interval",
+                    f"[{nowcast['ci_lower']:+.2f}, {nowcast['ci_upper']:+.2f}]",
+                    delta=None
+                )
+            
+            with col3:
+                signal_status = get_signal_status(nowcast['gt_signals'])
+                st.metric(
+                    "GT Signal Status",
+                    signal_status['level'],
+                    delta=signal_status['message']
+                )
+        
+        # GT Signal Monitoring
+        if include_gt:
+            st.markdown("#### 🚨 Google Trends Early Warning Signals")
+            
+            gt_latest = st.session_state.get('gt_latest', {})
+            
+            col1, col2, col3 = st.columns(3)
+            
+            keywords = ['centro per l\'impiego', 'offerte di lavoro', 'curriculum']
+            
+            for idx, kw in enumerate(keywords):
+                with [col1, col2, col3][idx]:
+                    value = gt_latest.get(kw, 50)
+                    baseline = 50
+                    change = ((value - baseline) / baseline) * 100
+                    
+                    st.metric(
+                        kw.title(),
+                        f"{value:.0f}",
+                        delta=f"{change:+.1f}%"
+                    )
+        
+        # Forecast Timeline
+        st.markdown("#### 📅 Nowcast Timeline")
+        
+        st.markdown("""
+        <div class="info-box">
+            <p><strong>Current Date:</strong> {}</p>
+            <p><strong>Reference Month:</strong> {}</p>
+            <p><strong>Official Release:</strong> {} (in {} days)</p>
+            <p><strong>GT Data Advantage:</strong> 2-3 weeks earlier</p>
+        </div>
+        """.format(
+            datetime.now().strftime("%Y-%m-%d"),
+            "November 2025",
+            "December 15, 2025",
+            12
+        ), unsafe_allow_html=True)
 
-# =============================================================================
-# QUICK ACTIONS
-# =============================================================================
+# ============================================================================
+# TAB 6: DOCUMENTATION
+# ============================================================================
 
-st.markdown('<div class="section-header">⚡ Quick Actions</div>', unsafe_allow_html=True)
-
-col1, col2, col3, col4 = st.columns(4)
-
-with col1:
-    if st.button("📊 View Dashboard", use_container_width=True, key="btn_dashboard"):
-        st.switch_page("pages/1_Dashboard.py")
-
-with col2:
-    if st.button("🧱 Build Panel", use_container_width=True, key="btn_panel"):
-        st.switch_page("pages/2_Data_Aggregation.py")
-
-with col3:
-    if st.button("🧪 Engineer Features", use_container_width=True, key="btn_features"):
-        st.switch_page("pages/3_Feature_Engineering.py")
-
-with col4:
-    if st.button("🧮 Run Backtest", use_container_width=True, key="btn_backtest"):
-        st.switch_page("pages/4_Backtesting.py")
-
-# =============================================================================
-# HELP & DOCUMENTATION
-# =============================================================================
-
-with st.expander("📚 Quick Help & Documentation", expanded=False):
-    st.markdown("""
-    ### Getting Started
+with tab6:
+    st.markdown("### 📚 Documentation & User Guide")
     
-    1. **Upload Data**: Start by uploading your monthly target and daily financial data
-    2. **Build Panel**: Aggregate daily data to monthly frequency
-    3. **Engineer Features**: Create lags, rolling statistics, and transforms
-    4. **Run Backtest**: Train models using walk-forward validation
-    5. **Analyze Results**: View performance metrics and visualizations
+    with st.expander("📖 Complete User Guide", expanded=True):
+        st.markdown("""
+        # Italian Unemployment Nowcasting System
+        ## User Guide
+        
+        ### System Overview
+        
+        This application provides real-time unemployment nowcasts for Italy using:
+        - **Official ISTAT unemployment data** (monthly)
+        - **Google Trends search data** (weekly, optional)
+        - **Exogenous economic indicators** (CCI, HICP, optional)
+        
+        ### Key Features
+        
+        #### 1. Multi-Model Framework
+        - **MIDAS Models**: Exponential and Beta polynomial weighting
+        - **Linear Models**: Ridge, Lasso regression
+        - **Machine Learning**: Random Forest, XGBoost
+        - **Deep Learning**: LSTM networks (experimental)
+        
+        #### 2. Google Trends Integration
+        - Automatic 5-segment merging with quality checks
+        - Keyword selection based on economic relevance
+        - Weekly-to-monthly aggregation via MIDAS
+        
+        #### 3. Statistical Rigor
+        - Clark-West test for nested models
+        - Diebold-Mariano test for general comparison
+        - Backtesting with walk-forward validation
+        
+        ### Workflow
+        
+        **Step 1: Data Upload**
+        - Upload unemployment CSV with 'date' and 'unemp' columns
+        - Optionally upload Google Trends Excel files (5-year segments)
+        - Optionally upload exogenous variables CSV
+        
+        **Step 2: Configuration**
+        - Select operating mode (Default or Custom)
+        - Choose train/test split ratio
+        - Select models to train
+        
+        **Step 3: Processing**
+        - Click "Load & Process Data"
+        - Review data quality in Data Explorer tab
+        - Check correlation structure
+        
+        **Step 4: Modeling**
+        - Click "Train Models"
+        - Wait for training to complete
+        - Review results in Results tab
+        
+        **Step 5: Nowcasting**
+        - Navigate to Live Nowcast tab
+        - View current month prediction
+        - Monitor GT early warning signals
+        
+        ### Interpreting Results
+        
+        #### RMSE (Root Mean Squared Error)
+        - Lower is better
+        - Measures average prediction error
+        - Comparable across models
+        
+        #### Improvement Percentage
+        - Shows gain over naive baseline (historical mean)
+        - +7% means 7% RMSE reduction
+        - Realistic gains: 5-10%
+        
+        #### p-value
+        - Statistical significance test
+        - p < 0.05 indicates significant improvement
+        - Be cautious with borderline values
+        
+        #### Confidence Intervals
+        - ±2 standard deviations
+        - 95% probability true value is in range
+        - Wider intervals = higher uncertainty
+        
+        ### Best Practices
+        
+        1. **Data Quality**: Ensure clean, consistent data with no large gaps
+        2. **Sample Size**: Minimum 60 months training data recommended
+        3. **Google Trends**: Use multiple keywords for robustness
+        4. **Model Selection**: Start with MIDAS, add ML models for comparison
+        5. **Validation**: Always check out-of-sample performance
+        
+        ### Limitations
+        
+        - **Timeliness vs Accuracy**: Early signals may be noisy
+        - **Method Dependency**: GT value requires proper aggregation
+        - **Structural Breaks**: Performance may degrade during crises
+        - **Regional Aggregation**: National nowcasts mask local variation
+        
+        ### Technical Details
+        
+        **MIDAS Exponential Weights (θ=3.0):**
+```
+        w_j = exp(-θ * j) / Σ exp(-θ * i)
+        
+        Result: [0.950, 0.047, 0.002, 0.0001]
+        → 95% weight on most recent week
+```
+        
+        **Ridge Regression:**
+```
+        β̂ = argmin (Σ(y - Xβ)² + α||β||²)
+        
+        α = 50.0 (selected via cross-validation)
+```
+        
+        ### Contact & Support
+        
+        - **Author**: Ali Ghanbari
+        - **Institution**: ISTAT
+        - **Version**: 1.0.0
+        - **Last Updated**: December 2025
+        
+        For issues or questions, please contact ISTAT Labor Statistics Division.
+        """)
     
-    ### Data Requirements
+    with st.expander("🔧 Technical Specifications"):
+        st.markdown("""
+        ### System Requirements
+        
+        **Software:**
+        - Python 3.8+
+        - Streamlit 1.28+
+        - See requirements.txt for full dependencies
+        
+        **Hardware:**
+        - Minimum: 4GB RAM
+        - Recommended: 8GB RAM, 2+ CPU cores
+        
+        **Data Format:**
+        - Unemployment: CSV with 'date', 'unemp' columns
+        - Google Trends: Excel (.xlsx) with 'Week' and keyword columns
+        - Exogenous: CSV with 'date' and variable columns
+        
+        ### API Reference
+        
+        **Backend Modules:**
+```python
+        from backend.data_loader import DataLoader
+        from backend.models import ModelFactory
+        from backend.evaluation import Evaluator
+        from backend.forecaster import RealTimeForecaster
+```
+        
+        **Key Classes:**
+        - `DataLoader`: Handle data upload, cleaning, merging
+        - `FeatureEngineer`: Create lags, MIDAS features
+        - `ModelFactory`: Train multiple model types
+        - `Evaluator`: Compute metrics, statistical tests
+        - `RealTimeForecaster`: Generate live nowcasts
+        
+        ### Deployment
+        
+        **Local:**
+```bash
+        streamlit run app.py
+```
+        
+        **Streamlit Cloud:**
+        1. Push to GitHub
+        2. Connect repository in Streamlit Cloud
+        3. Configure secrets (if needed)
+        4. Deploy
+        
+        **Docker:**
+```dockerfile
+        FROM python:3.9-slim
+        COPY . /app
+        WORKDIR /app
+        RUN pip install -r requirements.txt
+        CMD streamlit run app.py
+```
+        """)
     
-    - **Monthly Target**: CSV with `date` and `value` columns
-    - **Daily Data**: CSV with `date` column and numeric features
-    - **Google Trends**: CSV with `Week`/`Month` and trend values
-    
-    ### Supported Models
-    
-    - NAIVE, MA3, MA12: Benchmark models
-    - ETS: Exponential smoothing
-    - Ridge: Regularized regression
-    - MIDAS: Mixed-data sampling
-    - Ensembles: Combined predictions
-    
-    ### API Keys (Optional)
-    
-    Set environment variables for AI features:
-    - `OPENAI_API_KEY`: For GPT models
-    - `ANTHROPIC_API_KEY`: For Claude
-    - `GOOGLE_API_KEY`: For Gemini
-    - `NEWSAPI_KEY`: For news analysis
-    """)
+    with st.expander("📊 Example Datasets"):
+        st.markdown("""
+        ### Sample Data Files
+        
+        Download example datasets to test the app:
+        
+        **1. Unemployment Data (unemployment.csv)**
+```csv
+        date,unemp,unemp(25-34)
+        2020-01-01,9.8,16.2
+        2020-02-01,9.7,16.0
+        2020-03-01,9.9,16.5
+        ...
+```
+        
+        **2. Google Trends (segment1.xlsx)**
+        | Week | lavoro | cerco lavoro | offerte di lavoro | ... |
+        |------|--------|--------------|-------------------|-----|
+        | 2020-07-05 | 45 | 38 | 52 | ... |
+        | 2020-07-12 | 47 | 40 | 51 | ... |
+        
+        **3. Exogenous Variables (exog.csv)**
+```csv
+        date,CCI,PRC-HICP
+        2020-01-01,105.2,0.2
+        2020-02-01,104.8,0.1
+        ...
+```
+        """)
 
-# =============================================================================
-# FOOTER
-# =============================================================================
-
-st.markdown("---")
-
-col1, col2, col3 = st.columns(3)
-
-with col1:
-    st.caption(f"📅 Session: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-
-with col2:
-    st.caption("🇮🇹 ISTAT Unemployment Nowcasting")
-
-with col3:
-    st.caption("💻 Built with Streamlit Pro")
-
-st.markdown("""
-<div style='text-align: center; color: #94A3B8; font-size: 0.875rem; margin-top: 2rem;'>
-    © 2025 Nowcasting Lab · Experimental Research Tool · Use Responsibly
-</div>
-""", unsafe_allow_html=True)
+# Handle data loading trigger
+if st.session_state.get('trigger_load', False):
+    with st.spinner("📁 Loading and processing data..."):
+        try:
+            loader = DataLoader()
+            
+            # Load unemployment
+            if uploaded_unemployment:
+                df_unemp = pd.read_csv(uploaded_unemployment)
+            else:
+                # Use default demo data
+                st.warning("No data uploaded. Using demo dataset.")
+                df_unemp = loader.load_demo_data()
+            
+            # Process
+            df_clean = loader.process_data(
+                df_unemp,
+                gt_files=uploaded_gt if uploaded_gt else None,
+                exog_file=uploaded_exog if uploaded_exog else None
+            )
+            
+            # Train/test split
+            split_idx = int(len(df_clean) * train_test_split / 100)
+            train = df_clean.iloc[:split_idx]
+            test = df_clean.iloc[split_idx:]
+            
+            # Save to session state
+            st.session_state.data_loader = loader
+            st.session_state.df_clean = df_clean
+            st.session_state.train = train
+            st.session_state.test = test
+            st.session_state.data_loaded = True
+            st.session_state.trigger_load = False
+            
+            st.success("✅ Data loaded successfully!")
+            st.rerun()
+            
+        except Exception as e:
+            st.error(f"❌ Error loading data: {str(e)}")
+            st.session_state.trigger_load = False
