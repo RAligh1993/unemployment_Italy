@@ -2,7 +2,6 @@
 Real-Time Forecaster Module
 Generates live nowcasts with confidence intervals and alerts
 
-Author: Ali Ghanbari
 Institution: ISTAT
 """
 
