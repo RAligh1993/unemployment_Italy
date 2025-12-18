@@ -1,41 +1,43 @@
-# Core
-streamlit>=1.36
-pandas>=2.2
-numpy>=1.26
-plotly>=5.20
-streamlit==1.37.0
-streamlit
-pandas
-numpy
-plotly
-requests
-feedparser
-# Modeling
-scikit-learn>=1.3
-statsmodels>=0.14
-shap>=0.46  # optional; heavy; enables SHAP plots on page 7
-# Existing packages...
+# Streamlit App Requirements
+# Italian Unemployment Nowcasting System
+
+
+# Core Framework
 streamlit>=1.28.0
-pandas>=2.0.0
-plotly>=5.17.0
-urllib3
-# For ISTAT API
-requests>=2.31.0
-lxml>=4.9.0  # For XML parsing if needed
-# NLP / News (optional)
-feedparser>=6.0     # RSS
-requests>=2.31      # NewsAPI / GDELT / local HTTP LLM
-nltk>=3.8           # VADER sentiment (optional)
-PyPDF2>=3.0         # PDF text extraction for RAG
 
-# LLM providers (optional for page 6)
-openai>=1.30
-anthropic>=0.36
-google-generativeai>=0.7
+# Data Processing
+numpy>=1.21.0
+pandas>=1.3.0
+scipy>=1.7.0
 
-# Export / misc
-markdown>=3.6       # Markdown → HTML for report builder
+# Machine Learning
+scikit-learn>=1.0.0
 
-# (Linux wheels) If SHAP build fails, try installing these before shap:
-# numba>=0.59
-# llvmlite>=0.43
+# Visualization
+plotly>=5.14.0
+matplotlib>=3.4.0
+seaborn>=0.11.0
+
+# Data Reading
+openpyxl>=3.0.0
+xlrd>=2.0.0
+
+# Date/Time
+python-dateutil>=2.8.0
+
+# Additional ML (optional but recommended)
+xgboost>=1.7.0
+lightgbm>=3.3.0
+
+# Statistics
+statsmodels>=0.13.0
+
+# File handling
+pathlib>=1.0.1
+
+# System
+typing-extensions>=4.0.0
+
+# Development (optional)
+pytest>=7.0.0
+black>=22.0.0
