@@ -177,7 +177,7 @@ with st.sidebar:
     
     st.markdown("---")
     st.markdown("**Version:** 1.0.0")
-    st.markdown("**Author:** Ali Ghanbari")
+    st.markdown("**Author:** Rajabali Ghasempour")
     st.markdown("**Institution:** ISTAT")
 
 # Main content
@@ -794,7 +794,7 @@ with tab6:
         
         ### Contact & Support
         
-        - **Author**: Ali Ghanbari
+        - **Author**: Rajabali Ghasempour
         - **Institution**: ISTAT
         - **Version**: 1.0.0
         - **Last Updated**: December 2025
