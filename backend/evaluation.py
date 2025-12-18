@@ -2,7 +2,6 @@
 Evaluation Module
 Comprehensive performance metrics and statistical tests
 
-Author: Rajabali Ghasempour
 Institution: ISTAT
 """
 
