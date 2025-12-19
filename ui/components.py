@@ -527,9 +527,13 @@ class DataPreviewComponent:
             st.metric("Status", quality)
         
         # Date range
-        st.markdown(f"""
-        **Date Range:** {dataset_info.date_range[0].strftime('%Y-%m-%d')} to {dataset_info.date_range[1].strftime('%Y-%m-%d')}
-        """)
+        # Check if date_range exists
+        if hasattr(dataset_info, 'date_range') and dataset_info.date_range:
+            st.markdown(f"""
+            **Date Range:** {dataset_info.date_range[0].strftime('%Y-%m-%d')} to {dataset_info.date_range[1].strftime('%Y-%m-%d')}
+            """)
+        else:
+            st.markdown("**Date Range:** Not available")
         
         # Validation warnings
         if dataset_info.validation.get('warnings'):
