@@ -2,10 +2,10 @@
 Configuration for Nowcasting Platform
 Production-ready settings
 """
-
-from dataclasses import dataclass
-from typing import List, Tuple
+from dataclasses import dataclass, field
+from typing import List, Tuple, Dict
 import os
+
 
 @dataclass
 class AppConfig:
@@ -26,28 +26,28 @@ class AppConfig:
     MAX_MISSING_PCT: float = 0.3
     OUTLIER_THRESHOLD: float = 3.0
     
-    # Frequency detection
-    FREQ_THRESHOLDS = {
+    # Frequency detection - ✅ FIXED
+    FREQ_THRESHOLDS: Dict[str, Tuple[float, float]] = field(default_factory=lambda: {
         'daily': (0.8, 1.5),      # days
         'weekly': (6, 8),         # days
         'monthly': (28, 32),      # days
         'quarterly': (89, 93),    # days
         'annual': (360, 370)      # days
-    }
+    })
     
-    # Feature engineering
-    LAGS_MONTHLY: List[int] = [1, 2, 3, 6, 12]
-    LAGS_WEEKLY: List[int] = [1, 2, 4, 8, 52]
-    LAGS_DAILY: List[int] = [1, 7, 30]
+    # Feature engineering - ✅ FIXED
+    LAGS_MONTHLY: List[int] = field(default_factory=lambda: [1, 2, 3, 6, 12])
+    LAGS_WEEKLY: List[int] = field(default_factory=lambda: [1, 2, 4, 8, 52])
+    LAGS_DAILY: List[int] = field(default_factory=lambda: [1, 7, 30])
     
-    # MIDAS
-    MIDAS_WINDOWS: List[int] = [4, 8, 12]
-    MIDAS_LAMBDAS: List[float] = [0.6, 0.8]
+    # MIDAS - ✅ FIXED
+    MIDAS_WINDOWS: List[int] = field(default_factory=lambda: [4, 8, 12])
+    MIDAS_LAMBDAS: List[float] = field(default_factory=lambda: [0.6, 0.8])
     MIDAS_CUTOFF_DAY: int = 15
     
-    # Models
-    RIDGE_ALPHAS: List[float] = [1, 10, 50, 100]
-    LASSO_ALPHAS: List[float] = [0.01, 0.1, 1.0]
+    # Models - ✅ FIXED
+    RIDGE_ALPHAS: List[float] = field(default_factory=lambda: [1, 10, 50, 100])
+    LASSO_ALPHAS: List[float] = field(default_factory=lambda: [0.01, 0.1, 1.0])
     
     # Evaluation
     TRAIN_SPLIT: float = 0.7
