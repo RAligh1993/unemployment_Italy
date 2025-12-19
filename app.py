@@ -1,932 +1,1368 @@
 """
-Italian Unemployment Nowcasting System
-Professional Streamlit App with Multi-Model Framework
-
-Author: Rajabali Ghasempour
-Institution: ISTAT
+Nowcasting Platform - Main Application
+Professional Streamlit interface for time series nowcasting
+Production-ready implementation
 """
 
 import streamlit as st
 import pandas as pd
 import numpy as np
-from datetime import datetime
-import plotly.graph_objects as go
-import plotly.express as px
+import sys
 from pathlib import Path
+from typing import Dict, List, Optional, Any
+import warnings
+warnings.filterwarnings('ignore')
 
-# Backend imports
-from backend.data_loader import DataLoader
-from backend.feature_engineering import FeatureEngineer
-from backend.models import ModelFactory
-from backend.evaluation import Evaluator
-from backend.forecaster import RealTimeForecaster
-from utils.visualizations import Visualizer
-from utils.helpers import format_number, get_signal_status
+# Add core modules to path
+sys.path.append(str(Path(__file__).parent))
 
-# Page config
+# Core imports
+from config import CONFIG
+from core.data_intelligence import DataIntelligence, DatasetInfo
+from core.frequency_aligner import FrequencyAligner
+from core.feature_factory import FeatureFactory
+from core.model_library import (
+    ModelLibrary, PersistenceModel, HistoricalMeanModel, 
+    AutoRegressiveModel, RidgeModel, LassoModel, DeltaCorrectionModel
+)
+from core.evaluator import (
+    MetricsCalculator, StatisticalTests, BootstrapMethods, 
+    BacktestEngine, ComprehensiveEvaluator
+)
+from core.exporter import DataExporter, FigureExporter, ReportGenerator, PackageExporter
+
+# UI imports
+from ui.styles import get_custom_css, get_header_html
+from ui.components import (
+    DashboardComponents, WelcomeScreen, DataPreviewComponent,
+    ModelConfigurationComponent, ResultsDashboard
+)
+from ui.charts import NowcastingCharts
+
+
+# ============================================================================
+# PAGE CONFIGURATION
+# ============================================================================
+
 st.set_page_config(
-    page_title="Unemployment Nowcasting System",
-    page_icon="📊",
+    page_title="Nowcasting Platform",
+    page_icon="📈",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="expanded",
+    menu_items={
+        'Get Help': 'https://github.com/yourusername/nowcasting-platform',
+        'Report a bug': 'https://github.com/yourusername/nowcasting-platform/issues',
+        'About': """
+        # Nowcasting Platform v1.0
+        
+        Professional forecasting tool for economists and data scientists.
+        
+        Features:
+        - Auto-detection of data frequency
+        - Multiple model comparison
+        - Statistical significance tests
+        - Mixed-frequency data handling (MIDAS)
+        - Comprehensive export capabilities
+        """
+    }
 )
 
-# Custom CSS
-st.markdown("""
-<style>
-    .main-header {
-        font-size: 2.5rem;
-        font-weight: bold;
-        color: #1f77b4;
-        text-align: center;
-        margin-bottom: 2rem;
-    }
-    .sub-header {
-        font-size: 1.5rem;
-        font-weight: bold;
-        color: #2c3e50;
-        margin-top: 2rem;
-        margin-bottom: 1rem;
-    }
-    .metric-card {
-        background-color: #f8f9fa;
-        padding: 1.5rem;
-        border-radius: 10px;
-        border-left: 5px solid #1f77b4;
-        margin: 1rem 0;
-    }
-    .success-box {
-        background-color: #d4edda;
-        border: 1px solid #c3e6cb;
-        border-radius: 5px;
-        padding: 1rem;
-        margin: 1rem 0;
-    }
-    .warning-box {
-        background-color: #fff3cd;
-        border: 1px solid #ffeaa7;
-        border-radius: 5px;
-        padding: 1rem;
-        margin: 1rem 0;
-    }
-    .info-box {
-        background-color: #d1ecf1;
-        border: 1px solid #bee5eb;
-        border-radius: 5px;
-        padding: 1rem;
-        margin: 1rem 0;
-    }
-    .stTabs [data-baseweb="tab-list"] {
-        gap: 2rem;
-    }
-    .stTabs [data-baseweb="tab"] {
-        height: 3rem;
-        padding: 0 2rem;
-        background-color: #f0f2f6;
-        border-radius: 5px 5px 0 0;
-    }
-    .stTabs [aria-selected="true"] {
-        background-color: #1f77b4;
-        color: white;
-    }
-</style>
-""", unsafe_allow_html=True)
 
-# Initialize session state
-if 'data_loaded' not in st.session_state:
-    st.session_state.data_loaded = False
-if 'models_trained' not in st.session_state:
-    st.session_state.models_trained = False
-if 'results' not in st.session_state:
-    st.session_state.results = {}
+# ============================================================================
+# CUSTOM CSS
+# ============================================================================
 
-# Sidebar
+st.markdown(get_custom_css(), unsafe_allow_html=True)
+
+
+# ============================================================================
+# SESSION STATE INITIALIZATION
+# ============================================================================
+
+def initialize_session_state():
+    """Initialize session state variables"""
+    
+    if 'step' not in st.session_state:
+        st.session_state.step = 0
+    
+    if 'target_data' not in st.session_state:
+        st.session_state.target_data = None
+    
+    if 'exog_data' not in st.session_state:
+        st.session_state.exog_data = None
+    
+    if 'alt_data' not in st.session_state:
+        st.session_state.alt_data = []
+    
+    if 'dataset_info' not in st.session_state:
+        st.session_state.dataset_info = None
+    
+    if 'aligned_data' not in st.session_state:
+        st.session_state.aligned_data = None
+    
+    if 'engineered_data' not in st.session_state:
+        st.session_state.engineered_data = None
+    
+    if 'model_config' not in st.session_state:
+        st.session_state.model_config = {}
+    
+    if 'results' not in st.session_state:
+        st.session_state.results = None
+    
+    if 'figures' not in st.session_state:
+        st.session_state.figures = {}
+
+initialize_session_state()
+
+
+# ============================================================================
+# UTILITY FUNCTIONS
+# ============================================================================
+
+def reset_workflow():
+    """Reset workflow to beginning"""
+    for key in list(st.session_state.keys()):
+        if key != 'step':
+            del st.session_state[key]
+    st.session_state.step = 0
+    st.rerun()
+
+
+def advance_step():
+    """Advance to next step"""
+    st.session_state.step += 1
+    st.rerun()
+
+
+def go_to_step(step_number: int):
+    """Go to specific step"""
+    st.session_state.step = step_number
+    st.rerun()
+
+
+# ============================================================================
+# HEADER
+# ============================================================================
+
+st.markdown(
+    get_header_html(
+        "📈 Nowcasting Platform",
+        "Professional Time Series Forecasting with Mixed-Frequency Data"
+    ),
+    unsafe_allow_html=True
+)
+
+
+# ============================================================================
+# SIDEBAR - NAVIGATION
+# ============================================================================
+
 with st.sidebar:
-    st.image("https://via.placeholder.com/200x80/1f77b4/ffffff?text=ISTAT", use_column_width=True)
-    st.markdown("### 📊 Nowcasting System")
-    st.markdown("---")
-    
-    st.markdown("#### ⚙️ Configuration")
-    
-    # Mode selection
-    mode = st.radio(
-        "Operating Mode",
-        ["Default (Unemployment + GT)", "Custom Analysis"],
-        help="Default mode uses Italian unemployment data with Google Trends"
-    )
+    st.image("https://via.placeholder.com/200x80/003366/FFFFFF?text=NOWCAST", use_container_width=True)
     
     st.markdown("---")
     
-    # Data upload
-    st.markdown("#### 📁 Data Upload")
+    st.markdown("### 🎯 Workflow")
     
-    uploaded_unemployment = st.file_uploader(
-        "Unemployment Data (CSV)",
-        type=['csv'],
-        help="Monthly unemployment rate time series"
-    )
+    # Progress indicator
+    steps = [
+        "1️⃣ Upload Data",
+        "2️⃣ Configure Models",
+        "3️⃣ Run Analysis",
+        "4️⃣ View Results",
+        "5️⃣ Export"
+    ]
     
-    uploaded_gt = st.file_uploader(
-        "Google Trends (Excel)",
-        type=['xlsx', 'xls'],
-        accept_multiple_files=True,
-        help="Multiple 5-year segments (optional)"
-    )
+    current_step = st.session_state.step
     
-    uploaded_exog = st.file_uploader(
-        "Exogenous Variables (CSV)",
-        type=['csv'],
-        help="Additional predictors (CCI, HICP, etc.)"
-    )
-    
-    st.markdown("---")
-    
-    # Model settings
-    st.markdown("#### 🎯 Model Settings")
-    
-    train_test_split = st.slider(
-        "Train/Test Split (%)",
-        min_value=50,
-        max_value=90,
-        value=70,
-        step=5,
-        help="Percentage of data for training"
-    )
-    
-    include_gt = st.checkbox(
-        "Include Google Trends",
-        value=True,
-        help="Use GT features in models"
-    )
-    
-    models_to_run = st.multiselect(
-        "Models to Train",
-        ["MIDAS Exponential", "MIDAS Beta", "Ridge", "Lasso", "Random Forest", "XGBoost", "LSTM"],
-        default=["MIDAS Exponential", "Ridge"],
-        help="Select multiple models for comparison"
-    )
+    for idx, step in enumerate(steps):
+        if idx < current_step:
+            st.markdown(f"✅ ~~{step}~~")
+        elif idx == current_step:
+            st.markdown(f"**👉 {step}**")
+        else:
+            st.markdown(f"⚪ {step}")
     
     st.markdown("---")
     
-    # Action buttons
-    if st.button("🚀 Load & Process Data", type="primary", use_container_width=True):
-        st.session_state.trigger_load = True
+    # Quick actions
+    st.markdown("### ⚡ Quick Actions")
     
-    if st.button("🤖 Train Models", disabled=not st.session_state.data_loaded, use_container_width=True):
-        st.session_state.trigger_train = True
+    if st.button("🔄 Reset Workflow", use_container_width=True):
+        reset_workflow()
+    
+    if st.session_state.results:
+        if st.button("📊 Jump to Results", use_container_width=True):
+            go_to_step(3)
     
     st.markdown("---")
-    st.markdown("**Version:** 1.0.0")
-    st.markdown("**Author:** Rajabali Ghasempour")
-    st.markdown("**Institution:** ISTAT")
+    
+    # Settings
+    with st.expander("⚙️ Advanced Settings"):
+        train_split = st.slider("Train/Test Split", 0.5, 0.9, 0.7, 0.05)
+        random_seed = st.number_input("Random Seed", 0, 9999, 42)
+        significance_level = st.slider("Significance Level", 0.01, 0.10, 0.05, 0.01)
+        
+        st.session_state.train_split = train_split
+        st.session_state.random_seed = random_seed
+        st.session_state.significance_level = significance_level
+    
+    st.markdown("---")
+    st.caption("v1.0.0 | Made with ❤️ for Economists")
 
-# Main content
-st.markdown('<div class="main-header">🇮🇹 Italian Unemployment Nowcasting System</div>', unsafe_allow_html=True)
-
-# Tabs
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
-    "📊 Overview",
-    "📈 Data Explorer",
-    "🤖 Models",
-    "📉 Results",
-    "🔮 Live Nowcast",
-    "📚 Documentation"
-])
 
 # ============================================================================
-# TAB 1: OVERVIEW
+# MAIN CONTENT AREA
 # ============================================================================
 
-with tab1:
-    st.markdown("### Welcome to the Unemployment Nowcasting System")
+# Step 0: Welcome Screen
+if st.session_state.step == 0:
     
-    col1, col2, col3 = st.columns(3)
+    WelcomeScreen.render()
+    
+    st.markdown("---")
+    
+    col1, col2, col3 = st.columns([1, 2, 1])
+    with col2:
+        if st.button("🚀 Start Nowcasting", use_container_width=True, type="primary"):
+            advance_step()
+
+
+# Step 1: Data Upload
+elif st.session_state.step == 1:
+    
+    st.markdown("## 1️⃣ Data Upload")
+    
+    st.info("""
+    📌 **Instructions:**
+    - Upload your **target variable** (the series you want to forecast)
+    - Optionally add **exogenous variables** (economic indicators)
+    - Optionally add **alternative data** sources (Google Trends, etc.)
+    """)
+    
+    # Target variable
+    st.markdown("### 📊 Target Variable (Required)")
+    
+    target_file = st.file_uploader(
+        "Upload target series (CSV or Excel)",
+        type=['csv', 'xlsx', 'xls'],
+        key='target_upload',
+        help="Must contain a date column and target variable"
+    )
+    
+    if target_file:
+        try:
+            with st.spinner("📖 Reading file..."):
+                intel = DataIntelligence()
+                df_target = intel.load_file(target_file)
+            
+            st.success(f"✅ Loaded {len(df_target)} rows, {len(df_target.columns)} columns")
+            
+            # Show preview
+            with st.expander("👁️ Preview Data"):
+                st.dataframe(df_target.head(10), use_container_width=True)
+            
+            # Detect date column
+            date_col = intel.detect_date_column(df_target)
+            if date_col:
+                st.success(f"✅ Detected date column: **{date_col}**")
+            else:
+                st.warning("⚠️ Could not auto-detect date column")
+                date_col = st.selectbox("Select date column:", df_target.columns)
+            
+            # Parse dates
+            df_target['date_parsed'] = intel.parse_dates(df_target, date_col)
+            
+            # Detect frequency
+            freq, freq_diag = intel.detect_frequency(df_target['date_parsed'])
+            
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("Frequency", freq.upper())
+            with col2:
+                st.metric("Observations", freq_diag.get('observations', 0))
+            with col3:
+                median_delta = freq_diag.get('median_delta', 0)
+                st.metric("Median Gap", f"{median_delta:.1f} days")
+            
+            # Detect target
+            suggested_target = intel.suggest_target(df_target, date_col)
+            
+            if suggested_target:
+                st.info(f"💡 Suggested target: **{suggested_target}**")
+                use_suggested = st.checkbox("Use suggested target", value=True)
+                if use_suggested:
+                    target_col = suggested_target
+                else:
+                    numeric_cols = df_target.select_dtypes(include=[np.number]).columns.tolist()
+                    target_col = st.selectbox("Select target variable:", numeric_cols)
+            else:
+                numeric_cols = df_target.select_dtypes(include=[np.number]).columns.tolist()
+                target_col = st.selectbox("Select target variable:", numeric_cols)
+            
+            # Validate
+            validation = intel.validate_dataset(df_target, date_col, target_col)
+            
+            if validation['valid']:
+                st.success("✅ Data validation passed")
+            else:
+                st.error("❌ Data validation failed:")
+                for error in validation['errors']:
+                    st.error(error)
+            
+            for warning in validation.get('warnings', []):
+                st.warning(warning)
+            
+            # Create DatasetInfo
+            dataset_info = DatasetInfo(
+                df=df_target,
+                date_col=date_col,
+                target_col=target_col,
+                frequency=freq,
+                freq_diag=freq_diag,
+                validation=validation
+            )
+            
+            st.session_state.target_data = dataset_info
+            st.session_state.dataset_info = dataset_info
+            
+        except Exception as e:
+            st.error(f"❌ Error loading file: {str(e)}")
+    
+    st.markdown("---")
+    
+    # Exogenous variables (optional)
+    st.markdown("### 📈 Exogenous Variables (Optional)")
+    
+    with st.expander("ℹ️ What are exogenous variables?"):
+        st.markdown("""
+        Exogenous variables are external factors that may help predict your target:
+        - **Economic indicators:** GDP, inflation, interest rates
+        - **Sentiment indices:** Consumer confidence, business surveys
+        - **Policy variables:** Government spending, tax rates
+        
+        These should be at the **same or higher frequency** as your target.
+        """)
+    
+    exog_file = st.file_uploader(
+        "Upload exogenous variables (CSV or Excel)",
+        type=['csv', 'xlsx', 'xls'],
+        key='exog_upload'
+    )
+    
+    if exog_file:
+        try:
+            intel = DataIntelligence()
+            df_exog = intel.load_file(exog_file)
+            st.success(f"✅ Loaded {len(df_exog)} rows, {len(df_exog.columns)} columns")
+            
+            with st.expander("👁️ Preview Exogenous Data"):
+                st.dataframe(df_exog.head(10), use_container_width=True)
+            
+            st.session_state.exog_data = df_exog
+            
+        except Exception as e:
+            st.error(f"❌ Error loading file: {str(e)}")
+    
+    st.markdown("---")
+    
+    # Alternative data (optional)
+    st.markdown("### 🌐 Alternative Data (Optional)")
+    
+    with st.expander("ℹ️ What is alternative data?"):
+        st.markdown("""
+        Alternative data sources include:
+        - **Google Trends:** Search volume for keywords
+        - **Social media:** Twitter sentiment, mentions
+        - **Web traffic:** Page views, clicks
+        - **Satellite data:** Parking lot occupancy, shipping activity
+        
+        ⚠️ **Important:** Alternative data may contain measurement bias.
+        Platform will apply MIDAS aggregation for frequency alignment.
+        """)
+    
+    include_alt = st.checkbox("Include alternative data sources")
+    
+    if include_alt:
+        st.warning("⚠️ Alternative data may contain measurement bias. Use with caution.")
+        
+        alt_files = st.file_uploader(
+            "Upload alternative data files",
+            type=['csv', 'xlsx', 'xls'],
+            key='alt_upload',
+            accept_multiple_files=True
+        )
+        
+        if alt_files:
+            st.session_state.alt_data = []
+            for idx, file in enumerate(alt_files):
+                try:
+                    intel = DataIntelligence()
+                    df_alt = intel.load_file(file)
+                    st.success(f"✅ File {idx+1}: {file.name} - {len(df_alt)} rows")
+                    st.session_state.alt_data.append(df_alt)
+                except Exception as e:
+                    st.error(f"❌ Error loading {file.name}: {str(e)}")
+    
+    st.markdown("---")
+    
+    # Navigation
+    col1, col2, col3 = st.columns([1, 2, 1])
     
     with col1:
-        st.markdown("""
-        <div class="metric-card">
-            <h4>🎯 Purpose</h4>
-            <p>Provide real-time unemployment estimates using high-frequency Google Trends data, 2-3 weeks before official releases.</p>
-        </div>
-        """, unsafe_allow_html=True)
-    
-    with col2:
-        st.markdown("""
-        <div class="metric-card">
-            <h4>⚡ Key Features</h4>
-            <ul>
-                <li>Multi-model framework</li>
-                <li>MIDAS aggregation</li>
-                <li>Statistical testing</li>
-                <li>Real-time nowcasting</li>
-            </ul>
-        </div>
-        """, unsafe_allow_html=True)
+        if st.button("⬅️ Back", use_container_width=True):
+            go_to_step(0)
     
     with col3:
-        st.markdown("""
-        <div class="metric-card">
-            <h4>📊 Current Status</h4>
-            <p><strong>Data Loaded:</strong> {}</p>
-            <p><strong>Models Trained:</strong> {}</p>
-        </div>
-        """.format(
-            "✅ Yes" if st.session_state.data_loaded else "❌ No",
-            "✅ Yes" if st.session_state.models_trained else "❌ No"
-        ), unsafe_allow_html=True)
+        if st.session_state.target_data and st.session_state.target_data.validation['valid']:
+            if st.button("Next ➡️", use_container_width=True, type="primary"):
+                advance_step()
+        else:
+            st.button("Next ➡️", use_container_width=True, disabled=True)
+            st.caption("Upload valid target data to continue")
+
+
+# Step 2: Model Configuration
+elif st.session_state.step == 2:
+    
+    st.markdown("## 2️⃣ Model Configuration")
+    
+    # Show data summary
+    if st.session_state.dataset_info:
+        DataPreviewComponent.render(st.session_state.dataset_info)
     
     st.markdown("---")
     
-    # Quick Start Guide
-    st.markdown("### 🚀 Quick Start")
+    # Model selection
+    st.markdown("### 🤖 Select Models")
     
-    with st.expander("📖 How to Use This App", expanded=not st.session_state.data_loaded):
-        st.markdown("""
-        #### Step 1: Upload Data
-        - **Unemployment Data**: Monthly unemployment rate (required)
-        - **Google Trends**: Weekly search data (optional but recommended)
-        - **Exogenous Variables**: CCI, HICP, etc. (optional)
+    tab1, tab2, tab3 = st.tabs(["📊 Benchmarks", "🔬 Machine Learning", "⚙️ Advanced"])
+    
+    with tab1:
+        st.markdown("**Benchmark Models** (Always Included)")
         
-        #### Step 2: Configure Settings
-        - Choose operating mode (Default or Custom)
-        - Select train/test split ratio
-        - Pick models to train
-        
-        #### Step 3: Load & Process
-        - Click "🚀 Load & Process Data" in sidebar
-        - Review data quality and correlations
-        
-        #### Step 4: Train Models
-        - Click "🤖 Train Models" to start training
-        - Compare model performance
-        
-        #### Step 5: Generate Nowcasts
-        - Navigate to "🔮 Live Nowcast" tab
-        - Get real-time predictions with confidence intervals
+        st.info("""
+        The following baseline models are always included for comparison:
+        - **Persistence:** ŷ_t = y_{t-1} (Random Walk)
+        - **Historical Mean:** ŷ_t = mean(y_train)
+        - **AR(1):** First-order autoregressive
+        - **AR(2):** Second-order autoregressive
         """)
+        
+        st.markdown("✅ All benchmark models will be included automatically")
     
-    # System Architecture
-    with st.expander("🏗️ System Architecture"):
-        st.markdown("""
-```
-        Data Sources          Processing              Models                Output
-        ─────────────        ──────────────         ─────────────         ────────────
-        │ Unemployment   →   │ 5-Seg Merge    →    │ MIDAS Exp     →    │ Nowcast
-        │ Google Trends  →   │ Feature Eng    →    │ MIDAS Beta    →    │ ± CI
-        │ CCI, HICP      →   │ Lag Creation   →    │ Ridge/Lasso   →    │ Alerts
-                             │ Scaling        →    │ ML Models     →    │ Viz
-```
-        
-        **Backend Components:**
-        - Data Loader: Handles uploads, cleaning, validation
-        - Feature Engineer: Creates lags, MIDAS weights, interactions
-        - Model Factory: Trains multiple model types
-        - Evaluator: Computes metrics, statistical tests
-        - Forecaster: Real-time nowcasting engine
-        """)
-    
-    # Performance Summary (if models trained)
-    if st.session_state.models_trained and 'model_results' in st.session_state.results:
-        st.markdown("### 📊 Latest Performance Summary")
-        
-        results = st.session_state.results['model_results']
-        best_model = results.loc[results['RMSE'].idxmin()]
-        
-        col1, col2, col3, col4 = st.columns(4)
-        
-        with col1:
-            st.metric(
-                "Best Model",
-                best_model['Model'],
-                delta=None
-            )
-        
-        with col2:
-            st.metric(
-                "RMSE",
-                f"{best_model['RMSE']:.4f}",
-                delta=None
-            )
-        
-        with col3:
-            improvement = best_model.get('Improvement_pct', 0)
-            st.metric(
-                "Improvement",
-                f"{improvement:+.1f}%",
-                delta=f"{improvement:+.1f}%"
-            )
-        
-        with col4:
-            p_value = best_model.get('p_value', 1.0)
-            st.metric(
-                "Significance",
-                "Yes ✅" if p_value < 0.05 else "No ❌",
-                delta=f"p={p_value:.4f}"
-            )
-
-# ============================================================================
-# TAB 2: DATA EXPLORER
-# ============================================================================
-
-with tab2:
-    st.markdown("### 📈 Data Explorer & Quality Assessment")
-    
-    if not st.session_state.data_loaded:
-        st.info("👆 Please upload data and click 'Load & Process Data' in the sidebar to begin.")
-    else:
-        data_loader = st.session_state.get('data_loader')
-        
-        # Data Summary
-        st.markdown("#### 📊 Dataset Summary")
+    with tab2:
+        st.markdown("**Machine Learning Models**")
         
         col1, col2 = st.columns(2)
         
         with col1:
-            st.markdown("""
-            <div class="info-box">
-                <h5>Unemployment Data</h5>
-                <p><strong>Observations:</strong> {}</p>
-                <p><strong>Date Range:</strong> {} to {}</p>
-                <p><strong>Mean:</strong> {:.2f}%</p>
-                <p><strong>Std Dev:</strong> {:.2f}%</p>
-            </div>
-            """.format(
-                len(st.session_state.df_clean),
-                st.session_state.df_clean['date'].min().date(),
-                st.session_state.df_clean['date'].max().date(),
-                st.session_state.df_clean['target'].mean(),
-                st.session_state.df_clean['target'].std()
-            ), unsafe_allow_html=True)
+            use_ridge = st.checkbox("✅ Ridge Regression", value=True)
+            if use_ridge:
+                ridge_alphas = st.multiselect(
+                    "Ridge regularization (α)",
+                    [1, 10, 50, 100, 200],
+                    default=[10, 50, 100],
+                    help="Higher α = more regularization"
+                )
+            else:
+                ridge_alphas = []
+            
+            use_lasso = st.checkbox("✅ Lasso Regression", value=True)
+            if use_lasso:
+                lasso_alphas = st.multiselect(
+                    "Lasso regularization (α)",
+                    [0.001, 0.01, 0.1, 1.0],
+                    default=[0.01, 0.1],
+                    help="Lasso performs feature selection"
+                )
+            else:
+                lasso_alphas = []
         
         with col2:
-            if include_gt and 'gt_data' in st.session_state:
-                gt_quality = st.session_state.get('gt_quality', {})
-                st.markdown("""
-                <div class="success-box">
-                    <h5>Google Trends Quality</h5>
-                    <p><strong>GOOD Keywords:</strong> {}</p>
-                    <p><strong>CAUTION Keywords:</strong> {}</p>
-                    <p><strong>WARNING Keywords:</strong> {}</p>
-                    <p><strong>Total Merged Weeks:</strong> {}</p>
-                </div>
-                """.format(
-                    len(gt_quality.get('GOOD', [])),
-                    len(gt_quality.get('CAUTION', [])),
-                    len(gt_quality.get('WARNING', [])),
-                    len(st.session_state.gt_data)
-                ), unsafe_allow_html=True)
-        
-        # Time Series Plot
-        st.markdown("#### 📉 Time Series Visualization")
-        
-        viz = Visualizer()
-        fig = viz.plot_time_series_interactive(
-            st.session_state.df_clean,
-            'date',
-            'target',
-            title="Unemployment Rate Changes Over Time"
-        )
-        st.plotly_chart(fig, use_container_width=True)
-        
-        # Correlation Matrix
-        st.markdown("#### 🔗 Correlation Analysis")
-        
-        target_col = 'target'
-        feature_cols = [col for col in st.session_state.df_clean.columns 
-                       if col not in ['date', target_col] and 
-                       st.session_state.df_clean[col].dtype in ['float64', 'int64']]
-        
-        if len(feature_cols) > 0:
-            corr_matrix = st.session_state.df_clean[feature_cols + [target_col]].corr()
+            use_elastic = st.checkbox("Elastic Net", value=False)
+            if use_elastic:
+                elastic_alpha = st.select_slider("ElasticNet α", [0.01, 0.1, 1.0], value=0.1)
+                elastic_l1_ratio = st.slider("L1 ratio", 0.0, 1.0, 0.5, 0.1)
             
-            fig = px.imshow(
-                corr_matrix,
-                labels=dict(color="Correlation"),
-                x=corr_matrix.columns,
-                y=corr_matrix.columns,
-                color_continuous_scale='RdBu_r',
-                zmin=-1, zmax=1
-            )
-            fig.update_layout(height=600)
-            st.plotly_chart(fig, use_container_width=True)
-            
-            # Top Correlations with Target
-            st.markdown("##### Top Correlations with Target")
-            
-            target_corr = corr_matrix[target_col].drop(target_col).abs().sort_values(ascending=False)
-            
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                st.markdown("**Strongest Positive:**")
-                positive_corr = corr_matrix[target_col].drop(target_col).sort_values(ascending=False).head(5)
-                for feat, corr in positive_corr.items():
-                    st.write(f"- **{feat}**: {corr:+.3f}")
-            
-            with col2:
-                st.markdown("**Strongest Negative:**")
-                negative_corr = corr_matrix[target_col].drop(target_col).sort_values().head(5)
-                for feat, corr in negative_corr.items():
-                    st.write(f"- **{feat}**: {corr:+.3f}")
+            use_delta = st.checkbox("✅ Delta-Correction", value=True)
+            if use_delta:
+                st.info("Predicts changes (Δ) instead of levels, then corrects: ŷ = lag1 + w·Δ̂")
+                blend_weights = st.multiselect(
+                    "Blending weights (w)",
+                    [0.5, 0.7, 0.8, 0.9, 1.0],
+                    default=[0.9, 1.0],
+                    help="w=1.0 means full delta, w<1.0 blends with persistence"
+                )
+            else:
+                blend_weights = []
         
-        # Data Table
-        with st.expander("📋 View Raw Data"):
-            st.dataframe(
-                st.session_state.df_clean,
-                use_container_width=True,
-                height=400
-            )
-
-# ============================================================================
-# TAB 3: MODELS
-# ============================================================================
-
-with tab3:
-    st.markdown("### 🤖 Model Training & Comparison")
+        # Store config
+        st.session_state.model_config = {
+            'use_ridge': use_ridge,
+            'ridge_alphas': ridge_alphas,
+            'use_lasso': use_lasso,
+            'lasso_alphas': lasso_alphas,
+            'use_elastic': use_elastic,
+            'use_delta': use_delta,
+            'blend_weights': blend_weights
+        }
     
-    if not st.session_state.data_loaded:
-        st.warning("⚠️ Please load data first in the sidebar.")
-    else:
-        # Model Configuration
-        st.markdown("#### ⚙️ Model Configuration")
+    with tab3:
+        st.markdown("**Advanced Settings**")
         
-        col1, col2, col3 = st.columns(3)
+        # MIDAS (if alternative data)
+        if st.session_state.alt_data:
+            st.markdown("#### Mixed-Frequency Settings (MIDAS)")
+            
+            use_midas = st.checkbox("Enable MIDAS aggregation", value=True)
+            
+            if use_midas:
+                midas_windows = st.multiselect(
+                    "MIDAS windows (W)",
+                    [4, 8, 12, 16],
+                    default=[4, 8],
+                    help="Number of high-freq observations to aggregate"
+                )
+                
+                midas_lambdas = st.multiselect(
+                    "Exponential decay (λ)",
+                    [0.5, 0.6, 0.7, 0.8, 0.9],
+                    default=[0.6, 0.8],
+                    help="Higher λ = more weight on recent data"
+                )
+                
+                cutoff_day = st.number_input(
+                    "Nowcast cutoff day",
+                    1, 28, 15,
+                    help="Use data up to day D of nowcast month"
+                )
+                
+                st.session_state.model_config.update({
+                    'use_midas': use_midas,
+                    'midas_windows': midas_windows,
+                    'midas_lambdas': midas_lambdas,
+                    'cutoff_day': cutoff_day
+                })
+        
+        # Feature engineering
+        st.markdown("#### Feature Engineering")
+        
+        col1, col2 = st.columns(2)
         
         with col1:
-            st.markdown("""
-            <div class="metric-card">
-                <h5>Selected Models</h5>
-                <ul>
-                    {}
-                </ul>
-            </div>
-            """.format("\n".join([f"<li>{m}</li>" for m in models_to_run])), unsafe_allow_html=True)
+            include_lags = st.checkbox("Include lags", value=True)
+            if include_lags:
+                max_lags = st.number_input("Maximum lag order", 1, 24, 12)
+            
+            include_ma = st.checkbox("Include moving averages", value=True)
         
         with col2:
-            st.markdown("""
-            <div class="metric-card">
-                <h5>Training Configuration</h5>
-                <p><strong>Train Size:</strong> {}%</p>
-                <p><strong>Test Size:</strong> {}%</p>
-                <p><strong>GT Included:</strong> {}</p>
-            </div>
-            """.format(train_test_split, 100-train_test_split, "Yes" if include_gt else "No"), unsafe_allow_html=True)
+            include_seasonal = st.checkbox("Include seasonal dummies", value=True)
+            include_yoy = st.checkbox("Include year-over-year", value=True)
         
-        with col3:
-            if st.session_state.models_trained:
-                st.markdown("""
-                <div class="success-box">
-                    <h5>Training Complete ✅</h5>
-                    <p>Models trained successfully</p>
-                    <p>Check Results tab for details</p>
-                </div>
-                """, unsafe_allow_html=True)
-            else:
-                st.markdown("""
-                <div class="warning-box">
-                    <h5>Not Trained Yet ⏳</h5>
-                    <p>Click "Train Models" in sidebar</p>
-                </div>
-                """, unsafe_allow_html=True)
+        st.session_state.model_config.update({
+            'include_lags': include_lags,
+            'max_lags': max_lags if include_lags else None,
+            'include_ma': include_ma,
+            'include_seasonal': include_seasonal,
+            'include_yoy': include_yoy
+        })
         
-        # Training Progress (if triggered)
-        if st.session_state.get('trigger_train', False):
-            with st.spinner("🤖 Training models... This may take a few minutes."):
-                # Initialize components
-                factory = ModelFactory()
-                evaluator = Evaluator()
-                
-                # Get data splits
-                train_data = st.session_state.train
-                test_data = st.session_state.test
-                
-                # Progress bar
-                progress_bar = st.progress(0)
-                status_text = st.empty()
-                
-                results_list = []
-                
-                for idx, model_name in enumerate(models_to_run):
-                    status_text.text(f"Training {model_name}... ({idx+1}/{len(models_to_run)})")
+        # Evaluation settings
+        st.markdown("#### Evaluation Settings")
+        
+        enable_backtest = st.checkbox("Enable rolling-origin backtest", value=True)
+        if enable_backtest:
+            n_splits = st.slider("Number of splits", 5, 20, 10)
+            st.session_state.model_config['enable_backtest'] = True
+            st.session_state.model_config['n_splits'] = n_splits
+        else:
+            st.session_state.model_config['enable_backtest'] = False
+        
+        enable_bootstrap = st.checkbox("Enable bootstrap CI", value=True)
+        if enable_bootstrap:
+            bootstrap_iterations = st.number_input("Bootstrap iterations", 500, 5000, 2000, 500)
+            st.session_state.model_config['enable_bootstrap'] = True
+            st.session_state.model_config['bootstrap_iterations'] = bootstrap_iterations
+        else:
+            st.session_state.model_config['enable_bootstrap'] = False
+    
+    st.markdown("---")
+    
+    # Summary
+    with st.expander("📋 Configuration Summary", expanded=True):
+        config = st.session_state.model_config
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.markdown("**Models to Train:**")
+            models_count = 4  # Benchmarks
+            if config.get('use_ridge') and config.get('ridge_alphas'):
+                models_count += len(config['ridge_alphas'])
+            if config.get('use_lasso') and config.get('lasso_alphas'):
+                models_count += len(config['lasso_alphas'])
+            if config.get('use_delta') and config.get('blend_weights'):
+                models_count *= len(config['blend_weights'])
+            
+            st.metric("Total Models", models_count)
+        
+        with col2:
+            st.markdown("**Evaluation:**")
+            eval_methods = []
+            if config.get('enable_backtest'):
+                eval_methods.append(f"Rolling ({config.get('n_splits')} splits)")
+            if config.get('enable_bootstrap'):
+                eval_methods.append(f"Bootstrap ({config.get('bootstrap_iterations')} iter)")
+            eval_methods.append("DM Test")
+            eval_methods.append("CW Test")
+            
+            st.write(", ".join(eval_methods))
+    
+    st.markdown("---")
+    
+    # Navigation
+    col1, col2, col3 = st.columns([1, 2, 1])
+    
+    with col1:
+        if st.button("⬅️ Back", use_container_width=True):
+            go_to_step(1)
+    
+    with col3:
+        if st.button("Run Analysis ▶️", use_container_width=True, type="primary"):
+            advance_step()
+
+
+# Step 3: Run Analysis
+elif st.session_state.step == 3:
+    
+    st.markdown("## 3️⃣ Running Analysis")
+    
+    # Progress tracking
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    
+    try:
+        # Step 1: Feature engineering
+        status_text.text("🔧 Engineering features...")
+        progress_bar.progress(10)
+        
+        dataset_info = st.session_state.dataset_info
+        config = st.session_state.model_config
+        
+        factory = FeatureFactory()
+        
+        df_features = factory.auto_engineer_features(
+            df=dataset_info.df,
+            target_col=dataset_info.target_col,
+            date_col=dataset_info.date_col,
+            frequency=dataset_info.frequency,
+            include_seasonal=config.get('include_seasonal', True),
+            include_yoy=config.get('include_yoy', True),
+            include_ma=config.get('include_ma', True)
+        )
+        
+        progress_bar.progress(20)
+        
+        # Step 2: Handle alternative data (MIDAS)
+        if st.session_state.alt_data and config.get('use_midas'):
+            status_text.text("🌐 Aggregating alternative data (MIDAS)...")
+            
+            aligner = FrequencyAligner()
+            
+            for alt_df in st.session_state.alt_data:
+                # Detect alt data frequency
+                intel = DataIntelligence()
+                alt_date_col = intel.detect_date_column(alt_df)
+                if alt_date_col:
+                    alt_dates = intel.parse_dates(alt_df, alt_date_col)
+                    alt_freq, _ = intel.detect_frequency(alt_dates)
                     
-                    # Train model
-                    model = factory.create_model(model_name, include_gt=include_gt)
-                    model.fit(train_data)
-                    
-                    # Predict
-                    pred = model.predict(test_data)
-                    
-                    # Evaluate
-                    metrics = evaluator.compute_metrics(
-                        test_data['target'].values,
-                        pred,
-                        baseline_pred=np.full(len(pred), train_data['target'].mean())
+                    # Align
+                    alt_cols = [c for c in alt_df.columns if c != alt_date_col]
+                    aligned = aligner.align_datasets(
+                        df_features,
+                        alt_df,
+                        dataset_info.date_col,
+                        alt_date_col,
+                        dataset_info.frequency,
+                        alt_freq,
+                        alt_cols,
+                        cutoff_day=config.get('cutoff_day', 15)
                     )
                     
-                    results_list.append({
-                        'Model': model_name,
-                        'RMSE': metrics['RMSE'],
-                        'MAE': metrics['MAE'],
-                        'Improvement_pct': metrics['Improvement_pct'],
-                        'p_value': metrics.get('p_value', np.nan)
-                    })
-                    
-                    progress_bar.progress((idx + 1) / len(models_to_run))
+                    # Merge
+                    df_features = df_features.merge(aligned, on=dataset_info.date_col, how='left')
+        
+        progress_bar.progress(30)
+        
+        # Step 3: Prepare train/test split
+        status_text.text("✂️ Splitting data...")
+        
+        df_clean = df_features.dropna(subset=[dataset_info.target_col])
+        
+        train_split = st.session_state.get('train_split', 0.7)
+        split_idx = int(len(df_clean) * train_split)
+        
+        train_df = df_clean.iloc[:split_idx].copy()
+        test_df = df_clean.iloc[split_idx:].copy()
+        
+        # Feature columns
+        feature_cols = [c for c in df_clean.columns 
+                       if c not in [dataset_info.date_col, dataset_info.target_col]]
+        
+        # Remove low-quality features
+        feature_cols = factory.remove_constant_features(df_clean, feature_cols)
+        
+        X_train = train_df[feature_cols].values
+        y_train = train_df[dataset_info.target_col].values
+        X_test = test_df[feature_cols].values
+        y_test = test_df[dataset_info.target_col].values
+        
+        progress_bar.progress(40)
+        
+        # Step 4: Train models
+        status_text.text("🤖 Training models...")
+        
+        library = ModelLibrary()
+        
+        # Benchmark models
+        models_to_train = []
+        models_to_train.extend(library.create_benchmark_suite())
+        
+        # Ridge
+        if config.get('use_ridge') and config.get('ridge_alphas'):
+            for alpha in config['ridge_alphas']:
+                models_to_train.append(RidgeModel(alpha=alpha))
+        
+        # Lasso
+        if config.get('use_lasso') and config.get('lasso_alphas'):
+            for alpha in config['lasso_alphas']:
+                models_to_train.append(LassoModel(alpha=alpha))
+        
+        progress_bar.progress(50)
+        
+        # Train all models
+        results = {}
+        predictions = {}
+        
+        for idx, model in enumerate(models_to_train):
+            status_text.text(f"🤖 Training {model.name}...")
+            
+            try:
+                model.fit(X_train, y_train)
+                y_pred = model.predict(X_test)
                 
-                # Save results
-                st.session_state.results['model_results'] = pd.DataFrame(results_list)
-                st.session_state.models_trained = True
-                st.session_state.trigger_train = False
+                predictions[model.name] = y_pred
                 
-                status_text.text("✅ Training complete!")
-                st.success("All models trained successfully!")
+                # Calculate metrics
+                calc = MetricsCalculator()
+                metrics = calc.calculate_all(y_test, y_pred)
+                results[model.name] = metrics
+                
+            except Exception as e:
+                st.warning(f"⚠️ {model.name} failed: {str(e)}")
+            
+            progress_bar.progress(50 + int(30 * (idx+1) / len(models_to_train)))
+        
+        # Delta-correction variants
+        if config.get('use_delta') and config.get('blend_weights'):
+            status_text.text("🔄 Creating delta-correction variants...")
+            
+            for base_name, base_pred in list(predictions.items()):
+                if 'Ridge' in base_name or 'Lasso' in base_name:
+                    for w in config['blend_weights']:
+                        # Recreate model
+                        if 'Ridge' in base_name:
+                            alpha = float(base_name.split('α=')[1].split(')')[0])
+                            base_model = RidgeModel(alpha=alpha)
+                        else:
+                            alpha = float(base_name.split('α=')[1].split(')')[0])
+                            base_model = LassoModel(alpha=alpha)
+                        
+                        # Delta correction
+                        delta_model = DeltaCorrectionModel(base_model, blend_weight=w)
+                        
+                        try:
+                            delta_model.fit(X_train, y_train)
+                            y_pred_delta = delta_model.predict(X_test)
+                            
+                            delta_name = f"Δ-{base_name[:-1]},w={w})"
+                            predictions[delta_name] = y_pred_delta
+                            
+                            metrics = MetricsCalculator().calculate_all(y_test, y_pred_delta)
+                            results[delta_name] = metrics
+                        except:
+                            pass
+        
+        progress_bar.progress(80)
+        
+        # Step 5: Statistical tests
+        status_text.text("📊 Running statistical tests...")
+        
+        # Find best model
+        rmse_scores = {name: m['rmse'] for name, m in results.items()}
+        best_model_name = min(rmse_scores, key=rmse_scores.get)
+        
+        # Persistence for comparison
+        pers_name = 'Persistence'
+        if pers_name in predictions:
+            tester = StatisticalTests(significance_level=st.session_state.get('significance_level', 0.05))
+            
+            # DM test: Best vs Persistence
+            e_best = y_test - predictions[best_model_name]
+            e_pers = y_test - predictions[pers_name]
+            
+            dm_result = tester.diebold_mariano_test(e_best, e_pers, alternative='greater')
+            
+            # CW test: Best vs simpler baseline (if applicable)
+            baseline_names = [n for n in predictions.keys() if 'AR(' in n or 'Mean' in n]
+            if baseline_names:
+                baseline_name = baseline_names[0]
+                e_baseline = y_test - predictions[baseline_name]
+                
+                cw_result = tester.clark_west_test(
+                    e_best, e_baseline,
+                    predictions[best_model_name], predictions[baseline_name]
+                )
+            else:
+                cw_result = None
+            
+            test_results = {
+                'Diebold-Mariano': {
+                    'statistic': dm_result.statistic,
+                    'p_value': dm_result.p_value,
+                    'is_significant': dm_result.is_significant,
+                    'interpretation': dm_result.interpretation
+                }
+            }
+            
+            if cw_result:
+                test_results['Clark-West'] = {
+                    'statistic': cw_result.statistic,
+                    'p_value': cw_result.p_value,
+                    'is_significant': cw_result.is_significant,
+                    'interpretation': cw_result.interpretation
+                }
+        else:
+            test_results = {}
+        
+        progress_bar.progress(90)
+        
+        # Step 6: Bootstrap CI (if enabled)
+        if config.get('enable_bootstrap'):
+            status_text.text("🔁 Computing bootstrap confidence intervals...")
+            
+            bootstrap = BootstrapMethods(
+                n_iterations=config.get('bootstrap_iterations', 2000)
+            )
+            
+            if pers_name in predictions:
+                bootstrap_result = bootstrap.moving_block_bootstrap(
+                    e_best, e_pers, block_size=6
+                )
+            else:
+                bootstrap_result = None
+        else:
+            bootstrap_result = None
+        
+        progress_bar.progress(95)
+        
+        # Step 7: Backtesting (if enabled)
+        if config.get('enable_backtest'):
+            status_text.text("🔄 Running rolling-origin backtest...")
+            
+            backtest_engine = BacktestEngine()
+            
+            # Use best model for backtest
+            def model_factory():
+                if 'Ridge' in best_model_name:
+                    alpha = float(best_model_name.split('α=')[1].split(')')[0])
+                    return RidgeModel(alpha=alpha)
+                else:
+                    return PersistenceModel()
+            
+            try:
+                backtest_results = backtest_engine.rolling_origin_backtest(
+                    df_clean,
+                    dataset_info.target_col,
+                    feature_cols,
+                    model_factory,
+                    n_splits=config.get('n_splits', 10)
+                )
+                
+                backtest_summary = backtest_engine.summarize_backtest_results(backtest_results)
+            except Exception as e:
+                st.warning(f"⚠️ Backtest failed: {str(e)}")
+                backtest_results = []
+                backtest_summary = {}
+        else:
+            backtest_results = []
+            backtest_summary = {}
+        
+        progress_bar.progress(100)
+        status_text.text("✅ Analysis complete!")
+        
+        # Store results
+        st.session_state.results = {
+            'metrics': results,
+            'predictions': predictions,
+            'test_actual': y_test,
+            'test_dates': test_df[dataset_info.date_col].values,
+            'best_model': best_model_name,
+            'statistical_tests': test_results,
+            'bootstrap': bootstrap_result,
+            'backtest_results': backtest_results,
+            'backtest_summary': backtest_summary,
+            'feature_cols': feature_cols
+        }
+        
+        # Auto-advance
+        st.success("✅ Analysis complete! Generating visualizations...")
+        st.balloons()
+        
+        import time
+        time.sleep(2)
+        advance_step()
+        
+    except Exception as e:
+        st.error(f"❌ Error during analysis: {str(e)}")
+        st.exception(e)
+        
+        col1, col2, col3 = st.columns([1, 2, 1])
+        with col2:
+            if st.button("🔄 Retry", use_container_width=True):
                 st.rerun()
 
-# ============================================================================
-# TAB 4: RESULTS
-# ============================================================================
 
-with tab4:
-    st.markdown("### 📉 Model Results & Performance")
+# Step 4: Results
+elif st.session_state.step == 4:
     
-    if not st.session_state.models_trained:
-        st.info("📊 Train models first to see results here.")
-    else:
-        results_df = st.session_state.results['model_results']
+    st.markdown("## 4️⃣ Results")
+    
+    if not st.session_state.results:
+        st.error("No results available. Please run analysis first.")
+        if st.button("⬅️ Go Back"):
+            go_to_step(2)
+        st.stop()
+    
+    results = st.session_state.results
+    
+    # Results Dashboard
+    ResultsDashboard.render(results)
+    
+    st.markdown("---")
+    
+    # Detailed tabs
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+        "📊 Predictions",
+        "📈 Performance",
+        "🧪 Statistical Tests",
+        "🔄 Backtest",
+        "📋 Summary"
+    ])
+    
+    with tab1:
+        st.markdown("### 📊 Predictions vs Actual")
         
-        # Performance Table
-        st.markdown("#### 📊 Model Comparison")
+        # Generate chart
+        charts = NowcastingCharts()
         
-        st.dataframe(
-            results_df.style.background_gradient(subset=['RMSE'], cmap='RdYlGn_r')
-                     .background_gradient(subset=['Improvement_pct'], cmap='RdYlGn')
-                     .format({'RMSE': '{:.4f}', 'MAE': '{:.4f}', 
-                             'Improvement_pct': '{:+.2f}%', 'p_value': '{:.4f}'}),
+        dates = pd.to_datetime(results['test_dates'])
+        actual = results['test_actual']
+        predictions_dict = results['predictions']
+        
+        # Limit to top 5 models for clarity
+        rmse_scores = {name: results['metrics'][name]['rmse'] 
+                      for name in predictions_dict.keys() 
+                      if name in results['metrics']}
+        top_models = sorted(rmse_scores, key=rmse_scores.get)[:5]
+        
+        predictions_to_plot = {name: predictions_dict[name] 
+                              for name in top_models}
+        
+        fig_pred = charts.plot_predictions_vs_actual(
+            dates, actual, predictions_to_plot,
+            title="Predictions vs Actual (Top 5 Models)"
+        )
+        
+        st.plotly_chart(fig_pred, use_container_width=True)
+        
+        # Errors
+        st.markdown("### 📉 Forecast Errors")
+        
+        errors_dict = {name: actual - predictions_dict[name] 
+                      for name in top_models}
+        
+        fig_errors = charts.plot_forecast_errors(
+            dates, errors_dict,
+            title="Forecast Errors Over Time"
+        )
+        
+        st.plotly_chart(fig_errors, use_container_width=True)
+        
+        # Store figures
+        st.session_state.figures['predictions_vs_actual'] = fig_pred
+        st.session_state.figures['forecast_errors'] = fig_errors
+    
+    with tab2:
+        st.markdown("### 📈 Model Performance Comparison")
+        
+        # Metrics table
+        DashboardComponents.comparison_table(
+            results['metrics'],
+            highlight_best=True,
+            metrics_to_show=['rmse', 'mae', 'mape', 'direction_accuracy']
+        )
+        
+        # Metrics comparison chart
+        fig_metrics = charts.plot_metrics_comparison(
+            results['metrics'],
+            metric_names=['rmse', 'mae'],
+            title="RMSE and MAE Comparison"
+        )
+        
+        st.plotly_chart(fig_metrics, use_container_width=True)
+        
+        # Error distribution
+        st.markdown("### 📊 Error Distribution")
+        
+        errors_all = {name: actual - pred 
+                     for name, pred in predictions_dict.items()}
+        
+        fig_dist = charts.plot_error_distribution(
+            errors_all,
+            title="Error Distribution Across Models"
+        )
+        
+        st.plotly_chart(fig_dist, use_container_width=True)
+        
+        st.session_state.figures['metrics_comparison'] = fig_metrics
+        st.session_state.figures['error_distribution'] = fig_dist
+    
+    with tab3:
+        st.markdown("### 🧪 Statistical Significance Tests")
+        
+        test_results = results.get('statistical_tests', {})
+        
+        if test_results:
+            for test_name, test_result in test_results.items():
+                DashboardComponents.statistical_test_badge(
+                    test_name,
+                    test_result['p_value'],
+                    test_result['statistic']
+                )
+                
+                with st.expander(f"ℹ️ About {test_name}"):
+                    st.markdown(test_result.get('interpretation', ''))
+            
+            # Statistical tests chart
+            fig_tests = charts.plot_statistical_tests(
+                test_results,
+                title="Statistical Test Results"
+            )
+            
+            st.plotly_chart(fig_tests, use_container_width=True)
+            
+            st.session_state.figures['statistical_tests'] = fig_tests
+        else:
+            st.info("No statistical tests available")
+        
+        # Bootstrap CI
+        bootstrap = results.get('bootstrap')
+        if bootstrap:
+            st.markdown("### 🔁 Bootstrap Confidence Interval")
+            
+            col1, col2, col3 = st.columns(3)
+            
+            with col1:
+                st.metric("Mean Difference", f"{bootstrap['mean']:.4f}")
+            with col2:
+                st.metric("95% CI Lower", f"{bootstrap['ci_lower']:.4f}")
+            with col3:
+                st.metric("95% CI Upper", f"{bootstrap['ci_upper']:.4f}")
+            
+            if bootstrap.get('includes_zero'):
+                st.warning("⚠️ Confidence interval includes zero - improvement not statistically robust")
+            else:
+                st.success("✅ Confidence interval excludes zero - improvement is statistically robust")
+    
+    with tab4:
+        st.markdown("### 🔄 Rolling-Origin Backtest")
+        
+        backtest_results = results.get('backtest_results', [])
+        
+        if backtest_results:
+            backtest_summary = results.get('backtest_summary', {})
+            
+            # Summary metrics
+            col1, col2, col3, col4 = st.columns(4)
+            
+            with col1:
+                st.metric("Splits", backtest_summary.get('n_splits', 0))
+            with col2:
+                st.metric("Mean RMSE", f"{backtest_summary.get('mean_rmse', 0):.4f}")
+            with col3:
+                st.metric("Std RMSE", f"{backtest_summary.get('std_rmse', 0):.4f}")
+            with col4:
+                st.metric("Min RMSE", f"{backtest_summary.get('min_rmse', 0):.4f}")
+            
+            # Rolling performance chart
+            fig_rolling = charts.plot_rolling_performance(
+                backtest_results,
+                metric='rmse',
+                title="RMSE Across Rolling Windows"
+            )
+            
+            st.plotly_chart(fig_rolling, use_container_width=True)
+            
+            st.session_state.figures['rolling_backtest'] = fig_rolling
+            
+            # Detailed results table
+            with st.expander("📋 Detailed Backtest Results"):
+                backtest_df = pd.DataFrame([{
+                    'Split': r.split_id,
+                    'Train Size': r.n_train,
+                    'Test Size': r.n_test,
+                    'RMSE': r.metrics['rmse'],
+                    'MAE': r.metrics['mae']
+                } for r in backtest_results])
+                
+                st.dataframe(backtest_df, use_container_width=True)
+        else:
+            st.info("No backtest results available")
+    
+    with tab5:
+        st.markdown("### 📋 Complete Summary")
+        
+        # Best model highlight
+        best_model = results['best_model']
+        best_metrics = results['metrics'][best_model]
+        
+        st.success(f"🏆 **Best Model:** {best_model}")
+        
+        col1, col2, col3, col4 = st.columns(4)
+        
+        with col1:
+            st.metric("RMSE", f"{best_metrics['rmse']:.4f}")
+        with col2:
+            st.metric("MAE", f"{best_metrics['mae']:.4f}")
+        with col3:
+            st.metric("Direction Acc", f"{best_metrics.get('direction_accuracy', 0):.1f}%")
+        with col4:
+            st.metric("Theil's U", f"{best_metrics.get('theil_u', 0):.3f}")
+        
+        st.markdown("---")
+        
+        # Key findings
+        st.markdown("### 🔍 Key Findings")
+        
+        # Compare to persistence
+        if 'Persistence' in results['metrics']:
+            pers_rmse = results['metrics']['Persistence']['rmse']
+            best_rmse = best_metrics['rmse']
+            improvement = (1 - best_rmse / pers_rmse) * 100
+            
+            if improvement > 0:
+                st.success(f"✅ Best model improves over persistence by **{improvement:.2f}%**")
+            else:
+                st.warning(f"⚠️ Best model is {abs(improvement):.2f}% worse than persistence")
+        
+        # Statistical significance
+        dm_test = results.get('statistical_tests', {}).get('Diebold-Mariano')
+        if dm_test:
+            if dm_test['is_significant']:
+                st.success(f"✅ Improvement is statistically significant (DM p={dm_test['p_value']:.4f})")
+            else:
+                st.warning(f"⚠️ Improvement is not statistically significant (DM p={dm_test['p_value']:.4f})")
+        
+        # Feature importance (if available)
+        st.markdown("### 🎯 Top Features")
+        
+        feature_cols = results.get('feature_cols', [])
+        if feature_cols:
+            st.write(f"**Total features used:** {len(feature_cols)}")
+            
+            with st.expander("📋 View All Features"):
+                st.write(feature_cols)
+    
+    st.markdown("---")
+    
+    # Navigation
+    col1, col2, col3 = st.columns([1, 2, 1])
+    
+    with col1:
+        if st.button("⬅️ Back to Config", use_container_width=True):
+            go_to_step(2)
+    
+    with col3:
+        if st.button("Export Results ➡️", use_container_width=True, type="primary"):
+            advance_step()
+
+
+# Step 5: Export
+elif st.session_state.step == 5:
+    
+    st.markdown("## 5️⃣ Export Results")
+    
+    if not st.session_state.results:
+        st.error("No results to export")
+        st.stop()
+    
+    results = st.session_state.results
+    
+    st.info("📦 Download your complete nowcasting results")
+    
+    # Prepare exports
+    data_exporter = DataExporter()
+    figure_exporter = FigureExporter()
+    
+    # Individual downloads
+    st.markdown("### 📄 Individual Files")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        # Predictions CSV
+        predictions_df = pd.DataFrame({
+            'date': results['test_dates'],
+            'actual': results['test_actual']
+        })
+        
+        for model_name, pred in results['predictions'].items():
+            col_name = model_name.replace(' ', '_').replace('(', '').replace(')', '').lower()
+            predictions_df[f'pred_{col_name}'] = pred
+        
+        csv_predictions = predictions_df.to_csv(index=False).encode('utf-8')
+        
+        st.download_button(
+            "📊 Download Predictions CSV",
+            csv_predictions,
+            "predictions.csv",
+            "text/csv",
             use_container_width=True
         )
         
-        # Best Model Highlight
-        best_idx = results_df['RMSE'].idxmin()
-        best_model = results_df.loc[best_idx]
+        # Metrics CSV
+        metrics_df = pd.DataFrame(results['metrics']).T
+        metrics_df.index.name = 'model'
+        metrics_df.reset_index(inplace=True)
         
-        st.markdown(f"""
-        <div class="success-box">
-            <h4>🏆 Best Model: {best_model['Model']}</h4>
-            <p><strong>RMSE:</strong> {best_model['RMSE']:.4f}</p>
-            <p><strong>Improvement:</strong> {best_model['Improvement_pct']:+.2f}%</p>
-            <p><strong>Statistical Significance:</strong> {'✅ Yes (p < 0.05)' if best_model['p_value'] < 0.05 else '❌ No'}</p>
-        </div>
-        """, unsafe_allow_html=True)
+        csv_metrics = metrics_df.to_csv(index=False).encode('utf-8')
         
-        # Visualization
-        st.markdown("#### 📈 Performance Visualization")
-        
-        viz = Visualizer()
-        fig = viz.plot_model_comparison(results_df)
-        st.plotly_chart(fig, use_container_width=True)
-        
-        # Period-wise Performance
-        if 'period_results' in st.session_state.results:
-            st.markdown("#### 📅 Period-wise Performance")
-            period_df = st.session_state.results['period_results']
-            
-            fig = viz.plot_period_performance(period_df)
-            st.plotly_chart(fig, use_container_width=True)
-
-# ============================================================================
-# TAB 5: LIVE NOWCAST
-# ============================================================================
-
-with tab5:
-    st.markdown("### 🔮 Live Unemployment Nowcast")
+        st.download_button(
+            "📈 Download Metrics CSV",
+            csv_metrics,
+            "metrics.csv",
+            "text/csv",
+            use_container_width=True
+        )
     
-    if not st.session_state.models_trained:
-        st.warning("⚠️ Please train models first to generate nowcasts.")
-    else:
-        # Current Nowcast
-        st.markdown("#### 📊 Current Month Nowcast")
+    with col2:
+        # Statistical tests JSON
+        tests_json = json.dumps(results.get('statistical_tests', {}), indent=2).encode('utf-8')
         
-        forecaster = st.session_state.get('forecaster')
+        st.download_button(
+            "🧪 Download Statistical Tests JSON",
+            tests_json,
+            "statistical_tests.json",
+            "application/json",
+            use_container_width=True
+        )
         
-        if forecaster:
-            nowcast = forecaster.generate_nowcast()
+        # Backtest results
+        if results.get('backtest_results'):
+            backtest_df = pd.DataFrame([{
+                'split': r.split_id,
+                'n_train': r.n_train,
+                'n_test': r.n_test,
+                **r.metrics
+            } for r in results['backtest_results']])
             
-            col1, col2, col3 = st.columns(3)
+            csv_backtest = backtest_df.to_csv(index=False).encode('utf-8')
             
-            with col1:
-                st.metric(
-                    "Nowcast (MIDAS)",
-                    f"{nowcast['prediction']:+.2f} pp",
-                    delta=nowcast.get('vs_historical', None)
-                )
-            
-            with col2:
-                st.metric(
-                    "Confidence Interval",
-                    f"[{nowcast['ci_lower']:+.2f}, {nowcast['ci_upper']:+.2f}]",
-                    delta=None
-                )
-            
-            with col3:
-                signal_status = get_signal_status(nowcast['gt_signals'])
-                st.metric(
-                    "GT Signal Status",
-                    signal_status['level'],
-                    delta=signal_status['message']
-                )
-        
-        # GT Signal Monitoring
-        if include_gt:
-            st.markdown("#### 🚨 Google Trends Early Warning Signals")
-            
-            gt_latest = st.session_state.get('gt_latest', {})
-            
-            col1, col2, col3 = st.columns(3)
-            
-            keywords = ['centro per l\'impiego', 'offerte di lavoro', 'curriculum']
-            
-            for idx, kw in enumerate(keywords):
-                with [col1, col2, col3][idx]:
-                    value = gt_latest.get(kw, 50)
-                    baseline = 50
-                    change = ((value - baseline) / baseline) * 100
-                    
-                    st.metric(
-                        kw.title(),
-                        f"{value:.0f}",
-                        delta=f"{change:+.1f}%"
-                    )
-        
-        # Forecast Timeline
-        st.markdown("#### 📅 Nowcast Timeline")
-        
-        st.markdown("""
-        <div class="info-box">
-            <p><strong>Current Date:</strong> {}</p>
-            <p><strong>Reference Month:</strong> {}</p>
-            <p><strong>Official Release:</strong> {} (in {} days)</p>
-            <p><strong>GT Data Advantage:</strong> 2-3 weeks earlier</p>
-        </div>
-        """.format(
-            datetime.now().strftime("%Y-%m-%d"),
-            "November 2025",
-            "December 15, 2025",
-            12
-        ), unsafe_allow_html=True)
-
-# ============================================================================
-# TAB 6: DOCUMENTATION
-# ============================================================================
-
-with tab6:
-    st.markdown("### 📚 Documentation & User Guide")
-    
-    with st.expander("📖 Complete User Guide", expanded=True):
-        st.markdown("""
-        # Italian Unemployment Nowcasting System
-        ## User Guide
-        
-        ### System Overview
-        
-        This application provides real-time unemployment nowcasts for Italy using:
-        - **Official ISTAT unemployment data** (monthly)
-        - **Google Trends search data** (weekly, optional)
-        - **Exogenous economic indicators** (CCI, HICP, optional)
-        
-        ### Key Features
-        
-        #### 1. Multi-Model Framework
-        - **MIDAS Models**: Exponential and Beta polynomial weighting
-        - **Linear Models**: Ridge, Lasso regression
-        - **Machine Learning**: Random Forest, XGBoost
-        - **Deep Learning**: LSTM networks (experimental)
-        
-        #### 2. Google Trends Integration
-        - Automatic 5-segment merging with quality checks
-        - Keyword selection based on economic relevance
-        - Weekly-to-monthly aggregation via MIDAS
-        
-        #### 3. Statistical Rigor
-        - Clark-West test for nested models
-        - Diebold-Mariano test for general comparison
-        - Backtesting with walk-forward validation
-        
-        ### Workflow
-        
-        **Step 1: Data Upload**
-        - Upload unemployment CSV with 'date' and 'unemp' columns
-        - Optionally upload Google Trends Excel files (5-year segments)
-        - Optionally upload exogenous variables CSV
-        
-        **Step 2: Configuration**
-        - Select operating mode (Default or Custom)
-        - Choose train/test split ratio
-        - Select models to train
-        
-        **Step 3: Processing**
-        - Click "Load & Process Data"
-        - Review data quality in Data Explorer tab
-        - Check correlation structure
-        
-        **Step 4: Modeling**
-        - Click "Train Models"
-        - Wait for training to complete
-        - Review results in Results tab
-        
-        **Step 5: Nowcasting**
-        - Navigate to Live Nowcast tab
-        - View current month prediction
-        - Monitor GT early warning signals
-        
-        ### Interpreting Results
-        
-        #### RMSE (Root Mean Squared Error)
-        - Lower is better
-        - Measures average prediction error
-        - Comparable across models
-        
-        #### Improvement Percentage
-        - Shows gain over naive baseline (historical mean)
-        - +7% means 7% RMSE reduction
-        - Realistic gains: 5-10%
-        
-        #### p-value
-        - Statistical significance test
-        - p < 0.05 indicates significant improvement
-        - Be cautious with borderline values
-        
-        #### Confidence Intervals
-        - ±2 standard deviations
-        - 95% probability true value is in range
-        - Wider intervals = higher uncertainty
-        
-        ### Best Practices
-        
-        1. **Data Quality**: Ensure clean, consistent data with no large gaps
-        2. **Sample Size**: Minimum 60 months training data recommended
-        3. **Google Trends**: Use multiple keywords for robustness
-        4. **Model Selection**: Start with MIDAS, add ML models for comparison
-        5. **Validation**: Always check out-of-sample performance
-        
-        ### Limitations
-        
-        - **Timeliness vs Accuracy**: Early signals may be noisy
-        - **Method Dependency**: GT value requires proper aggregation
-        - **Structural Breaks**: Performance may degrade during crises
-        - **Regional Aggregation**: National nowcasts mask local variation
-        
-        ### Technical Details
-        
-        **MIDAS Exponential Weights (θ=3.0):**
-```
-        w_j = exp(-θ * j) / Σ exp(-θ * i)
-        
-        Result: [0.950, 0.047, 0.002, 0.0001]
-        → 95% weight on most recent week
-```
-        
-        **Ridge Regression:**
-```
-        β̂ = argmin (Σ(y - Xβ)² + α||β||²)
-        
-        α = 50.0 (selected via cross-validation)
-```
-        
-        ### Contact & Support
-        
-        - **Author**: Rajabali Ghasempour
-        - **Institution**: ISTAT
-        - **Version**: 1.0.0
-        - **Last Updated**: December 2025
-        
-        For issues or questions, please contact ISTAT Labor Statistics Division.
-        """)
-    
-    with st.expander("🔧 Technical Specifications"):
-        st.markdown("""
-        ### System Requirements
-        
-        **Software:**
-        - Python 3.8+
-        - Streamlit 1.28+
-        - See requirements.txt for full dependencies
-        
-        **Hardware:**
-        - Minimum: 4GB RAM
-        - Recommended: 8GB RAM, 2+ CPU cores
-        
-        **Data Format:**
-        - Unemployment: CSV with 'date', 'unemp' columns
-        - Google Trends: Excel (.xlsx) with 'Week' and keyword columns
-        - Exogenous: CSV with 'date' and variable columns
-        
-        ### API Reference
-        
-        **Backend Modules:**
-```python
-        from backend.data_loader import DataLoader
-        from backend.models import ModelFactory
-        from backend.evaluation import Evaluator
-        from backend.forecaster import RealTimeForecaster
-```
-        
-        **Key Classes:**
-        - `DataLoader`: Handle data upload, cleaning, merging
-        - `FeatureEngineer`: Create lags, MIDAS features
-        - `ModelFactory`: Train multiple model types
-        - `Evaluator`: Compute metrics, statistical tests
-        - `RealTimeForecaster`: Generate live nowcasts
-        
-        ### Deployment
-        
-        **Local:**
-```bash
-        streamlit run app.py
-```
-        
-        **Streamlit Cloud:**
-        1. Push to GitHub
-        2. Connect repository in Streamlit Cloud
-        3. Configure secrets (if needed)
-        4. Deploy
-        
-        **Docker:**
-```dockerfile
-        FROM python:3.9-slim
-        COPY . /app
-        WORKDIR /app
-        RUN pip install -r requirements.txt
-        CMD streamlit run app.py
-```
-        """)
-    
-    with st.expander("📊 Example Datasets"):
-        st.markdown("""
-        ### Sample Data Files
-        
-        Download example datasets to test the app:
-        
-        **1. Unemployment Data (unemployment.csv)**
-```csv
-        date,unemp,unemp(25-34)
-        2020-01-01,9.8,16.2
-        2020-02-01,9.7,16.0
-        2020-03-01,9.9,16.5
-        ...
-```
-        
-        **2. Google Trends (segment1.xlsx)**
-        | Week | lavoro | cerco lavoro | offerte di lavoro | ... |
-        |------|--------|--------------|-------------------|-----|
-        | 2020-07-05 | 45 | 38 | 52 | ... |
-        | 2020-07-12 | 47 | 40 | 51 | ... |
-        
-        **3. Exogenous Variables (exog.csv)**
-```csv
-        date,CCI,PRC-HICP
-        2020-01-01,105.2,0.2
-        2020-02-01,104.8,0.1
-        ...
-```
-        """)
-
-# Handle data loading trigger
-if st.session_state.get('trigger_load', False):
-    with st.spinner("📁 Loading and processing data..."):
-        try:
-            loader = DataLoader()
-            
-            # Load unemployment
-            if uploaded_unemployment:
-                df_unemp = pd.read_csv(uploaded_unemployment)
-            else:
-                # Use default demo data
-                st.warning("No data uploaded. Using demo dataset.")
-                df_unemp = loader.load_demo_data()
-            
-            # Process
-            df_clean = loader.process_data(
-                df_unemp,
-                gt_files=uploaded_gt if uploaded_gt else None,
-                exog_file=uploaded_exog if uploaded_exog else None
+            st.download_button(
+                "🔄 Download Backtest Results CSV",
+                csv_backtest,
+                "backtest_results.csv",
+                "text/csv",
+                use_container_width=True
             )
-            
-            # Train/test split
-            split_idx = int(len(df_clean) * train_test_split / 100)
-            train = df_clean.iloc[:split_idx]
-            test = df_clean.iloc[split_idx:]
-            
-            # Save to session state
-            st.session_state.data_loader = loader
-            st.session_state.df_clean = df_clean
-            st.session_state.train = train
-            st.session_state.test = test
-            st.session_state.data_loaded = True
-            st.session_state.trigger_load = False
-            
-            st.success("✅ Data loaded successfully!")
-            st.rerun()
-            
-        except Exception as e:
-            st.error(f"❌ Error loading data: {str(e)}")
-            st.session_state.trigger_load = False
+    
+    st.markdown("---")
+    
+    # Complete package
+    st.markdown("### 📦 Complete Package")
+    
+    st.info("Download all results in a single ZIP file")
+    
+    if st.button("🎁 Generate Complete Package", use_container_width=True, type="primary"):
+        with st.spinner("📦 Creating package..."):
+            try:
+                from core.exporter import StreamlitDownloader
+                
+                # Prepare files
+                files_dict = {}
+                
+                # CSVs
+                files_dict['predictions.csv'] = csv_predictions
+                files_dict['metrics.csv'] = csv_metrics
+                files_dict['statistical_tests.json'] = tests_json
+                
+                if results.get('backtest_results'):
+                    files_dict['backtest_results.csv'] = csv_backtest
+                
+                # Figures (HTML)
+                for fig_name, fig in st.session_state.figures.items():
+                    html_buffer = io.StringIO()
+                    fig.write_html(html_buffer)
+                    files_dict[f'{fig_name}.html'] = html_buffer.getvalue().encode('utf-8')
+                
+                # Create ZIP
+                zip_bytes = StreamlitDownloader.prepare_zip_download(files_dict)
+                
+                st.download_button(
+                    "⬇️ Download ZIP Package",
+                    zip_bytes,
+                    f"nowcast_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
+                    "application/zip",
+                    use_container_width=True
+                )
+                
+                st.success("✅ Package ready for download!")
+                
+            except Exception as e:
+                st.error(f"❌ Error creating package: {str(e)}")
+    
+    st.markdown("---")
+    
+    # Final actions
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        if st.button("⬅️ Back to Results", use_container_width=True):
+            go_to_step(4)
+    
+    with col2:
+        if st.button("🔄 New Analysis", use_container_width=True):
+            reset_workflow()
+    
+    with col3:
+        st.markdown("### ✅ Complete!")
+
+
+# ============================================================================
+# FOOTER
+# ============================================================================
+
+st.markdown("---")
+st.markdown("""
+<div class="footer">
+    <p>
+        <strong>Nowcasting Platform v1.0</strong><br>
+        Developed for professional economists and data scientists<br>
+        📧 Contact | 📚 Documentation | 🐛 Report Issues
+    </p>
+</div>
+""", unsafe_allow_html=True)
